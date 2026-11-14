@@ -36,21 +36,5 @@ services:
     ports:
       - "8080:3000"
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: notecraft-caddy
-    restart: unless-stopped
-    depends_on:
-      - notecraft
-    ports:
-      - "80:80"
-      - "443:443"
-    command: caddy reverse-proxy --from notecraft.duckdns.org --to notecraft:3000
-    volumes:
-      - caddy_data:/data
-      - caddy_config:/config
-
 volumes:
   notecraft_pgdata:
-  caddy_data:
-  caddy_config:
