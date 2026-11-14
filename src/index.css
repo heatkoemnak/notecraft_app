@@ -63,3 +63,16 @@ html.dark ::-webkit-scrollbar-thumb {
 html.dark ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.24);
 }
+
+.live-editable:empty:focus::before,
+.live-editable[data-placeholder^="Start writing"]:empty::before {
+  content: attr(data-placeholder);
+  color: rgba(113, 113, 122, 0.65);
+  pointer-events: none;
+}
+
+html.dark .live-editable:empty:focus::before,
+html.dark .live-editable[data-placeholder^="Start writing"]:empty::before {
+  color: rgba(161, 161, 170, 0.48);
+}
+

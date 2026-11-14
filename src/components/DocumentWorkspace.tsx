@@ -9,8 +9,8 @@ import {
   Columns2,
   Copy,
   Download,
-  Eye,
   FileCode2,
+  FileText,
   Heading2,
   Heading3,
   ImagePlus,
@@ -18,13 +18,15 @@ import {
   ListTree,
   Minus,
   PanelLeftOpen,
-  PenLine,
   Plus,
   Quote,
+  Redo2,
   Search,
   Star,
   Table,
+  Undo2,
 } from 'lucide-react';
+import { NoteSelection, NoteUpdateMeta } from '../hooks/useNoteHistory';
 import { Folder, NoteDocument, Snippet, ViewMode } from '../types/notes';
 import {
   extractHeadings,
@@ -34,6 +36,7 @@ import {
 } from '../utils/markdown';
 import { resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
 import { ImageInsertModal } from './ImageInsertModal';
+import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface DocumentWorkspaceProps {
@@ -43,10 +46,24 @@ interface DocumentWorkspaceProps {
   viewMode: ViewMode;
   sidebarOpen: boolean;
   outlineOpen: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  pendingSelection: {
+    noteId: string;
+    selection: NoteSelection;
+    seq: number;
+  } | null;
+  selectionReaderRef: React.MutableRefObject<() => NoteSelection | null>;
+  onUndo: () => void;
+  onRedo: () => void;
   onOpenSidebar: () => void;
   onToggleOutline: () => void;
   onChangeViewMode: (mode: ViewMode) => void;
-  onUpdateNote: (noteId: string, patch: Partial<Pick<NoteDocument, 'title' | 'content' | 'folderId' | 'starred'>>) => void;
+  onUpdateNote: (
+    noteId: string,
+    patch: Partial<Pick<NoteDocument, 'title' | 'content' | 'folderId' | 'starred'>>,
+    meta?: NoteUpdateMeta
+  ) => void;
   onCreateNote: () => void;
   onOpenSnippetModal: (prefillContent?: string) => void;
   onOpenSnippetsLibrary: () => void;
@@ -59,6 +76,12 @@ export function DocumentWorkspace({
   viewMode,
   sidebarOpen,
   outlineOpen,
+  canUndo,
+  canRedo,
+  pendingSelection,
+  selectionReaderRef,
+  onUndo,
+  onRedo,
   onOpenSidebar,
   onToggleOutline,
   onChangeViewMode,
@@ -67,7 +90,11 @@ export function DocumentWorkspace({
   onOpenSnippetModal,
   onOpenSnippetsLibrary,
 }: DocumentWorkspaceProps) {
+  const titleInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const liveEditorRef = useRef<LiveDocumentEditorHandle>(null);
+  const lastTextareaSelectionRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+  const lastTitleSelectionRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
   const snippetMenuRef = useRef<HTMLDivElement>(null);
   const [copiedDoc, setCopiedDoc] = useState(false);
   const [snippetMenuOpen, setSnippetMenuOpen] = useState(false);
@@ -75,6 +102,83 @@ export function DocumentWorkspace({
   const [hasSelection, setHasSelection] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+
+  const syncTextareaSelection = (el: HTMLTextAreaElement) => {
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? start;
+    lastTextareaSelectionRef.current = { start, end };
+    setHasSelection(end > start);
+  };
+
+  const syncTitleSelection = (el: HTMLInputElement) => {
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? start;
+    lastTitleSelectionRef.current = { start, end };
+  };
+
+  useEffect(() => {
+    selectionReaderRef.current = () => {
+      const activeEl = document.activeElement;
+      if (titleInputRef.current && activeEl === titleInputRef.current) {
+        return {
+          target: 'title',
+          start: titleInputRef.current.selectionStart ?? 0,
+          end: titleInputRef.current.selectionEnd ?? 0,
+        };
+      }
+      if (textareaRef.current && activeEl === textareaRef.current) {
+        return {
+          target: 'content',
+          start: textareaRef.current.selectionStart ?? 0,
+          end: textareaRef.current.selectionEnd ?? 0,
+        };
+      }
+      if (textareaRef.current) {
+        return {
+          target: 'content',
+          start: lastTextareaSelectionRef.current.start,
+          end: lastTextareaSelectionRef.current.end,
+        };
+      }
+      return null;
+    };
+  }, [selectionReaderRef]);
+
+  useEffect(() => {
+    lastTextareaSelectionRef.current = { start: 0, end: 0 };
+    lastTitleSelectionRef.current = { start: 0, end: 0 };
+    setHasSelection(false);
+  }, [note?.id]);
+
+  useEffect(() => {
+    if (!pendingSelection || !note || pendingSelection.noteId !== note.id) return;
+    const { target, start, end } = pendingSelection.selection;
+
+    window.requestAnimationFrame(() => {
+      if (target === 'title' && titleInputRef.current) {
+        const input = titleInputRef.current;
+        const clampedStart = Math.min(start, input.value.length);
+        const clampedEnd = Math.min(end, input.value.length);
+        if (document.activeElement !== input) {
+          input.focus();
+        }
+        input.setSelectionRange(clampedStart, clampedEnd);
+        lastTitleSelectionRef.current = { start: clampedStart, end: clampedEnd };
+      } else if (target === 'content' && textareaRef.current) {
+        const textarea = textareaRef.current;
+        const scrollTop = textarea.scrollTop;
+        const clampedStart = Math.min(start, textarea.value.length);
+        const clampedEnd = Math.min(end, textarea.value.length);
+        if (document.activeElement !== textarea) {
+          textarea.focus();
+        }
+        textarea.scrollTop = scrollTop;
+        textarea.setSelectionRange(clampedStart, clampedEnd);
+        lastTextareaSelectionRef.current = { start: clampedStart, end: clampedEnd };
+        setHasSelection(clampedEnd > clampedStart);
+      }
+    });
+  }, [pendingSelection, note?.id]);
 
   const headings = useMemo(() => (note ? extractHeadings(note.content) : []), [note]);
   const stats = useMemo(() => (note ? getDocumentStats(note.content) : null), [note]);
@@ -117,7 +221,11 @@ export function DocumentWorkspace({
 
     if (!textarea) {
       const separator = note.content.trimEnd() ? '\n\n' : '';
-      onUpdateNote(note.id, { content: `${note.content.trimEnd()}${separator}${textToInsert}\n` });
+      onUpdateNote(
+        note.id,
+        { content: `${note.content.trimEnd()}${separator}${textToInsert}\n` },
+        { source: 'discrete', field: 'content' }
+      );
       return;
     }
 
@@ -127,18 +235,28 @@ export function DocumentWorkspace({
     const before = note.content.slice(0, start);
     const after = note.content.slice(end);
     const nextContent = `${before}${textToInsert}${after}`;
+    const nextSelStart =
+      selectStartOffset !== undefined ? start + selectStartOffset : start + textToInsert.length;
+    const nextSelEnd =
+      selectEndOffset !== undefined ? start + selectEndOffset : nextSelStart;
 
-    onUpdateNote(note.id, { content: nextContent });
+    lastTextareaSelectionRef.current = { start: nextSelStart, end: nextSelEnd };
+    onUpdateNote(
+      note.id,
+      { content: nextContent },
+      {
+        source: 'discrete',
+        field: 'content',
+        prevSelection: { target: 'content', start, end },
+        nextSelection: { target: 'content', start: nextSelStart, end: nextSelEnd },
+      }
+    );
 
     window.requestAnimationFrame(() => {
       textarea.focus();
       textarea.scrollTop = scrollTop;
-      if (selectStartOffset !== undefined && selectEndOffset !== undefined) {
-        textarea.setSelectionRange(start + selectStartOffset, start + selectEndOffset);
-      } else {
-        const cursor = start + textToInsert.length;
-        textarea.setSelectionRange(cursor, cursor);
-      }
+      textarea.setSelectionRange(nextSelStart, nextSelEnd);
+      setHasSelection(nextSelEnd > nextSelStart);
     });
   };
 
@@ -152,31 +270,49 @@ export function DocumentWorkspace({
     const selected = note.content.slice(start, end) || placeholder;
     const replacement = `${prefix}${selected}${suffix}`;
     const scrollTop = textarea.scrollTop;
+    const nextSelStart = start + prefix.length;
+    const nextSelEnd = nextSelStart + selected.length;
 
     const nextContent = note.content.slice(0, start) + replacement + note.content.slice(end);
-    onUpdateNote(note.id, { content: nextContent });
+    lastTextareaSelectionRef.current = { start: nextSelStart, end: nextSelEnd };
+    onUpdateNote(
+      note.id,
+      { content: nextContent },
+      {
+        source: 'discrete',
+        field: 'content',
+        prevSelection: { target: 'content', start, end },
+        nextSelection: { target: 'content', start: nextSelStart, end: nextSelEnd },
+      }
+    );
 
     window.requestAnimationFrame(() => {
       textarea.focus();
       textarea.scrollTop = scrollTop;
-      textarea.setSelectionRange(start + prefix.length, start + prefix.length + selected.length);
+      textarea.setSelectionRange(nextSelStart, nextSelEnd);
+      setHasSelection(nextSelEnd > nextSelStart);
     });
   };
 
   const handleInsertSnippet = (snippet: Snippet) => {
     if (!note) return;
-    if (viewMode === 'read') {
-      onChangeViewMode('split');
-    }
-    const textarea = textareaRef.current;
-    if (textarea && viewMode !== 'read') {
-      const start = textarea.selectionStart;
-      const needsLeadingNewline = start > 0 && note.content[start - 1] !== '\n';
-      const prefix = needsLeadingNewline ? '\n\n' : '';
-      insertAtCursor(`${prefix}${snippet.content}\n`);
+    if (viewMode === 'read' && liveEditorRef.current) {
+      liveEditorRef.current.insertMarkdownContent(snippet.content);
     } else {
-      const separator = note.content.trimEnd() ? '\n\n' : '';
-      onUpdateNote(note.id, { content: `${note.content.trimEnd()}${separator}${snippet.content}\n` });
+      const textarea = textareaRef.current;
+      if (textarea) {
+        const start = textarea.selectionStart;
+        const needsLeadingNewline = start > 0 && note.content[start - 1] !== '\n';
+        const prefix = needsLeadingNewline ? '\n\n' : '';
+        insertAtCursor(`${prefix}${snippet.content}\n`);
+      } else {
+        const separator = note.content.trimEnd() ? '\n\n' : '';
+        onUpdateNote(
+          note.id,
+          { content: `${note.content.trimEnd()}${separator}${snippet.content}\n` },
+          { source: 'discrete', field: 'content' }
+        );
+      }
     }
     setSnippetMenuOpen(false);
     setSnippetQuery('');
@@ -184,6 +320,11 @@ export function DocumentWorkspace({
 
   const handleSaveSelectionAsSnippet = () => {
     if (!note) return;
+    if (viewMode === 'read' && liveEditorRef.current) {
+      const selected = liveEditorRef.current.getSelectedText();
+      onOpenSnippetModal(selected || undefined);
+      return;
+    }
     const textarea = textareaRef.current;
     if (textarea) {
       const selected = note.content.slice(textarea.selectionStart, textarea.selectionEnd).trim();
@@ -195,6 +336,10 @@ export function DocumentWorkspace({
 
   const handleInsertImageMarkdown = (markdownImage: string) => {
     if (!note) return;
+    if (viewMode === 'read' && liveEditorRef.current) {
+      liveEditorRef.current.insertMarkdownContent(markdownImage);
+      return;
+    }
     const textarea = textareaRef.current;
     if (textarea && viewMode !== 'read') {
       const start = textarea.selectionStart;
@@ -203,7 +348,11 @@ export function DocumentWorkspace({
       insertAtCursor(`${prefix}${markdownImage}\n`);
     } else {
       const separator = note.content.trimEnd() ? '\n\n' : '';
-      onUpdateNote(note.id, { content: `${note.content.trimEnd()}${separator}${markdownImage}\n` });
+      onUpdateNote(
+        note.id,
+        { content: `${note.content.trimEnd()}${separator}${markdownImage}\n` },
+        { source: 'discrete', field: 'content' }
+      );
     }
   };
 
@@ -240,6 +389,7 @@ export function DocumentWorkspace({
   const handleEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (!note) return;
     const textarea = e.currentTarget;
+    syncTextareaSelection(textarea);
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
       e.preventDefault();
@@ -267,16 +417,31 @@ export function DocumentWorkspace({
 
     if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
       const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
       const lineStart = note.content.lastIndexOf('\n', start - 1) + 1;
       const currentLine = note.content.slice(lineStart, start);
+
+      const clearEmptyListPrefix = () => {
+        const nextContent = note.content.slice(0, lineStart) + note.content.slice(start);
+        lastTextareaSelectionRef.current = { start: lineStart, end: lineStart };
+        onUpdateNote(
+          note.id,
+          { content: nextContent },
+          {
+            source: 'discrete',
+            field: 'content',
+            prevSelection: { target: 'content', start, end },
+            nextSelection: { target: 'content', start: lineStart, end: lineStart },
+          }
+        );
+        window.requestAnimationFrame(() => textarea.setSelectionRange(lineStart, lineStart));
+      };
 
       const taskMatch = /^(\s*(?:[-*+])\s+\[[ xX]\]\s+)(.*)$/.exec(currentLine);
       if (taskMatch) {
         e.preventDefault();
         if (!taskMatch[2].trim()) {
-          const nextContent = note.content.slice(0, lineStart) + note.content.slice(start);
-          onUpdateNote(note.id, { content: nextContent });
-          window.requestAnimationFrame(() => textarea.setSelectionRange(lineStart, lineStart));
+          clearEmptyListPrefix();
         } else {
           const indent = /^(\s*)/.exec(currentLine)?.[1] || '';
           insertAtCursor(`\n${indent}- [ ] `);
@@ -288,9 +453,7 @@ export function DocumentWorkspace({
       if (bulletMatch) {
         e.preventDefault();
         if (!bulletMatch[2].trim()) {
-          const nextContent = note.content.slice(0, lineStart) + note.content.slice(start);
-          onUpdateNote(note.id, { content: nextContent });
-          window.requestAnimationFrame(() => textarea.setSelectionRange(lineStart, lineStart));
+          clearEmptyListPrefix();
         } else {
           insertAtCursor(`\n${bulletMatch[1]}`);
         }
@@ -301,9 +464,7 @@ export function DocumentWorkspace({
       if (orderedMatch) {
         e.preventDefault();
         if (!orderedMatch[4].trim()) {
-          const nextContent = note.content.slice(0, lineStart) + note.content.slice(start);
-          onUpdateNote(note.id, { content: nextContent });
-          window.requestAnimationFrame(() => textarea.setSelectionRange(lineStart, lineStart));
+          clearEmptyListPrefix();
         } else {
           const nextNum = Number(orderedMatch[2]) + 1;
           insertAtCursor(`\n${orderedMatch[1]}${nextNum}${orderedMatch[3]}`);
@@ -405,7 +566,10 @@ export function DocumentWorkspace({
   }
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#121214]">
+    <div
+      data-document-workspace="true"
+      className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#121214]"
+    >
       {/* Top Document Bar */}
       <header className="h-[52px] shrink-0 px-4 sm:px-5 border-b border-neutral-200 dark:border-white/[0.07] flex items-center justify-between gap-3">
         {/* Left: Sidebar toggle + Note breadcrumb & folder selector */}
@@ -433,7 +597,11 @@ export function DocumentWorkspace({
               <select
                 value={note.folderId || ''}
                 onChange={(e) =>
-                  onUpdateNote(note.id, { folderId: e.target.value ? e.target.value : null })
+                  onUpdateNote(
+                    note.id,
+                    { folderId: e.target.value ? e.target.value : null },
+                    { source: 'discrete', field: 'folderId' }
+                  )
                 }
                 aria-label="Move note to project folder"
                 className="appearance-none bg-transparent pr-5 pl-1.5 py-1 rounded-md text-[13px] text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] focus:outline-none cursor-pointer"
@@ -452,7 +620,13 @@ export function DocumentWorkspace({
 
             <button
               type="button"
-              onClick={() => onUpdateNote(note.id, { starred: !note.starred })}
+              onClick={() =>
+                onUpdateNote(
+                  note.id,
+                  { starred: !note.starred },
+                  { source: 'discrete', field: 'starred' }
+                )
+              }
               aria-label={note.starred ? 'Remove star' : 'Star note'}
               title={note.starred ? 'Starred' : 'Star this note'}
               className={`p-1.5 rounded-lg transition-colors cursor-pointer shrink-0 ${
@@ -485,8 +659,8 @@ export function DocumentWorkspace({
                   : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-950 dark:hover:text-white'
               }`}
             >
-              <Eye className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Read</span>
+              <FileText className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Document</span>
             </button>
             <button
               type="button"
@@ -513,8 +687,8 @@ export function DocumentWorkspace({
                   : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-950 dark:hover:text-white'
               }`}
             >
-              <PenLine className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Write</span>
+              <FileCode2 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Markdown</span>
             </button>
           </div>
 
@@ -566,72 +740,122 @@ export function DocumentWorkspace({
         </div>
       </header>
 
-      {/* Markdown & Snippet Toolbar (shown in Write & Split modes) */}
-      {(viewMode === 'write' || viewMode === 'split') && (
-        <div className="shrink-0 px-4 sm:px-5 py-2 border-b border-neutral-200 dark:border-white/[0.07] bg-neutral-50/70 dark:bg-[#151518] flex items-center justify-between gap-3 flex-wrap">
-          <div className="flex items-center gap-0.5 flex-wrap">
-            <ToolbarButton
-              label="Heading 2"
-              onClick={() => insertAtCursor('## ', 3, 3)}
-              icon={<Heading2 className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Heading 3"
-              onClick={() => insertAtCursor('### ', 4, 4)}
-              icon={<Heading3 className="w-4 h-4" />}
-            />
-            <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
-            <ToolbarButton
-              label="Bold (Cmd+B)"
-              onClick={() => wrapSelection('**', '**', 'bold text')}
-              icon={<Bold className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Italic (Cmd+I)"
-              onClick={() => wrapSelection('*', '*', 'italic text')}
-              icon={<Italic className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Inline code"
-              onClick={() => wrapSelection('`', '`', 'code')}
-              icon={<Code className="w-4 h-4" />}
-            />
-            <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
-            <ToolbarButton
-              label="Code block"
-              onClick={() => insertAtCursor('```bash\n\n```\n', 8, 8)}
-              icon={<FileCode2 className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Insert image"
-              onClick={() => setImageModalOpen(true)}
-              icon={<ImagePlus className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Table"
-              onClick={() =>
-                insertAtCursor(
-                  '| Column A | Column B |\n| :--- | :--- |\n| Value 1 | Value 2 |\n'
-                )
-              }
-              icon={<Table className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Checklist"
-              onClick={() => insertAtCursor('- [ ] Task item\n')}
-              icon={<CheckSquare className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Callout quote"
-              onClick={() => insertAtCursor('> Note: ')}
-              icon={<Quote className="w-4 h-4" />}
-            />
-            <ToolbarButton
-              label="Horizontal rule"
-              onClick={() => insertAtCursor('\n---\n\n')}
-              icon={<Minus className="w-4 h-4" />}
-            />
-          </div>
+      {/* Formatting & Snippet Toolbar (available directly in Document, Split, and Markdown modes) */}
+      <div className="shrink-0 px-4 sm:px-5 py-2 border-b border-neutral-200 dark:border-white/[0.07] bg-neutral-50/70 dark:bg-[#151518] flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-0.5 flex-wrap">
+          <ToolbarButton
+            label="Undo (Ctrl+Z)"
+            onClick={onUndo}
+            disabled={!canUndo}
+            icon={<Undo2 className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Redo (Ctrl+Y)"
+            onClick={onRedo}
+            disabled={!canRedo}
+            icon={<Redo2 className="w-4 h-4" />}
+          />
+          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+          <ToolbarButton
+            label="Heading 2"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.toggleOrInsertBlock('h2')
+                : insertAtCursor('## ', 3, 3)
+            }
+            icon={<Heading2 className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Heading 3"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.toggleOrInsertBlock('h3')
+                : insertAtCursor('### ', 4, 4)
+            }
+            icon={<Heading3 className="w-4 h-4" />}
+          />
+          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+          <ToolbarButton
+            label="Bold (Ctrl+B)"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.applyInlineFormat('bold')
+                : wrapSelection('**', '**', 'bold text')
+            }
+            icon={<Bold className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Italic (Ctrl+I)"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.applyInlineFormat('italic')
+                : wrapSelection('*', '*', 'italic text')
+            }
+            icon={<Italic className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Inline code"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.applyInlineFormat('code')
+                : wrapSelection('`', '`', 'code')
+            }
+            icon={<Code className="w-4 h-4" />}
+          />
+          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+          <ToolbarButton
+            label="Code block"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.insertCodeBlock('bash', '')
+                : insertAtCursor('```bash\n\n```\n', 8, 8)
+            }
+            icon={<FileCode2 className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Insert image"
+            onClick={() => setImageModalOpen(true)}
+            icon={<ImagePlus className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Table"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.insertTableBlock()
+                : insertAtCursor(
+                    '| Column A | Column B |\n| :--- | :--- |\n| Value 1 | Value 2 |\n'
+                  )
+            }
+            icon={<Table className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Checklist"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.toggleOrInsertBlock('task-item')
+                : insertAtCursor('- [ ] Task item\n')
+            }
+            icon={<CheckSquare className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Callout quote"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.toggleOrInsertBlock('blockquote')
+                : insertAtCursor('> Note: ')
+            }
+            icon={<Quote className="w-4 h-4" />}
+          />
+          <ToolbarButton
+            label="Horizontal rule"
+            onClick={() =>
+              viewMode === 'read'
+                ? liveEditorRef.current?.insertDividerBlock()
+                : insertAtCursor('\n---\n\n')
+            }
+            icon={<Minus className="w-4 h-4" />}
+          />
+        </div>
 
           <div className="flex items-center gap-2 shrink-0">
             <button
@@ -713,7 +937,6 @@ export function DocumentWorkspace({
             </div>
           </div>
         </div>
-      )}
 
       {/* Main Document Area + Optional Outline Rail */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
@@ -722,9 +945,32 @@ export function DocumentWorkspace({
             {/* Left Pane: Markdown Source */}
             <div className="flex flex-col min-h-0 overflow-y-auto px-6 py-6">
               <input
+                ref={titleInputRef}
+                data-note-field="title"
                 type="text"
                 value={note.title}
-                onChange={(e) => onUpdateNote(note.id, { title: e.target.value })}
+                onFocus={(e) => syncTitleSelection(e.currentTarget)}
+                onSelect={(e) => syncTitleSelection(e.currentTarget)}
+                onKeyDown={(e) => syncTitleSelection(e.currentTarget)}
+                onMouseUp={(e) => syncTitleSelection(e.currentTarget)}
+                onPaste={(e) => syncTitleSelection(e.currentTarget)}
+                onCut={(e) => syncTitleSelection(e.currentTarget)}
+                onChange={(e) => {
+                  const nextStart = e.target.selectionStart ?? e.target.value.length;
+                  const nextEnd = e.target.selectionEnd ?? nextStart;
+                  const prevSel = lastTitleSelectionRef.current;
+                  lastTitleSelectionRef.current = { start: nextStart, end: nextEnd };
+                  onUpdateNote(
+                    note.id,
+                    { title: e.target.value },
+                    {
+                      source: 'typing',
+                      field: 'title',
+                      prevSelection: { target: 'title', ...prevSel },
+                      nextSelection: { target: 'title', start: nextStart, end: nextEnd },
+                    }
+                  );
+                }}
                 placeholder="Document title..."
                 aria-label="Document title"
                 className="w-full bg-transparent text-[26px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
@@ -742,10 +988,34 @@ export function DocumentWorkspace({
               </div>
               <textarea
                 ref={textareaRef}
+                data-note-field="content"
                 value={note.content}
-                onChange={(e) => onUpdateNote(note.id, { content: e.target.value })}
+                onFocus={(e) => syncTextareaSelection(e.currentTarget)}
+                onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onCut={(e) => syncTextareaSelection(e.currentTarget)}
+                onChange={(e) => {
+                  const nextStart = e.target.selectionStart ?? e.target.value.length;
+                  const nextEnd = e.target.selectionEnd ?? nextStart;
+                  const prevSel = lastTextareaSelectionRef.current;
+                  lastTextareaSelectionRef.current = { start: nextStart, end: nextEnd };
+                  setHasSelection(nextEnd > nextStart);
+                  onUpdateNote(
+                    note.id,
+                    { content: e.target.value },
+                    {
+                      source: 'typing',
+                      field: 'content',
+                      prevSelection: { target: 'content', ...prevSel },
+                      nextSelection: { target: 'content', start: nextStart, end: nextEnd },
+                    }
+                  );
+                }}
                 onKeyDown={handleEditorKeyDown}
-                onPaste={handleEditorPaste}
+                onPaste={async (e) => {
+                  syncTextareaSelection(e.currentTarget);
+                  await handleEditorPaste(e);
+                }}
                 onDragOver={(e) => {
                   if (e.dataTransfer.types.includes('Files')) {
                     e.preventDefault();
@@ -760,10 +1030,7 @@ export function DocumentWorkspace({
                     await handleImageFiles(e.dataTransfer.files);
                   }
                 }}
-                onSelect={(e) => {
-                  const t = e.currentTarget;
-                  setHasSelection(t.selectionEnd > t.selectionStart);
-                }}
+                onSelect={(e) => syncTextareaSelection(e.currentTarget)}
                 placeholder="Write Markdown notes, paste screenshots, or press Insert snippet above..."
                 aria-label="Markdown document editor"
                 className={`flex-1 w-full min-h-[420px] bg-transparent font-mono-code text-[14px] leading-[1.7] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
@@ -786,7 +1053,11 @@ export function DocumentWorkspace({
                 <MarkdownRenderer
                   content={note.content || '*Start typing in the editor to preview your Markdown document.*'}
                   onToggleCheckbox={(idx) =>
-                    onUpdateNote(note.id, { content: toggleTaskCheckbox(note.content, idx) })
+                    onUpdateNote(
+                      note.id,
+                      { content: toggleTaskCheckbox(note.content, idx) },
+                      { source: 'discrete', field: 'content' }
+                    )
                   }
                 />
               </div>
@@ -796,9 +1067,32 @@ export function DocumentWorkspace({
           <div className="flex-1 overflow-y-auto px-6 sm:px-10 py-8">
             <div className="max-w-[780px] mx-auto flex flex-col min-h-full">
               <input
+                ref={titleInputRef}
+                data-note-field="title"
                 type="text"
                 value={note.title}
-                onChange={(e) => onUpdateNote(note.id, { title: e.target.value })}
+                onFocus={(e) => syncTitleSelection(e.currentTarget)}
+                onSelect={(e) => syncTitleSelection(e.currentTarget)}
+                onKeyDown={(e) => syncTitleSelection(e.currentTarget)}
+                onMouseUp={(e) => syncTitleSelection(e.currentTarget)}
+                onPaste={(e) => syncTitleSelection(e.currentTarget)}
+                onCut={(e) => syncTitleSelection(e.currentTarget)}
+                onChange={(e) => {
+                  const nextStart = e.target.selectionStart ?? e.target.value.length;
+                  const nextEnd = e.target.selectionEnd ?? nextStart;
+                  const prevSel = lastTitleSelectionRef.current;
+                  lastTitleSelectionRef.current = { start: nextStart, end: nextEnd };
+                  onUpdateNote(
+                    note.id,
+                    { title: e.target.value },
+                    {
+                      source: 'typing',
+                      field: 'title',
+                      prevSelection: { target: 'title', ...prevSel },
+                      nextSelection: { target: 'title', start: nextStart, end: nextEnd },
+                    }
+                  );
+                }}
                 placeholder="Document title..."
                 aria-label="Document title"
                 className="w-full bg-transparent text-[30px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
@@ -818,10 +1112,34 @@ export function DocumentWorkspace({
               </div>
               <textarea
                 ref={textareaRef}
+                data-note-field="content"
                 value={note.content}
-                onChange={(e) => onUpdateNote(note.id, { content: e.target.value })}
+                onFocus={(e) => syncTextareaSelection(e.currentTarget)}
+                onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onCut={(e) => syncTextareaSelection(e.currentTarget)}
+                onChange={(e) => {
+                  const nextStart = e.target.selectionStart ?? e.target.value.length;
+                  const nextEnd = e.target.selectionEnd ?? nextStart;
+                  const prevSel = lastTextareaSelectionRef.current;
+                  lastTextareaSelectionRef.current = { start: nextStart, end: nextEnd };
+                  setHasSelection(nextEnd > nextStart);
+                  onUpdateNote(
+                    note.id,
+                    { content: e.target.value },
+                    {
+                      source: 'typing',
+                      field: 'content',
+                      prevSelection: { target: 'content', ...prevSel },
+                      nextSelection: { target: 'content', start: nextStart, end: nextEnd },
+                    }
+                  );
+                }}
                 onKeyDown={handleEditorKeyDown}
-                onPaste={handleEditorPaste}
+                onPaste={async (e) => {
+                  syncTextareaSelection(e.currentTarget);
+                  await handleEditorPaste(e);
+                }}
                 onDragOver={(e) => {
                   if (e.dataTransfer.types.includes('Files')) {
                     e.preventDefault();
@@ -836,10 +1154,7 @@ export function DocumentWorkspace({
                     await handleImageFiles(e.dataTransfer.files);
                   }
                 }}
-                onSelect={(e) => {
-                  const t = e.currentTarget;
-                  setHasSelection(t.selectionEnd > t.selectionStart);
-                }}
+                onSelect={(e) => syncTextareaSelection(e.currentTarget)}
                 placeholder="Write technical notes in Markdown, paste screenshots, or insert organized snippets..."
                 aria-label="Markdown document editor"
                 className={`flex-1 w-full min-h-[540px] bg-transparent font-mono-code text-[14.5px] leading-[1.75] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
@@ -849,7 +1164,7 @@ export function DocumentWorkspace({
             </div>
           </div>
         ) : (
-          /* Read Mode — Clean ChatGPT-style single-column technical document */
+          /* Document Mode — Direct in-place editable rich document without needing to click Edit */
           <div
             className={`flex-1 overflow-y-auto px-6 sm:px-10 py-8 sm:py-10 transition-colors ${
               isDraggingOver ? 'bg-blue-500/[0.04]' : ''
@@ -871,29 +1186,37 @@ export function DocumentWorkspace({
           >
             <article className="max-w-[760px] mx-auto pb-16">
               <div className="mb-7">
-                <div className="flex items-start justify-between gap-4">
-                  <h1 className="text-[30px] sm:text-[32px] font-bold tracking-tight text-neutral-950 dark:text-white leading-tight [text-wrap:balance]">
-                    {note.title || 'Untitled Note'}
-                  </h1>
-                  <div className="mt-1 flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setImageModalOpen(true)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium border border-neutral-200 dark:border-white/[0.1] text-neutral-600 dark:text-neutral-300 hover:text-neutral-950 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      <ImagePlus className="w-3.5 h-3.5" />
-                      <span>Add image</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onChangeViewMode('write')}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium border border-neutral-200 dark:border-white/[0.1] text-neutral-600 dark:text-neutral-300 hover:text-neutral-950 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      <PenLine className="w-3.5 h-3.5" />
-                      <span>Edit</span>
-                    </button>
-                  </div>
-                </div>
+                <input
+                  ref={titleInputRef}
+                  data-note-field="title"
+                  type="text"
+                  value={note.title}
+                  onFocus={(e) => syncTitleSelection(e.currentTarget)}
+                  onSelect={(e) => syncTitleSelection(e.currentTarget)}
+                  onKeyDown={(e) => syncTitleSelection(e.currentTarget)}
+                  onMouseUp={(e) => syncTitleSelection(e.currentTarget)}
+                  onPaste={(e) => syncTitleSelection(e.currentTarget)}
+                  onCut={(e) => syncTitleSelection(e.currentTarget)}
+                  onChange={(e) => {
+                    const nextStart = e.target.selectionStart ?? e.target.value.length;
+                    const nextEnd = e.target.selectionEnd ?? nextStart;
+                    const prevSel = lastTitleSelectionRef.current;
+                    lastTitleSelectionRef.current = { start: nextStart, end: nextEnd };
+                    onUpdateNote(
+                      note.id,
+                      { title: e.target.value },
+                      {
+                        source: 'typing',
+                        field: 'title',
+                        prevSelection: { target: 'title', ...prevSel },
+                        nextSelection: { target: 'title', start: nextStart, end: nextEnd },
+                      }
+                    );
+                  }}
+                  placeholder="Untitled Note"
+                  aria-label="Document title"
+                  className="w-full bg-transparent text-[30px] sm:text-[32px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none leading-tight"
+                />
 
                 <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[12.5px] text-neutral-500 dark:text-neutral-400 tabular-nums">
                   <span>{folderName}</span>
@@ -910,28 +1233,16 @@ export function DocumentWorkspace({
                 </div>
               </div>
 
-              {note.content.trim() ? (
-                <MarkdownRenderer
-                  content={note.content}
-                  onToggleCheckbox={(idx) =>
-                    onUpdateNote(note.id, { content: toggleTaskCheckbox(note.content, idx) })
-                  }
-                />
-              ) : (
-                <div className="rounded-xl border border-neutral-200 dark:border-white/[0.08] p-8 text-center space-y-3">
-                  <p className="text-[14.5px] text-neutral-500 dark:text-neutral-400">
-                    This document is empty.
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => onChangeViewMode('write')}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer"
-                  >
-                    <PenLine className="w-3.5 h-3.5" />
-                    <span>Start writing</span>
-                  </button>
-                </div>
-              )}
+              <LiveDocumentEditor
+                ref={liveEditorRef}
+                noteId={note.id}
+                content={note.content}
+                onChangeContent={(nextMarkdown, meta) =>
+                  onUpdateNote(note.id, { content: nextMarkdown }, meta)
+                }
+                onPasteImageFiles={handleImageFiles}
+                onSelectionStateChange={setHasSelection}
+              />
             </article>
           </div>
         )}
@@ -1006,18 +1317,26 @@ function ToolbarButton({
   label,
   icon,
   onClick,
+  disabled = false,
 }: {
   label: string;
   icon: React.ReactNode;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
+      onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
+      disabled={disabled}
       title={label}
       aria-label={label}
-      className="p-1.5 rounded-md text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer"
+      className={`p-1.5 rounded-md transition-colors ${
+        disabled
+          ? 'text-neutral-300 dark:text-neutral-600 cursor-not-allowed'
+          : 'text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] cursor-pointer'
+      }`}
     >
       {icon}
     </button>

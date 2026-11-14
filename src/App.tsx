@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CommandPalette } from './components/CommandPalette';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
 import { Sidebar } from './components/Sidebar';
 import { SnippetModal } from './components/SnippetModal';
 import { SnippetsView } from './components/SnippetsView';
 import { INITIAL_FOLDERS, INITIAL_NOTES, INITIAL_SNIPPETS } from './data/seedData';
+import {
+  NoteSelection,
+  NoteSnapshot,
+  NoteUpdateMeta,
+  useNoteHistory,
+} from './hooks/useNoteHistory';
 import { Folder, NoteDocument, SidebarFilter, Snippet, ViewMode } from './types/notes';
 
 async function syncApi(url: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown) {
@@ -68,6 +74,20 @@ export default function App() {
 
   const dbEnabledRef = useRef(false);
   const notePatchTimersRef = useRef<Map<string, number>>(new Map());
+  const notesRef = useRef<NoteDocument[]>(notes);
+  notesRef.current = notes;
+  const activeNoteIdRef = useRef<string | null>(activeNoteId);
+  activeNoteIdRef.current = activeNoteId;
+  const selectionReaderRef = useRef<() => NoteSelection | null>(() => null);
+  const selectionSeqRef = useRef(0);
+  const [pendingSelection, setPendingSelection] = useState<{
+    noteId: string;
+    selection: NoteSelection;
+    seq: number;
+  } | null>(null);
+
+  const { canUndo, canRedo, recordChange, undo, redo, clearNoteHistory } =
+    useNoteHistory(activeNoteId);
 
   // Hydrate from PostgreSQL backend when configured
   useEffect(() => {
@@ -84,6 +104,7 @@ export default function App() {
       .then((data) => {
         if (!data || cancelled) return;
         dbEnabledRef.current = true;
+        notesRef.current = data.notes;
         setFolders(data.folders);
         setNotes(data.notes);
         setSnippets(data.snippets);
@@ -148,23 +169,115 @@ export default function App() {
     }
   }, [activeNoteId]);
 
-  // Global keyboard shortcuts (Cmd/Ctrl+K for search, Cmd/Ctrl+E to toggle edit/read)
+  const applyHistorySnapshot = useCallback((noteId: string, snapshot: NoteSnapshot) => {
+    const updatedAt = Date.now();
+    const patch = {
+      title: snapshot.title,
+      content: snapshot.content,
+      folderId: snapshot.folderId,
+      starred: snapshot.starred,
+    };
+    const nextNotes = notesRef.current.map((n) =>
+      n.id === noteId ? { ...n, ...patch, updatedAt } : n
+    );
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+
+    if (snapshot.selection) {
+      selectionSeqRef.current += 1;
+      setPendingSelection({
+        noteId,
+        selection: snapshot.selection,
+        seq: selectionSeqRef.current,
+      });
+    }
+
+    if (dbEnabledRef.current) {
+      const existingTimer = notePatchTimersRef.current.get(noteId);
+      if (existingTimer) window.clearTimeout(existingTimer);
+      const timer = window.setTimeout(() => {
+        notePatchTimersRef.current.delete(noteId);
+        void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
+          ...patch,
+          updatedAt,
+        });
+      }, 280);
+      notePatchTimersRef.current.set(noteId, timer);
+    }
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    const current = notesRef.current.find((n) => n.id === activeNoteIdRef.current);
+    if (!current) return;
+    const currentSelection = selectionReaderRef.current();
+    const snapshot = undo(current, currentSelection);
+    if (!snapshot) return;
+    applyHistorySnapshot(current.id, snapshot);
+  }, [applyHistorySnapshot, undo]);
+
+  const handleRedo = useCallback(() => {
+    const current = notesRef.current.find((n) => n.id === activeNoteIdRef.current);
+    if (!current) return;
+    const currentSelection = selectionReaderRef.current();
+    const snapshot = redo(current, currentSelection);
+    if (!snapshot) return;
+    applyHistorySnapshot(current.id, snapshot);
+  }, [applyHistorySnapshot, redo]);
+
+  // Global keyboard shortcuts (Cmd/Ctrl+Z undo, Cmd/Ctrl+Y or Cmd/Ctrl+Shift+Z redo, Cmd/Ctrl+K search, Cmd/Ctrl+E view mode)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      const mod = (e.ctrlKey || e.metaKey) && !e.altKey;
+      const key = e.key.toLowerCase();
+
+      if (mod && (key === 'z' || (key === 'y' && !e.shiftKey))) {
+        if (
+          filter.type === 'snippets' ||
+          !activeNoteId ||
+          searchOpen ||
+          snippetModalState.open
+        ) {
+          return;
+        }
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[role="dialog"], [aria-modal="true"]')) {
+          return;
+        }
+        const tag = target?.tagName;
+        const isEditableElement =
+          tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(target?.isContentEditable);
+        const isNoteField =
+          target?.dataset?.noteField === 'title' ||
+          target?.dataset?.noteField === 'content' ||
+          Boolean(target?.closest('[data-live-editor="true"]'));
+
+        if (isEditableElement && !isNoteField) {
+          return;
+        }
+
+        e.preventDefault();
+        if (key === 'y' || e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+        return;
+      }
+
+      if (mod && key === 'k') {
         const tag = (e.target as HTMLElement)?.tagName;
         if (tag !== 'TEXTAREA') {
           e.preventDefault();
           setSearchOpen((prev) => !prev);
         }
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'e') {
+      } else if (mod && key === 'e') {
         e.preventDefault();
         setViewMode((prev) => (prev === 'read' ? 'split' : prev === 'split' ? 'write' : 'read'));
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [filter.type, activeNoteId, searchOpen, snippetModalState.open, handleUndo, handleRedo]);
 
   const activeNote = useMemo(
     () => notes.find((n) => n.id === activeNoteId) ?? null,
@@ -196,12 +309,14 @@ export default function App() {
       updatedAt: now,
     };
 
-    setNotes((prev) => [newNote, ...prev]);
+    const nextNotes = [newNote, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
     setActiveNoteId(newNote.id);
     if (filter.type === 'snippets') {
       setFilter({ type: 'all' });
     }
-    setViewMode('split');
+    setViewMode('read');
     if (window.innerWidth < 1024) setSidebarOpen(false);
 
     if (dbEnabledRef.current) {
@@ -209,37 +324,54 @@ export default function App() {
     }
   };
 
-  const handleUpdateNote = (
-    noteId: string,
-    patch: Partial<Pick<NoteDocument, 'title' | 'content' | 'folderId' | 'starred'>>
-  ) => {
-    const updatedAt = Date.now();
-    setNotes((prev) =>
-      prev.map((n) => (n.id === noteId ? { ...n, ...patch, updatedAt } : n))
-    );
+  const handleUpdateNote = useCallback(
+    (
+      noteId: string,
+      patch: Partial<Pick<NoteDocument, 'title' | 'content' | 'folderId' | 'starred'>>,
+      meta?: NoteUpdateMeta
+    ) => {
+      const prevNote = notesRef.current.find((n) => n.id === noteId);
+      if (!prevNote) return;
 
-    if (dbEnabledRef.current) {
-      const existingTimer = notePatchTimersRef.current.get(noteId);
-      if (existingTimer) window.clearTimeout(existingTimer);
-      const timer = window.setTimeout(() => {
-        notePatchTimersRef.current.delete(noteId);
-        void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
-          ...patch,
-          updatedAt,
-        });
-      }, 280);
-      notePatchTimersRef.current.set(noteId, timer);
-    }
-  };
+      const updatedAt = Date.now();
+      const nextNote: NoteDocument = { ...prevNote, ...patch, updatedAt };
+      const changed =
+        prevNote.title !== nextNote.title ||
+        prevNote.content !== nextNote.content ||
+        prevNote.folderId !== nextNote.folderId ||
+        prevNote.starred !== nextNote.starred;
+
+      if (!changed) return;
+
+      recordChange(prevNote, nextNote, meta);
+      const nextNotes = notesRef.current.map((n) => (n.id === noteId ? nextNote : n));
+      notesRef.current = nextNotes;
+      setNotes(nextNotes);
+
+      if (dbEnabledRef.current) {
+        const existingTimer = notePatchTimersRef.current.get(noteId);
+        if (existingTimer) window.clearTimeout(existingTimer);
+        const timer = window.setTimeout(() => {
+          notePatchTimersRef.current.delete(noteId);
+          void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
+            ...patch,
+            updatedAt,
+          });
+        }, 280);
+        notePatchTimersRef.current.set(noteId, timer);
+      }
+    },
+    [recordChange]
+  );
 
   const handleDeleteNote = (noteId: string) => {
-    setNotes((prev) => {
-      const remaining = prev.filter((n) => n.id !== noteId);
-      if (activeNoteId === noteId) {
-        setActiveNoteId(remaining[0]?.id ?? null);
-      }
-      return remaining;
-    });
+    clearNoteHistory(noteId);
+    const remaining = notesRef.current.filter((n) => n.id !== noteId);
+    notesRef.current = remaining;
+    setNotes(remaining);
+    if (activeNoteId === noteId) {
+      setActiveNoteId(remaining[0]?.id ?? null);
+    }
 
     if (dbEnabledRef.current) {
       void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'DELETE');
@@ -247,24 +379,13 @@ export default function App() {
   };
 
   const handleToggleStar = (noteId: string) => {
-    let nextStarred = false;
-    const updatedAt = Date.now();
-    setNotes((prev) =>
-      prev.map((n) => {
-        if (n.id === noteId) {
-          nextStarred = !n.starred;
-          return { ...n, starred: nextStarred, updatedAt };
-        }
-        return n;
-      })
+    const target = notesRef.current.find((n) => n.id === noteId);
+    if (!target) return;
+    handleUpdateNote(
+      noteId,
+      { starred: !target.starred },
+      { source: 'discrete', field: 'starred' }
     );
-
-    if (dbEnabledRef.current) {
-      void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
-        starred: nextStarred,
-        updatedAt,
-      });
-    }
   };
 
   const handleCreateFolder = (name: string) => {
@@ -288,9 +409,11 @@ export default function App() {
 
   const handleDeleteFolder = (folderId: string) => {
     setFolders((prev) => prev.filter((f) => f.id !== folderId));
-    setNotes((prev) =>
-      prev.map((n) => (n.folderId === folderId ? { ...n, folderId: null } : n))
+    const nextNotes = notesRef.current.map((n) =>
+      n.folderId === folderId ? { ...n, folderId: null } : n
     );
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
     if (filter.type === 'folder' && filter.folderId === folderId) {
       setFilter({ type: 'all' });
     }
@@ -319,7 +442,9 @@ export default function App() {
         createdAt: now,
         updatedAt: now,
       };
-      setNotes((prev) => [imported, ...prev]);
+      const nextNotes = [imported, ...notesRef.current];
+      notesRef.current = nextNotes;
+      setNotes(nextNotes);
       setActiveNoteId(imported.id);
       if (filter.type === 'snippets') setFilter({ type: 'all' });
       setViewMode('read');
@@ -392,11 +517,12 @@ export default function App() {
   const handleInsertSnippetIntoActiveNote = (snippet: Snippet) => {
     if (activeNote) {
       const separator = activeNote.content.trimEnd() ? '\n\n' : '';
-      handleUpdateNote(activeNote.id, {
-        content: `${activeNote.content.trimEnd()}${separator}${snippet.content}\n`,
-      });
+      handleUpdateNote(
+        activeNote.id,
+        { content: `${activeNote.content.trimEnd()}${separator}${snippet.content}\n` },
+        { source: 'discrete', field: 'content' }
+      );
       setFilter({ type: 'all' });
-      setViewMode('split');
     } else {
       const now = Date.now();
       const created: NoteDocument = {
@@ -408,10 +534,12 @@ export default function App() {
         createdAt: now,
         updatedAt: now,
       };
-      setNotes((prev) => [created, ...prev]);
+      const nextNotes = [created, ...notesRef.current];
+      notesRef.current = nextNotes;
+      setNotes(nextNotes);
       setActiveNoteId(created.id);
       setFilter({ type: 'all' });
-      setViewMode('split');
+      setViewMode('read');
 
       if (dbEnabledRef.current) {
         void syncApi('/api/notes', 'POST', created);
@@ -482,6 +610,12 @@ export default function App() {
           viewMode={viewMode}
           sidebarOpen={sidebarOpen}
           outlineOpen={outlineOpen}
+          canUndo={canUndo}
+          canRedo={canRedo}
+          pendingSelection={pendingSelection}
+          selectionReaderRef={selectionReaderRef}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
           onOpenSidebar={() => setSidebarOpen(true)}
           onToggleOutline={() => setOutlineOpen((prev) => !prev)}
           onChangeViewMode={setViewMode}
