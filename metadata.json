@@ -1,0 +1,6 @@
+{
+  "name": "NoteCraft",
+  "description": "A focused technical note-taking and organized Markdown snippet workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

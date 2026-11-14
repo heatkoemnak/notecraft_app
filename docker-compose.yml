@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: notecraft-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PGUSER:-notecraft}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-notecraft_secret_password}
+      POSTGRES_DB: ${PGDATABASE:-notecraft}
+    volumes:
+      - notecraft_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-notecraft} -d ${PGDATABASE:-notecraft}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  notecraft:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notecraft-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${PGUSER:-notecraft}
+      PGPASSWORD: ${PGPASSWORD:-notecraft_secret_password}
+      PGDATABASE: ${PGDATABASE:-notecraft}
+      PGSSL: "false"
+    ports:
+      - "8080:3000"
+
+volumes:
+  notecraft_pgdata:
