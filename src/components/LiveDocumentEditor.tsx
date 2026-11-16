@@ -7,16 +7,18 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { createPortal } from 'react-dom';
 import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   Check,
   Copy,
   ImageOff,
   Maximize2,
-  Minus,
-  Plus,
   RotateCcw,
   Trash2,
-  X,
 } from 'lucide-react';
 import { NoteUpdateMeta } from '../hooks/useNoteHistory';
 import {
@@ -572,9 +574,9 @@ function EditableTableBlock({
   onPasteImages,
   onUpdateHeader,
   onUpdateCell,
-  onAddRow,
+  onInsertRowAt,
   onDeleteRow,
-  onAddColumn,
+  onInsertColumnAt,
   onDeleteColumn,
   onChangeColWidths,
   onDeleteTable,
@@ -585,18 +587,42 @@ function EditableTableBlock({
   onPasteImages?: (files: File[]) => void;
   onUpdateHeader: (colIdx: number, val: string) => void;
   onUpdateCell: (rowIdx: number, colIdx: number, val: string) => void;
-  onAddRow: () => void;
+  onInsertRowAt: (insertIdx: number) => void;
   onDeleteRow: (rowIdx: number) => void;
-  onAddColumn: () => void;
+  onInsertColumnAt: (insertIdx: number) => void;
   onDeleteColumn: (colIdx: number) => void;
   onChangeColWidths: (colWidths: number[] | undefined) => void;
   onDeleteTable: () => void;
 }) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const tableRef = useRef<HTMLTableElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const cellElRefs = useRef<Map<string, HTMLElement>>(new Map());
   const [localSyncSeq, setLocalSyncSeq] = useState(0);
   const [draftWidths, setDraftWidths] = useState<number[] | null>(null);
   const [resizingColIdx, setResizingColIdx] = useState<number | null>(null);
+  const [activeCell, setActiveCell] = useState<{ rowIdx: number; colIdx: number } | null>(
+    null
+  );
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    rowIdx: number;
+    colIdx: number;
+  } | null>(null);
   const cleanupDragRef = useRef<(() => void) | null>(null);
+
+  const registerCellRef = useCallback(
+    (rowIdx: number, colIdx: number, el: HTMLElement | null) => {
+      const key = `${rowIdx}:${colIdx}`;
+      if (el) {
+        cellElRefs.current.set(key, el);
+      } else {
+        cellElRefs.current.delete(key);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     return () => {
@@ -604,14 +630,57 @@ function EditableTableBlock({
     };
   }, []);
 
+  useEffect(() => {
+    if (!activeCell && !contextMenu) return;
+
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (menuRef.current && menuRef.current.contains(target)) return;
+      if (contextMenu) {
+        setContextMenu(null);
+      }
+      if (wrapperRef.current && !wrapperRef.current.contains(target)) {
+        setActiveCell(null);
+      }
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [activeCell, contextMenu]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setContextMenu(null);
+      }
+    };
+
+    const handleScrollOrResize = () => {
+      setContextMenu(null);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('scroll', handleScrollOrResize, true);
+    window.addEventListener('resize', handleScrollOrResize);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('scroll', handleScrollOrResize, true);
+      window.removeEventListener('resize', handleScrollOrResize);
+    };
+  }, [contextMenu]);
+
   const persistedWidths =
     block.colWidths && block.colWidths.length === block.headers.length
       ? block.colWidths
       : null;
   const activeWidths = draftWidths ?? persistedWidths;
-  const actionColWidth = 36;
   const totalWidth = activeWidths
-    ? activeWidths.reduce((sum, w) => sum + w, 0) + actionColWidth
+    ? activeWidths.reduce((sum, w) => sum + w, 0)
     : null;
 
   const startColumnResize = (e: React.PointerEvent<HTMLDivElement>, colIdx: number) => {
@@ -668,14 +737,85 @@ function EditableTableBlock({
     window.addEventListener('pointercancel', handlePointerUp);
   };
 
+  const openContextMenuForCell = (
+    e: React.MouseEvent,
+    rowIdx: number,
+    colIdx: number
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const menuWidth = 216;
+    const menuHeight = 290;
+    const clampedX = Math.max(
+      8,
+      Math.min(e.clientX, window.innerWidth - menuWidth - 8)
+    );
+    const clampedY = Math.max(
+      8,
+      Math.min(e.clientY, window.innerHeight - menuHeight - 8)
+    );
+
+    setActiveCell({ rowIdx, colIdx });
+    setContextMenu({ x: clampedX, y: clampedY, rowIdx, colIdx });
+    onFocusBlock();
+  };
+
+  const handleTableContextMenu = (e: React.MouseEvent<HTMLTableElement>) => {
+    const target = (e.target as HTMLElement | null)?.closest<HTMLElement>(
+      '[data-cell-row][data-cell-col]'
+    );
+    if (target) {
+      const r = Number(target.getAttribute('data-cell-row'));
+      const c = Number(target.getAttribute('data-cell-col'));
+      if (!Number.isNaN(r) && !Number.isNaN(c)) {
+        openContextMenuForCell(e, r, c);
+        return;
+      }
+    }
+    if (activeCell) {
+      openContextMenuForCell(e, activeCell.rowIdx, activeCell.colIdx);
+    }
+  };
+
+  const focusCellAfterUpdate = (targetRowIdx: number, targetColIdx: number) => {
+    window.requestAnimationFrame(() => {
+      const clampedRow = Math.min(targetRowIdx, block.rows.length);
+      const clampedCol = Math.max(0, Math.min(targetColIdx, block.headers.length));
+      const el = cellElRefs.current.get(`${clampedRow}:${clampedCol}`);
+      if (el) {
+        placeCaretAtStart(el);
+        setActiveCell({ rowIdx: clampedRow, colIdx: clampedCol });
+      }
+    });
+  };
+
   const syncSeq = externalSyncSeq + localSyncSeq;
   const canDeleteCol = block.headers.length > 1;
+  const highlightedCell = contextMenu
+    ? { rowIdx: contextMenu.rowIdx, colIdx: contextMenu.colIdx }
+    : activeCell;
+
+  const focusCellPadding = (
+    e: React.MouseEvent<HTMLTableCellElement>,
+    rowIdx: number,
+    colIdx: number
+  ) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement)?.closest('[role="separator"]')) return;
+    const cellEl = cellElRefs.current.get(`${rowIdx}:${colIdx}`);
+    if (cellEl && e.target !== cellEl && !cellEl.contains(e.target as Node)) {
+      placeCaretAtEnd(cellEl);
+      setActiveCell({ rowIdx, colIdx });
+    }
+  };
 
   return (
-    <div className="group my-5">
+    <div ref={wrapperRef} className="my-5">
       <div className="overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
         <table
           ref={tableRef}
+          onContextMenu={handleTableContextMenu}
           style={totalWidth ? { width: `${totalWidth}px`, minWidth: '100%' } : undefined}
           className={`${
             activeWidths ? 'table-fixed' : 'w-full'
@@ -686,194 +826,288 @@ function EditableTableBlock({
               {activeWidths.map((w, idx) => (
                 <col key={idx} style={{ width: `${w}px` }} />
               ))}
-              <col style={{ width: `${actionColWidth}px` }} />
             </colgroup>
           )}
           <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
             <tr>
-              {block.headers.map((header, colIdx) => (
-                <th
-                  key={colIdx}
-                  data-col-header={colIdx}
-                  className={`group/col relative pl-4 pr-7 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200 align-top ${
-                    colIdx > 0 ? 'border-l border-neutral-200/70 dark:border-white/[0.06]' : ''
-                  } ${resizingColIdx === colIdx ? 'bg-blue-500/[0.06]' : ''}`}
-                >
-                  <RichInlineField
-                    markdown={header}
-                    externalSyncSeq={syncSeq}
-                    placeholder="Header"
-                    ariaLabel={`Table column ${colIdx + 1} header`}
-                    className="min-w-[44px]"
-                    onFocusBlock={onFocusBlock}
-                    onChangeMarkdown={(val) => onUpdateHeader(colIdx, val)}
-                    onPasteImages={onPasteImages}
-                  />
-
-                  {canDeleteCol && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLocalSyncSeq((s) => s + 1);
-                        onDeleteColumn(colIdx);
-                      }}
-                      title={`Delete column ${colIdx + 1}`}
-                      aria-label={`Delete column ${colIdx + 1}`}
-                      className="opacity-0 group-hover/col:opacity-100 focus:opacity-100 absolute top-2 right-2.5 p-0.5 rounded text-neutral-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-neutral-200/70 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  )}
-
-                  {resizingColIdx === colIdx && activeWidths && (
-                    <span className="pointer-events-none absolute -top-0.5 right-2 z-20 px-1.5 py-0.5 rounded bg-neutral-900 dark:bg-white text-[10px] font-mono-code font-medium text-white dark:text-neutral-950 tabular-nums shadow">
-                      {activeWidths[colIdx]}px
-                    </span>
-                  )}
-
-                  <div
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label={`Resize column ${colIdx + 1} width`}
-                    title="Drag to resize column (double-click to reset)"
-                    onPointerDown={(e) => startColumnResize(e, colIdx)}
-                    onDoubleClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onChangeColWidths(undefined);
-                    }}
-                    className="group/resizer absolute top-0 right-0 bottom-0 w-2.5 z-10 cursor-col-resize flex justify-end select-none touch-none"
+              {block.headers.map((header, colIdx) => {
+                const isExactTarget =
+                  highlightedCell?.rowIdx === -1 && highlightedCell?.colIdx === colIdx;
+                const isActiveCol = highlightedCell?.colIdx === colIdx;
+                return (
+                  <th
+                    key={colIdx}
+                    data-col-header={colIdx}
+                    data-cell-row={-1}
+                    data-cell-col={colIdx}
+                    onClick={(e) => focusCellPadding(e, -1, colIdx)}
+                    onContextMenu={(e) => openContextMenuForCell(e, -1, colIdx)}
+                    className={`relative px-4 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200 align-top transition-colors ${
+                      colIdx > 0 ? 'border-l border-neutral-200/70 dark:border-white/[0.06]' : ''
+                    } ${
+                      resizingColIdx === colIdx
+                        ? 'bg-blue-500/[0.08]'
+                        : isExactTarget
+                        ? 'bg-blue-500/[0.07] ring-1 ring-inset ring-blue-500/45'
+                        : isActiveCol
+                        ? 'bg-blue-500/[0.03]'
+                        : ''
+                    }`}
                   >
-                    <span
-                      className={`w-[2px] h-full transition-colors ${
-                        resizingColIdx === colIdx
-                          ? 'bg-blue-500'
-                          : 'bg-transparent group-hover/resizer:bg-blue-500/75'
-                      }`}
+                    <RichInlineField
+                      markdown={header}
+                      externalSyncSeq={syncSeq}
+                      placeholder="Header"
+                      ariaLabel={`Table column ${colIdx + 1} header`}
+                      className="min-w-[44px]"
+                      registerRef={(el) => registerCellRef(-1, colIdx, el)}
+                      onFocusBlock={() => {
+                        setActiveCell({ rowIdx: -1, colIdx });
+                        onFocusBlock();
+                      }}
+                      onChangeMarkdown={(val) => onUpdateHeader(colIdx, val)}
+                      onPasteImages={onPasteImages}
                     />
-                  </div>
-                </th>
-              ))}
-              <th
-                className="w-9 px-1 py-2.5 border-l border-neutral-200/70 dark:border-white/[0.06] text-center align-middle"
-                aria-label="Row actions"
-              />
+
+                    {resizingColIdx === colIdx && activeWidths && (
+                      <span className="pointer-events-none absolute -top-0.5 right-2 z-20 px-1.5 py-0.5 rounded bg-neutral-900 dark:bg-white text-[10px] font-mono-code font-medium text-white dark:text-neutral-950 tabular-nums shadow">
+                        {activeWidths[colIdx]}px
+                      </span>
+                    )}
+
+                    <div
+                      role="separator"
+                      aria-orientation="vertical"
+                      aria-label={`Resize column ${colIdx + 1} width`}
+                      title="Drag to resize column (double-click to reset)"
+                      onPointerDown={(e) => startColumnResize(e, colIdx)}
+                      onDoubleClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onChangeColWidths(undefined);
+                      }}
+                      className="group/resizer absolute top-0 right-0 bottom-0 w-2.5 z-10 cursor-col-resize flex justify-end select-none touch-none"
+                    >
+                      <span
+                        className={`w-[2px] h-full transition-colors ${
+                          resizingColIdx === colIdx
+                            ? 'bg-blue-500'
+                            : 'bg-transparent group-hover/resizer:bg-blue-500/75'
+                        }`}
+                      />
+                    </div>
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
-            {block.rows.map((row, rowIdx) => (
-              <tr
-                key={rowIdx}
-                className="group/row hover:bg-neutral-50/70 dark:hover:bg-white/[0.015] transition-colors"
-              >
-                {block.headers.map((_, colIdx) => (
-                  <td
-                    key={colIdx}
-                    className={`px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top ${
-                      colIdx > 0 ? 'border-l border-neutral-200/50 dark:border-white/[0.04]' : ''
-                    } ${resizingColIdx === colIdx ? 'bg-blue-500/[0.03]' : ''}`}
-                  >
-                    <RichInlineField
-                      markdown={row[colIdx] || ''}
-                      externalSyncSeq={syncSeq}
-                      placeholder="Cell..."
-                      ariaLabel={`Table row ${rowIdx + 1} column ${colIdx + 1}`}
-                      className="min-w-[44px]"
-                      onFocusBlock={onFocusBlock}
-                      onChangeMarkdown={(val) => onUpdateCell(rowIdx, colIdx, val)}
-                      onPasteImages={onPasteImages}
-                    />
-                  </td>
-                ))}
-                <td className="w-9 px-1 py-2 border-t border-l border-neutral-200/70 dark:border-white/[0.06] text-center align-middle">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setLocalSyncSeq((s) => s + 1);
-                      onDeleteRow(rowIdx);
-                    }}
-                    title={`Delete row ${rowIdx + 1}`}
-                    aria-label={`Delete row ${rowIdx + 1}`}
-                    className="opacity-0 group-hover/row:opacity-100 focus:opacity-100 p-1 rounded text-neutral-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-neutral-200/60 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {block.rows.map((row, rowIdx) => {
+              const isActiveRow = highlightedCell?.rowIdx === rowIdx;
+              return (
+                <tr
+                  key={rowIdx}
+                  className="hover:bg-neutral-50/70 dark:hover:bg-white/[0.015] transition-colors"
+                >
+                  {block.headers.map((_, colIdx) => {
+                    const isExactTarget =
+                      isActiveRow && highlightedCell?.colIdx === colIdx;
+                    const isActiveCol = highlightedCell?.colIdx === colIdx;
+                    return (
+                      <td
+                        key={colIdx}
+                        data-cell-row={rowIdx}
+                        data-cell-col={colIdx}
+                        onClick={(e) => focusCellPadding(e, rowIdx, colIdx)}
+                        onContextMenu={(e) => openContextMenuForCell(e, rowIdx, colIdx)}
+                        className={`px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top transition-colors ${
+                          colIdx > 0
+                            ? 'border-l border-neutral-200/50 dark:border-white/[0.04]'
+                            : ''
+                        } ${
+                          resizingColIdx === colIdx
+                            ? 'bg-blue-500/[0.04]'
+                            : isExactTarget
+                            ? 'bg-blue-500/[0.06] ring-1 ring-inset ring-blue-500/45'
+                            : isActiveRow || isActiveCol
+                            ? 'bg-blue-500/[0.02]'
+                            : ''
+                        }`}
+                      >
+                        <RichInlineField
+                          markdown={row[colIdx] || ''}
+                          externalSyncSeq={syncSeq}
+                          placeholder="Cell..."
+                          ariaLabel={`Table row ${rowIdx + 1} column ${colIdx + 1}`}
+                          className="min-w-[44px]"
+                          registerRef={(el) => registerCellRef(rowIdx, colIdx, el)}
+                          onFocusBlock={() => {
+                            setActiveCell({ rowIdx, colIdx });
+                            onFocusBlock();
+                          }}
+                          onChangeMarkdown={(val) => onUpdateCell(rowIdx, colIdx, val)}
+                          onPasteImages={onPasteImages}
+                        />
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
 
-      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 opacity-80 sm:opacity-55 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <button
-            type="button"
-            onClick={onAddRow}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-300 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+      {contextMenu &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            aria-label="Table row and column actions"
+            style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+            className="fixed z-50 w-52 rounded-xl border border-neutral-200 dark:border-white/12 bg-white dark:bg-[#1a1a20] shadow-xl py-1.5 text-[12.5px] text-neutral-800 dark:text-neutral-200 select-none"
+            onContextMenu={(e) => e.preventDefault()}
           >
-            <Plus className="w-3 h-3" />
-            <span>Add row</span>
-          </button>
-          <button
-            type="button"
-            disabled={block.rows.length === 0}
-            onClick={() => {
-              if (block.rows.length === 0) return;
-              setLocalSyncSeq((s) => s + 1);
-              onDeleteRow(block.rows.length - 1);
-            }}
-            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium whitespace-nowrap ${
-              block.rows.length === 0
-                ? 'text-neutral-300 dark:text-neutral-600 cursor-not-allowed'
-                : 'text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer'
-            }`}
-          >
-            <Minus className="w-3 h-3" />
-            <span>Delete row</span>
-          </button>
-          <button
-            type="button"
-            onClick={onAddColumn}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-300 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
-          >
-            <Plus className="w-3 h-3" />
-            <span>Add col</span>
-          </button>
-          {canDeleteCol && (
-            <button
-              type="button"
-              onClick={() => {
-                setLocalSyncSeq((s) => s + 1);
-                onDeleteColumn(block.headers.length - 1);
-              }}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
-            >
-              <Minus className="w-3 h-3" />
-              <span>Delete col</span>
-            </button>
-          )}
-          {persistedWidths && (
-            <button
-              type="button"
-              onClick={() => onChangeColWidths(undefined)}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
-            >
-              <RotateCcw className="w-3 h-3" />
-              <span>Reset widths</span>
-            </button>
-          )}
-        </div>
+            {contextMenu.rowIdx >= 0 && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const insertAt = contextMenu.rowIdx;
+                  const targetCol = contextMenu.colIdx;
+                  setContextMenu(null);
+                  setLocalSyncSeq((s) => s + 1);
+                  onInsertRowAt(insertAt);
+                  focusCellAfterUpdate(insertAt, targetCol);
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left hover:bg-neutral-100 dark:hover:bg-white/[0.07] cursor-pointer"
+              >
+                <ArrowUp className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
+                <span>Add row above</span>
+              </button>
+            )}
 
-        <button
-          type="button"
-          onClick={onDeleteTable}
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
-        >
-          <Trash2 className="w-3 h-3" />
-          <span>Delete table</span>
-        </button>
-      </div>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const insertAt = contextMenu.rowIdx < 0 ? 0 : contextMenu.rowIdx + 1;
+                const targetCol = contextMenu.colIdx;
+                setContextMenu(null);
+                setLocalSyncSeq((s) => s + 1);
+                onInsertRowAt(insertAt);
+                focusCellAfterUpdate(insertAt, targetCol);
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left hover:bg-neutral-100 dark:hover:bg-white/[0.07] cursor-pointer"
+            >
+              <ArrowDown className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
+              <span>Add row below</span>
+            </button>
+
+            <div className="my-1 border-t border-neutral-200/80 dark:border-white/[0.08]" />
+
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const insertAt = contextMenu.colIdx;
+                const targetRow = contextMenu.rowIdx;
+                setContextMenu(null);
+                setLocalSyncSeq((s) => s + 1);
+                onInsertColumnAt(insertAt);
+                focusCellAfterUpdate(targetRow, insertAt);
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left hover:bg-neutral-100 dark:hover:bg-white/[0.07] cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
+              <span>Add column left</span>
+            </button>
+
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const insertAt = contextMenu.colIdx + 1;
+                const targetRow = contextMenu.rowIdx;
+                setContextMenu(null);
+                setLocalSyncSeq((s) => s + 1);
+                onInsertColumnAt(insertAt);
+                focusCellAfterUpdate(targetRow, insertAt);
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left hover:bg-neutral-100 dark:hover:bg-white/[0.07] cursor-pointer"
+            >
+              <ArrowRight className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
+              <span>Add column right</span>
+            </button>
+
+            <div className="my-1 border-t border-neutral-200/80 dark:border-white/[0.08]" />
+
+            {contextMenu.rowIdx >= 0 && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const rowToDelete = contextMenu.rowIdx;
+                  setContextMenu(null);
+                  setActiveCell(null);
+                  setLocalSyncSeq((s) => s + 1);
+                  onDeleteRow(rowToDelete);
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-red-600 dark:text-red-400 hover:bg-red-500/10 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                <span>Delete row</span>
+              </button>
+            )}
+
+            {canDeleteCol && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const colToDelete = contextMenu.colIdx;
+                  setContextMenu(null);
+                  setActiveCell(null);
+                  setLocalSyncSeq((s) => s + 1);
+                  onDeleteColumn(colToDelete);
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-red-600 dark:text-red-400 hover:bg-red-500/10 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                <span>Delete column</span>
+              </button>
+            )}
+
+            {persistedWidths && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  onChangeColWidths(undefined);
+                }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left hover:bg-neutral-100 dark:hover:bg-white/[0.07] cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
+                <span>Reset column widths</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(null);
+                onDeleteTable();
+              }}
+              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-red-600 dark:text-red-400 hover:bg-red-500/10 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5 shrink-0" />
+              <span>Delete table</span>
+            </button>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
@@ -1746,12 +1980,20 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   });
                   commitBlocks(nextBlocks, 'typing');
                 }}
-                onAddRow={() => {
-                  const nextBlocks = blocksRef.current.map((b) =>
-                    b.id === block.id && b.type === 'table'
-                      ? { ...b, rows: [...b.rows, b.headers.map(() => '')] }
-                      : b
-                  );
+                onInsertRowAt={(insertIdx) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    const idx = Math.max(0, Math.min(b.rows.length, insertIdx));
+                    const emptyRow = b.headers.map(() => '');
+                    return {
+                      ...b,
+                      rows: [
+                        ...b.rows.slice(0, idx),
+                        emptyRow,
+                        ...b.rows.slice(idx),
+                      ],
+                    };
+                  });
                   commitBlocks(nextBlocks, 'discrete');
                 }}
                 onDeleteRow={(rowIdx) => {
@@ -1762,21 +2004,37 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   );
                   commitBlocks(nextBlocks, 'discrete');
                 }}
-                onAddColumn={() => {
-                  const nextBlocks = blocksRef.current.map((b) =>
-                    b.id === block.id && b.type === 'table'
-                      ? {
-                          ...b,
-                          headers: [...b.headers, `Column ${b.headers.length + 1}`],
-                          alignments: [...b.alignments, 'left' as const],
-                          rows: b.rows.map((r) => [...r, '']),
-                          colWidths:
-                            b.colWidths && b.colWidths.length === b.headers.length
-                              ? [...b.colWidths, 160]
-                              : b.colWidths,
-                        }
-                      : b
-                  );
+                onInsertColumnAt={(insertIdx) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    const idx = Math.max(0, Math.min(b.headers.length, insertIdx));
+                    const nextHeaders = [
+                      ...b.headers.slice(0, idx),
+                      `Column ${b.headers.length + 1}`,
+                      ...b.headers.slice(idx),
+                    ];
+                    const nextAlignments = [
+                      ...b.alignments.slice(0, idx),
+                      'left' as const,
+                      ...b.alignments.slice(idx),
+                    ];
+                    const nextRows = b.rows.map((r) => [
+                      ...r.slice(0, idx),
+                      '',
+                      ...r.slice(idx),
+                    ]);
+                    const nextWidths =
+                      b.colWidths && b.colWidths.length === b.headers.length
+                        ? [...b.colWidths.slice(0, idx), 160, ...b.colWidths.slice(idx)]
+                        : b.colWidths;
+                    return {
+                      ...b,
+                      headers: nextHeaders,
+                      alignments: nextAlignments,
+                      rows: nextRows,
+                      colWidths: nextWidths,
+                    };
+                  });
                   commitBlocks(nextBlocks, 'discrete');
                 }}
                 onDeleteColumn={(colIdx) => {
