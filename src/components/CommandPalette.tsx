@@ -51,7 +51,11 @@ export function CommandPalette({
       .map((note) => ({
         kind: 'note',
         note,
-        folderName: note.folderId ? folderMap.get(note.folderId) || 'Notes' : 'Root',
+        folderName: note.isSharedWithMe
+          ? `Shared by ${note.ownerName || note.ownerEmail || 'Collaborator'}`
+          : note.folderId
+          ? folderMap.get(note.folderId) || 'Notes'
+          : 'Root',
       }));
 
     const matchedSnippets: SearchResult[] = snippets

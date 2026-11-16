@@ -2,6 +2,8 @@ import React, { useRef, useState } from 'react';
 import {
   Braces,
   Check,
+  ChevronDown,
+  ChevronRight,
   FileText,
   Folder as FolderIcon,
   FolderPlus,
@@ -10,11 +12,13 @@ import {
   PanelLeftClose,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
   Star,
   Sun,
   Trash2,
   Upload,
+  Users,
   X,
 } from 'lucide-react';
 import { AuthUser, Folder, NoteDocument, SidebarFilter } from '../types/notes';
@@ -24,6 +28,7 @@ interface SidebarProps {
   onClose: () => void;
   folders: Folder[];
   notes: NoteDocument[];
+  sharedNotes: NoteDocument[];
   snippetCount: number;
   activeNoteId: string | null;
   filter: SidebarFilter;
@@ -34,6 +39,7 @@ interface SidebarProps {
   onOpenSearch: () => void;
   onSelectFilter: (filter: SidebarFilter) => void;
   onSelectNote: (noteId: string) => void;
+  onRefreshShared: () => void;
   onCreateNote: (folderId?: string | null) => void;
   onDeleteNote: (noteId: string) => void;
   onToggleStar: (noteId: string) => void;
@@ -48,6 +54,7 @@ export function Sidebar({
   onClose,
   folders,
   notes,
+  sharedNotes,
   snippetCount,
   activeNoteId,
   filter,
@@ -58,6 +65,7 @@ export function Sidebar({
   onOpenSearch,
   onSelectFilter,
   onSelectNote,
+  onRefreshShared,
   onCreateNote,
   onDeleteNote,
   onToggleStar,
@@ -72,6 +80,7 @@ export function Sidebar({
   const [renameDraft, setRenameDraft] = useState('');
   const [confirmDeleteNoteId, setConfirmDeleteNoteId] = useState<string | null>(null);
   const [confirmDeleteFolderId, setConfirmDeleteFolderId] = useState<string | null>(null);
+  const [sharedExpanded, setSharedExpanded] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const starredCount = notes.filter((n) => n.starred).length;
@@ -379,6 +388,87 @@ export function Sidebar({
             </div>
           </div>
 
+          {/* Shared with Me Collapsible Section */}
+          <div>
+            <div className="flex items-center justify-between px-2 mb-1">
+              <button
+                type="button"
+                onClick={() => setSharedExpanded((prev) => !prev)}
+                aria-expanded={sharedExpanded}
+                className="flex items-center gap-1.5 py-1 px-0.5 rounded-md text-[12px] font-medium text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white transition-colors cursor-pointer"
+              >
+                {sharedExpanded ? (
+                  <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>Shared</span>
+              </button>
+
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={onRefreshShared}
+                  title="Refresh shared notes"
+                  aria-label="Refresh shared notes"
+                  className="p-1 rounded-md text-neutral-400 hover:text-neutral-900 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+                <span className="text-[11px] text-neutral-400 dark:text-neutral-500 tabular-nums pr-0.5">
+                  {sharedNotes.length}
+                </span>
+              </div>
+            </div>
+
+            {sharedExpanded && (
+              <div className="space-y-0.5">
+                {sharedNotes.length === 0 ? (
+                  <div className="px-2.5 py-2 text-[12px] text-neutral-500 dark:text-neutral-500">
+                    Nothing shared with you yet.
+                  </div>
+                ) : (
+                  sharedNotes.map((sharedNote) => {
+                    const isActive =
+                      filter.type !== 'snippets' && sharedNote.id === activeNoteId;
+                    const senderLabel =
+                      sharedNote.ownerName || sharedNote.ownerEmail || 'Collaborator';
+                    const permLabel =
+                      sharedNote.sharedPermission === 'edit' ? 'Can edit' : 'View only';
+
+                    return (
+                      <button
+                        key={sharedNote.id}
+                        type="button"
+                        onClick={() => onSelectNote(sharedNote.id)}
+                        title={`${sharedNote.title || 'Untitled Note'} — Shared by ${senderLabel}`}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                          isActive
+                            ? 'bg-neutral-200/95 dark:bg-[#212125] text-neutral-950 dark:text-white'
+                            : 'text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/60 dark:hover:bg-white/[0.06]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Users className="w-3.5 h-3.5 text-neutral-400 dark:text-neutral-500 shrink-0" />
+                          <span
+                            className={`text-[13.5px] truncate leading-[1.5] ${
+                              isActive ? 'font-medium' : ''
+                            }`}
+                          >
+                            {sharedNote.title || 'Untitled Note'}
+                          </span>
+                        </div>
+                        <div className="pl-5.5 text-[11px] text-neutral-500 dark:text-neutral-400 truncate">
+                          {senderLabel} · {permLabel}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Recents / Notes List */}
           <div>
             <div className="flex items-center justify-between px-2.5 mb-1.5">
@@ -414,7 +504,7 @@ export function Sidebar({
                       <button
                         type="button"
                         onClick={() => onSelectNote(note.id)}
-                        className="flex-1 min-w-0 text-left truncate py-0.5 cursor-pointer"
+                        className="flex-1 min-w-0 text-left truncate py-1 leading-[1.5] cursor-pointer"
                         title={note.title || 'Untitled Note'}
                       >
                         {note.title || 'Untitled Note'}

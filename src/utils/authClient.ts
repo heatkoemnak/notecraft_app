@@ -86,6 +86,10 @@ function toPublicUser(record: LocalUserRecord): AuthUser {
   };
 }
 
+export function listLocalUsersPublic(): AuthUser[] {
+  return readLocalUsers().map(toPublicUser);
+}
+
 function seedLocalUserWorkspace(userId: string, isFirstUser: boolean) {
   const keys = getUserStorageKeys(userId);
   try {

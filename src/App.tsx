@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { CommandPalette } from './components/CommandPalette';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
+import { ShareNoteModal } from './components/ShareNoteModal';
 import { Sidebar } from './components/Sidebar';
 import { SnippetModal } from './components/SnippetModal';
 import { SnippetsView } from './components/SnippetsView';
@@ -12,7 +13,15 @@ import {
   NoteUpdateMeta,
   useNoteHistory,
 } from './hooks/useNoteHistory';
-import { AuthUser, Folder, NoteDocument, SidebarFilter, Snippet, ViewMode } from './types/notes';
+import {
+  AuthUser,
+  Folder,
+  NoteDocument,
+  SharePermission,
+  SidebarFilter,
+  Snippet,
+  ViewMode,
+} from './types/notes';
 import {
   fetchAuthSession,
   getUserStorageKeys,
@@ -20,6 +29,14 @@ import {
   StorageBackendMode,
 } from './utils/authClient';
 import { clearImageMemoryCache } from './utils/imageStore';
+import {
+  deleteSharesForNoteLocal,
+  hydrateLocalSharing,
+  refreshSharedNotes,
+  removeNoteShare,
+  shareNoteWithEmail,
+  updateSharedNoteLocal,
+} from './utils/shareClient';
 
 async function syncApi(url: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown) {
   try {
@@ -57,6 +74,7 @@ export default function App() {
 
   const [folders, setFolders] = useState<Folder[]>([]);
   const [notes, setNotes] = useState<NoteDocument[]>([]);
+  const [sharedNotes, setSharedNotes] = useState<NoteDocument[]>([]);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
 
@@ -67,6 +85,7 @@ export default function App() {
   );
   const [outlineOpen, setOutlineOpen] = useState<boolean>(false);
   const [searchOpen, setSearchOpen] = useState<boolean>(false);
+  const [shareModalOpen, setShareModalOpen] = useState<boolean>(false);
   const [snippetModalState, setSnippetModalState] = useState<{
     open: boolean;
     initial?: Partial<Snippet> | null;
@@ -76,6 +95,8 @@ export default function App() {
   const notePatchTimersRef = useRef<Map<string, number>>(new Map());
   const notesRef = useRef<NoteDocument[]>(notes);
   notesRef.current = notes;
+  const sharedNotesRef = useRef<NoteDocument[]>(sharedNotes);
+  sharedNotesRef.current = sharedNotes;
   const activeNoteIdRef = useRef<string | null>(activeNoteId);
   activeNoteIdRef.current = activeNoteId;
   const selectionReaderRef = useRef<() => NoteSelection | null>(() => null);
@@ -115,8 +136,10 @@ export default function App() {
       notePatchTimersRef.current.clear();
       setWorkspaceLoaded(false);
       notesRef.current = [];
+      sharedNotesRef.current = [];
       setFolders([]);
       setNotes([]);
+      setSharedNotes([]);
       setSnippets([]);
       setActiveNoteId(null);
       return;
@@ -138,20 +161,26 @@ export default function App() {
             folders: Folder[];
             notes: NoteDocument[];
             snippets: Snippet[];
+            sharedNotes?: NoteDocument[];
           };
         })
         .then((data) => {
           if (!data || cancelled) return;
+          const incomingShared = Array.isArray(data.sharedNotes) ? data.sharedNotes : [];
           dbEnabledRef.current = true;
           notesRef.current = data.notes;
+          sharedNotesRef.current = incomingShared;
           setFolders(data.folders);
           setNotes(data.notes);
+          setSharedNotes(incomingShared);
           setSnippets(data.snippets);
           const storedActive = readStorage<string | null>(userKeys.activeNoteId, null);
           const resolvedActive =
-            storedActive && data.notes.some((n) => n.id === storedActive)
+            storedActive &&
+            (data.notes.some((n) => n.id === storedActive) ||
+              incomingShared.some((n) => n.id === storedActive))
               ? storedActive
-              : data.notes[0]?.id ?? null;
+              : data.notes[0]?.id ?? incomingShared[0]?.id ?? null;
           setActiveNoteId(resolvedActive);
           setWorkspaceLoaded(true);
         })
@@ -160,20 +189,28 @@ export default function App() {
         });
     } else {
       const loadedFolders = readStorage<Folder[]>(userKeys.folders, INITIAL_FOLDERS);
-      const loadedNotes = readStorage<NoteDocument[]>(userKeys.notes, INITIAL_NOTES);
+      const rawNotes = readStorage<NoteDocument[]>(userKeys.notes, INITIAL_NOTES);
+      const { notesWithShares, sharedNotes: loadedShared } = hydrateLocalSharing(
+        currentUser,
+        rawNotes
+      );
       const loadedSnippets = readStorage<Snippet[]>(userKeys.snippets, INITIAL_SNIPPETS);
       const storedActive = readStorage<string | null>(
         userKeys.activeNoteId,
-        loadedNotes[0]?.id ?? null
+        notesWithShares[0]?.id ?? null
       );
       const resolvedActive =
-        storedActive && loadedNotes.some((n) => n.id === storedActive)
+        storedActive &&
+        (notesWithShares.some((n) => n.id === storedActive) ||
+          loadedShared.some((n) => n.id === storedActive))
           ? storedActive
-          : loadedNotes[0]?.id ?? null;
+          : notesWithShares[0]?.id ?? loadedShared[0]?.id ?? null;
 
-      notesRef.current = loadedNotes;
+      notesRef.current = notesWithShares;
+      sharedNotesRef.current = loadedShared;
       setFolders(loadedFolders);
-      setNotes(loadedNotes);
+      setNotes(notesWithShares);
+      setSharedNotes(loadedShared);
       setSnippets(loadedSnippets);
       setActiveNoteId(resolvedActive);
       setWorkspaceLoaded(true);
@@ -242,17 +279,62 @@ export default function App() {
 
   const applyHistorySnapshot = useCallback((noteId: string, snapshot: NoteSnapshot) => {
     const updatedAt = Date.now();
-    const patch = {
-      title: snapshot.title,
-      content: snapshot.content,
-      folderId: snapshot.folderId,
-      starred: snapshot.starred,
-    };
-    const nextNotes = notesRef.current.map((n) =>
-      n.id === noteId ? { ...n, ...patch, updatedAt } : n
-    );
-    notesRef.current = nextNotes;
-    setNotes(nextNotes);
+    const isOwn = notesRef.current.some((n) => n.id === noteId);
+
+    if (isOwn) {
+      const patch = {
+        title: snapshot.title,
+        content: snapshot.content,
+        folderId: snapshot.folderId,
+        starred: snapshot.starred,
+      };
+      const nextNotes = notesRef.current.map((n) =>
+        n.id === noteId ? { ...n, ...patch, updatedAt } : n
+      );
+      notesRef.current = nextNotes;
+      setNotes(nextNotes);
+
+      if (dbEnabledRef.current) {
+        const existingTimer = notePatchTimersRef.current.get(noteId);
+        if (existingTimer) window.clearTimeout(existingTimer);
+        const timer = window.setTimeout(() => {
+          notePatchTimersRef.current.delete(noteId);
+          void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
+            ...patch,
+            updatedAt,
+          });
+        }, 280);
+        notePatchTimersRef.current.set(noteId, timer);
+      }
+    } else {
+      const sharedTarget = sharedNotesRef.current.find((n) => n.id === noteId);
+      if (!sharedTarget || sharedTarget.sharedPermission !== 'edit') return;
+
+      const patch = {
+        title: snapshot.title,
+        content: snapshot.content,
+      };
+      const nextShared = sharedNotesRef.current.map((n) =>
+        n.id === noteId ? { ...n, ...patch, updatedAt } : n
+      );
+      sharedNotesRef.current = nextShared;
+      setSharedNotes(nextShared);
+
+      if (dbEnabledRef.current) {
+        const existingTimer = notePatchTimersRef.current.get(noteId);
+        if (existingTimer) window.clearTimeout(existingTimer);
+        const timer = window.setTimeout(() => {
+          notePatchTimersRef.current.delete(noteId);
+          void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
+            ...patch,
+            updatedAt,
+          });
+        }, 280);
+        notePatchTimersRef.current.set(noteId, timer);
+      } else if (sharedTarget.ownerEmail) {
+        updateSharedNoteLocal(sharedTarget.ownerEmail, noteId, patch, updatedAt);
+      }
+    }
 
     if (snapshot.selection) {
       selectionSeqRef.current += 1;
@@ -262,24 +344,13 @@ export default function App() {
         seq: selectionSeqRef.current,
       });
     }
-
-    if (dbEnabledRef.current) {
-      const existingTimer = notePatchTimersRef.current.get(noteId);
-      if (existingTimer) window.clearTimeout(existingTimer);
-      const timer = window.setTimeout(() => {
-        notePatchTimersRef.current.delete(noteId);
-        void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
-          ...patch,
-          updatedAt,
-        });
-      }, 280);
-      notePatchTimersRef.current.set(noteId, timer);
-    }
   }, []);
 
   const handleUndo = useCallback(() => {
-    const current = notesRef.current.find((n) => n.id === activeNoteIdRef.current);
-    if (!current) return;
+    const current =
+      notesRef.current.find((n) => n.id === activeNoteIdRef.current) ??
+      sharedNotesRef.current.find((n) => n.id === activeNoteIdRef.current);
+    if (!current || (current.isSharedWithMe && current.sharedPermission !== 'edit')) return;
     const currentSelection = selectionReaderRef.current();
     const snapshot = undo(current, currentSelection);
     if (!snapshot) return;
@@ -287,8 +358,10 @@ export default function App() {
   }, [applyHistorySnapshot, undo]);
 
   const handleRedo = useCallback(() => {
-    const current = notesRef.current.find((n) => n.id === activeNoteIdRef.current);
-    if (!current) return;
+    const current =
+      notesRef.current.find((n) => n.id === activeNoteIdRef.current) ??
+      sharedNotesRef.current.find((n) => n.id === activeNoteIdRef.current);
+    if (!current || (current.isSharedWithMe && current.sharedPermission !== 'edit')) return;
     const currentSelection = selectionReaderRef.current();
     const snapshot = redo(current, currentSelection);
     if (!snapshot) return;
@@ -307,6 +380,7 @@ export default function App() {
           filter.type === 'snippets' ||
           !activeNoteId ||
           searchOpen ||
+          shareModalOpen ||
           snippetModalState.open
         ) {
           return;
@@ -349,11 +423,23 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [currentUser, filter.type, activeNoteId, searchOpen, snippetModalState.open, handleUndo, handleRedo]);
+  }, [
+    currentUser,
+    filter.type,
+    activeNoteId,
+    searchOpen,
+    shareModalOpen,
+    snippetModalState.open,
+    handleUndo,
+    handleRedo,
+  ]);
 
   const activeNote = useMemo(
-    () => notes.find((n) => n.id === activeNoteId) ?? null,
-    [notes, activeNoteId]
+    () =>
+      notes.find((n) => n.id === activeNoteId) ??
+      sharedNotes.find((n) => n.id === activeNoteId) ??
+      null,
+    [notes, sharedNotes, activeNoteId]
   );
 
   const snippetCategories = useMemo(
@@ -402,23 +488,59 @@ export default function App() {
       patch: Partial<Pick<NoteDocument, 'title' | 'content' | 'folderId' | 'starred'>>,
       meta?: NoteUpdateMeta
     ) => {
-      const prevNote = notesRef.current.find((n) => n.id === noteId);
-      if (!prevNote) return;
+      const prevOwn = notesRef.current.find((n) => n.id === noteId);
+      if (prevOwn) {
+        const updatedAt = Date.now();
+        const nextNote: NoteDocument = { ...prevOwn, ...patch, updatedAt };
+        const changed =
+          prevOwn.title !== nextNote.title ||
+          prevOwn.content !== nextNote.content ||
+          prevOwn.folderId !== nextNote.folderId ||
+          prevOwn.starred !== nextNote.starred;
+
+        if (!changed) return;
+
+        recordChange(prevOwn, nextNote, meta);
+        const nextNotes = notesRef.current.map((n) => (n.id === noteId ? nextNote : n));
+        notesRef.current = nextNotes;
+        setNotes(nextNotes);
+
+        if (dbEnabledRef.current) {
+          const existingTimer = notePatchTimersRef.current.get(noteId);
+          if (existingTimer) window.clearTimeout(existingTimer);
+          const timer = window.setTimeout(() => {
+            notePatchTimersRef.current.delete(noteId);
+            void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
+              ...patch,
+              updatedAt,
+            });
+          }, 280);
+          notePatchTimersRef.current.set(noteId, timer);
+        }
+        return;
+      }
+
+      const prevShared = sharedNotesRef.current.find((n) => n.id === noteId);
+      if (!prevShared || prevShared.sharedPermission !== 'edit') return;
+
+      const sharedPatch: Partial<Pick<NoteDocument, 'title' | 'content'>> = {};
+      if (patch.title !== undefined) sharedPatch.title = patch.title;
+      if (patch.content !== undefined) sharedPatch.content = patch.content;
 
       const updatedAt = Date.now();
-      const nextNote: NoteDocument = { ...prevNote, ...patch, updatedAt };
+      const nextSharedNote: NoteDocument = { ...prevShared, ...sharedPatch, updatedAt };
       const changed =
-        prevNote.title !== nextNote.title ||
-        prevNote.content !== nextNote.content ||
-        prevNote.folderId !== nextNote.folderId ||
-        prevNote.starred !== nextNote.starred;
+        prevShared.title !== nextSharedNote.title ||
+        prevShared.content !== nextSharedNote.content;
 
       if (!changed) return;
 
-      recordChange(prevNote, nextNote, meta);
-      const nextNotes = notesRef.current.map((n) => (n.id === noteId ? nextNote : n));
-      notesRef.current = nextNotes;
-      setNotes(nextNotes);
+      recordChange(prevShared, nextSharedNote, meta);
+      const nextSharedList = sharedNotesRef.current.map((n) =>
+        n.id === noteId ? nextSharedNote : n
+      );
+      sharedNotesRef.current = nextSharedList;
+      setSharedNotes(nextSharedList);
 
       if (dbEnabledRef.current) {
         const existingTimer = notePatchTimersRef.current.get(noteId);
@@ -426,11 +548,13 @@ export default function App() {
         const timer = window.setTimeout(() => {
           notePatchTimersRef.current.delete(noteId);
           void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'PATCH', {
-            ...patch,
+            ...sharedPatch,
             updatedAt,
           });
         }, 280);
         notePatchTimersRef.current.set(noteId, timer);
+      } else if (prevShared.ownerEmail) {
+        updateSharedNoteLocal(prevShared.ownerEmail, noteId, sharedPatch, updatedAt);
       }
     },
     [recordChange]
@@ -442,11 +566,13 @@ export default function App() {
     notesRef.current = remaining;
     setNotes(remaining);
     if (activeNoteId === noteId) {
-      setActiveNoteId(remaining[0]?.id ?? null);
+      setActiveNoteId(remaining[0]?.id ?? sharedNotesRef.current[0]?.id ?? null);
     }
 
     if (dbEnabledRef.current) {
       void syncApi(`/api/notes/${encodeURIComponent(noteId)}`, 'DELETE');
+    } else if (currentUser) {
+      deleteSharesForNoteLocal(noteId, currentUser.id);
     }
   };
 
@@ -619,6 +745,83 @@ export default function App() {
     }
   };
 
+  const handleRefreshShared = async () => {
+    if (!currentUser) return;
+    try {
+      const refreshed = await refreshSharedNotes(storageMode, currentUser);
+      sharedNotesRef.current = refreshed;
+      setSharedNotes(refreshed);
+    } catch {
+      // Ignore refresh error
+    }
+  };
+
+  const handleShareNote = async (
+    noteId: string,
+    email: string,
+    permission: SharePermission
+  ) => {
+    if (!currentUser) return;
+    const savedShare = await shareNoteWithEmail(
+      storageMode,
+      currentUser,
+      noteId,
+      email,
+      permission
+    );
+    const nextNotes = notesRef.current.map((n) => {
+      if (n.id !== noteId) return n;
+      const existing = n.shares ?? [];
+      const filtered = existing.filter(
+        (s) => s.id !== savedShare.id && s.recipientEmail !== savedShare.recipientEmail
+      );
+      return {
+        ...n,
+        shares: [savedShare, ...filtered],
+      };
+    });
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+  };
+
+  const handleRevokeShare = async (noteId: string, shareId: string) => {
+    if (!currentUser) return;
+    await removeNoteShare(storageMode, currentUser, noteId, shareId);
+    const nextNotes = notesRef.current.map((n) => {
+      if (n.id !== noteId) return n;
+      return {
+        ...n,
+        shares: (n.shares ?? []).filter((s) => s.id !== shareId),
+      };
+    });
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+  };
+
+  const handleDuplicateSharedNote = (sourceNote: NoteDocument) => {
+    const now = Date.now();
+    const duplicated: NoteDocument = {
+      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      title: sourceNote.title ? `${sourceNote.title} (Copy)` : 'Untitled Note (Copy)',
+      content: sourceNote.content,
+      folderId: folders[0]?.id ?? null,
+      starred: false,
+      createdAt: now,
+      updatedAt: now,
+      shares: [],
+    };
+    const nextNotes = [duplicated, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(duplicated.id);
+    setFilter({ type: 'all' });
+    setViewMode('read');
+
+    if (dbEnabledRef.current) {
+      void syncApi('/api/notes', 'POST', duplicated);
+    }
+  };
+
   const handleLogout = async () => {
     for (const timer of notePatchTimersRef.current.values()) {
       window.clearTimeout(timer);
@@ -627,10 +830,14 @@ export default function App() {
     for (const n of notesRef.current) {
       clearNoteHistory(n.id);
     }
+    for (const n of sharedNotesRef.current) {
+      clearNoteHistory(n.id);
+    }
     clearImageMemoryCache();
     await logoutAccount(storageMode);
     setFilter({ type: 'all' });
     setSearchOpen(false);
+    setShareModalOpen(false);
     setSnippetModalState({ open: false });
     setCurrentUser(null);
   };
@@ -661,6 +868,7 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         folders={folders}
         notes={notes}
+        sharedNotes={sharedNotes}
         snippetCount={snippets.length}
         activeNoteId={activeNoteId}
         filter={filter}
@@ -691,6 +899,7 @@ export default function App() {
             setSidebarOpen(false);
           }
         }}
+        onRefreshShared={handleRefreshShared}
         onCreateNote={handleCreateNote}
         onDeleteNote={handleDeleteNote}
         onToggleStar={handleToggleStar}
@@ -730,6 +939,8 @@ export default function App() {
           onChangeViewMode={setViewMode}
           onUpdateNote={handleUpdateNote}
           onCreateNote={() => handleCreateNote()}
+          onDuplicateSharedNote={handleDuplicateSharedNote}
+          onOpenShareModal={() => setShareModalOpen(true)}
           onOpenSnippetModal={(prefillContent) =>
             setSnippetModalState({
               open: true,
@@ -742,7 +953,7 @@ export default function App() {
 
       <CommandPalette
         isOpen={searchOpen}
-        notes={notes}
+        notes={[...notes, ...sharedNotes]}
         folders={folders}
         snippets={snippets}
         onClose={() => setSearchOpen(false)}
@@ -751,6 +962,15 @@ export default function App() {
           if (filter.type === 'snippets') setFilter({ type: 'all' });
         }}
         onInsertSnippet={handleInsertSnippetIntoActiveNote}
+      />
+
+      <ShareNoteModal
+        isOpen={shareModalOpen}
+        note={activeNote && !activeNote.isSharedWithMe ? activeNote : null}
+        currentUser={currentUser}
+        onClose={() => setShareModalOpen(false)}
+        onShare={handleShareNote}
+        onRevoke={handleRevokeShare}
       />
 
       <SnippetModal

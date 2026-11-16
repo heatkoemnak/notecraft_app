@@ -3,8 +3,8 @@
 
 @layer base {
   :root {
-    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --font-sans: 'Plus Jakarta Sans', 'Kantumruy Pro', 'Noto Sans Khmer', 'Khmer OS Siemreap', 'Leelawadee UI', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', 'Noto Sans Khmer', 'Kantumruy Pro', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
 
   html,
@@ -24,13 +24,53 @@
   html.dark body {
     background-color: #121214;
     color: #ececf1;
-    letter-spacing: 0.005em;
   }
 }
 
 .font-mono-code {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  letter-spacing: normal;
+}
+
+.live-editable,
+[data-note-field] {
+  letter-spacing: normal;
+}
+
+.editor-prose-font {
+  font-family: 'Kantumruy Pro', 'Noto Sans Khmer', 'Plus Jakarta Sans', 'Khmer OS Siemreap', 'Leelawadee UI', sans-serif;
+  letter-spacing: normal;
+}
+
+.editor-source-font {
+  font-family: 'JetBrains Mono', 'Kantumruy Pro', 'Noto Sans Khmer', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: normal;
+}
+
+[data-editor-font="noto-khmer"] .editor-prose-font {
+  font-family: 'Noto Sans Khmer', 'Plus Jakarta Sans', 'Khmer OS Siemreap', 'Leelawadee UI', sans-serif;
+}
+
+[data-editor-font="noto-khmer"] .editor-source-font {
+  font-family: 'JetBrains Mono', 'Noto Sans Khmer', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+[data-editor-font="battambang"] .editor-prose-font {
+  font-family: 'Battambang', 'Kantumruy Pro', 'Plus Jakarta Sans', 'Khmer OS Battambang', serif;
+}
+
+[data-editor-font="battambang"] .editor-source-font {
+  font-family: 'JetBrains Mono', 'Battambang', 'Noto Sans Khmer', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+[data-editor-font="plus-jakarta"] .editor-prose-font {
+  font-family: var(--font-sans);
+}
+
+[data-editor-font="plus-jakarta"] .editor-source-font {
+  font-family: var(--font-mono);
 }
 
 .tabular-nums {

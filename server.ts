@@ -74,6 +74,16 @@ async function createSessionForUser(pool: Pool, userId: string, req: Request, re
   res.setHeader('Set-Cookie', buildSessionCookie(token, req));
 }
 
+function isPgConnectionError(err: unknown): boolean {
+  const code = (err as { code?: string })?.code;
+  return (
+    code === 'ECONNREFUSED' ||
+    code === 'ENOTFOUND' ||
+    code === 'ETIMEDOUT' ||
+    code === 'EHOSTUNREACH'
+  );
+}
+
 async function requireAuth(req: Request, res: Response): Promise<{ pool: Pool; user: SessionUser } | null> {
   const pool = getPool();
   if (!pool) {
@@ -81,14 +91,21 @@ async function requireAuth(req: Request, res: Response): Promise<{ pool: Pool; u
     return null;
   }
 
-  await ensureSchema(pool);
-  const user = await resolveSessionUser(pool, req);
-  if (!user) {
-    res.status(401).json({ error: 'Authentication required' });
-    return null;
+  try {
+    await ensureSchema(pool);
+    const user = await resolveSessionUser(pool, req);
+    if (!user) {
+      res.status(401).json({ error: 'Authentication required' });
+      return null;
+    }
+    return { pool, user };
+  } catch (err) {
+    if (isPgConnectionError(err)) {
+      res.status(503).json({ error: 'PostgreSQL unavailable' });
+      return null;
+    }
+    throw err;
   }
-
-  return { pool, user };
 }
 
 async function startServer() {
@@ -256,27 +273,91 @@ async function startServer() {
     return res.json({ ok: true });
   });
 
-  // Load authenticated user's workspace
+  // Load authenticated user's workspace (including shares & notes shared with user)
   app.get('/api/workspace', async (req, res) => {
     try {
       const auth = await requireAuth(req, res);
       if (!auth) return;
       const { pool, user } = auth;
 
-      const [foldersRes, notesRes, snippetsRes] = await Promise.all([
-        pool.query(
-          'SELECT id, name, created_at FROM folders WHERE user_id = $1 ORDER BY created_at ASC',
-          [user.id]
-        ),
-        pool.query(
-          'SELECT id, title, content, folder_id, starred, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
-          [user.id]
-        ),
-        pool.query(
-          'SELECT id, title, description, category, language, content, created_at, updated_at FROM snippets WHERE user_id = $1 ORDER BY updated_at DESC',
-          [user.id]
-        ),
-      ]);
+      const [foldersRes, notesRes, snippetsRes, ownerSharesRes, sharedWithMeRes] =
+        await Promise.all([
+          pool.query(
+            'SELECT id, name, created_at FROM folders WHERE user_id = $1 ORDER BY created_at ASC',
+            [user.id]
+          ),
+          pool.query(
+            'SELECT id, title, content, folder_id, starred, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
+            [user.id]
+          ),
+          pool.query(
+            'SELECT id, title, description, category, language, content, created_at, updated_at FROM snippets WHERE user_id = $1 ORDER BY updated_at DESC',
+            [user.id]
+          ),
+          pool.query<{
+            id: string;
+            note_id: string;
+            recipient_email: string;
+            permission: string;
+            created_at: string | number;
+            recipient_name: string | null;
+            recipient_user_id: string | null;
+          }>(
+            `SELECT ns.id, ns.note_id, ns.recipient_email, ns.permission, ns.created_at,
+                    u.name AS recipient_name, u.id AS recipient_user_id
+             FROM note_shares ns
+             LEFT JOIN users u ON LOWER(u.email) = ns.recipient_email
+             WHERE ns.owner_user_id = $1
+             ORDER BY ns.created_at DESC`,
+            [user.id]
+          ),
+          pool.query<{
+            id: string;
+            title: string;
+            content: string;
+            created_at: string | number;
+            updated_at: string | number;
+            permission: string;
+            owner_name: string;
+            owner_email: string;
+          }>(
+            `SELECT n.id, n.title, n.content, n.created_at, n.updated_at,
+                    ns.permission, u.name AS owner_name, u.email AS owner_email
+             FROM note_shares ns
+             JOIN notes n ON n.id = ns.note_id
+             JOIN users u ON u.id = ns.owner_user_id
+             WHERE ns.recipient_email = $1 AND ns.owner_user_id <> $2
+             ORDER BY n.updated_at DESC`,
+            [user.email.toLowerCase(), user.id]
+          ),
+        ]);
+
+      const sharesByNoteId = new Map<
+        string,
+        Array<{
+          id: string;
+          noteId: string;
+          recipientEmail: string;
+          recipientName: string | null;
+          recipientUserId: string | null;
+          permission: 'view' | 'edit';
+          createdAt: number;
+        }>
+      >();
+
+      for (const s of ownerSharesRes.rows) {
+        const list = sharesByNoteId.get(s.note_id) ?? [];
+        list.push({
+          id: s.id,
+          noteId: s.note_id,
+          recipientEmail: s.recipient_email,
+          recipientName: s.recipient_name,
+          recipientUserId: s.recipient_user_id,
+          permission: s.permission === 'edit' ? 'edit' : 'view',
+          createdAt: Number(s.created_at),
+        });
+        sharesByNoteId.set(s.note_id, list);
+      }
 
       return res.json({
         folders: foldersRes.rows.map((r) => ({
@@ -292,6 +373,7 @@ async function startServer() {
           starred: Boolean(r.starred),
           createdAt: Number(r.created_at),
           updatedAt: Number(r.updated_at),
+          shares: sharesByNoteId.get(r.id) ?? [],
         })),
         snippets: snippetsRes.rows.map((r) => ({
           id: r.id,
@@ -303,10 +385,71 @@ async function startServer() {
           createdAt: Number(r.created_at),
           updatedAt: Number(r.updated_at),
         })),
+        sharedNotes: sharedWithMeRes.rows.map((r) => ({
+          id: r.id,
+          title: r.title,
+          content: r.content,
+          folderId: null,
+          starred: false,
+          createdAt: Number(r.created_at),
+          updatedAt: Number(r.updated_at),
+          isSharedWithMe: true,
+          ownerName: r.owner_name,
+          ownerEmail: r.owner_email,
+          sharedPermission: r.permission === 'edit' ? 'edit' : 'view',
+        })),
       });
     } catch (err) {
       console.error('Failed to load workspace from PostgreSQL:', err);
       return res.status(500).json({ error: 'Failed to load workspace' });
+    }
+  });
+
+  // Refresh notes shared with the signed-in user
+  app.get('/api/shared-notes', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const sharedWithMeRes = await pool.query<{
+        id: string;
+        title: string;
+        content: string;
+        created_at: string | number;
+        updated_at: string | number;
+        permission: string;
+        owner_name: string;
+        owner_email: string;
+      }>(
+        `SELECT n.id, n.title, n.content, n.created_at, n.updated_at,
+                ns.permission, u.name AS owner_name, u.email AS owner_email
+         FROM note_shares ns
+         JOIN notes n ON n.id = ns.note_id
+         JOIN users u ON u.id = ns.owner_user_id
+         WHERE ns.recipient_email = $1 AND ns.owner_user_id <> $2
+         ORDER BY n.updated_at DESC`,
+        [user.email.toLowerCase(), user.id]
+      );
+
+      return res.json({
+        sharedNotes: sharedWithMeRes.rows.map((r) => ({
+          id: r.id,
+          title: r.title,
+          content: r.content,
+          folderId: null,
+          starred: false,
+          createdAt: Number(r.created_at),
+          updatedAt: Number(r.updated_at),
+          isSharedWithMe: true,
+          ownerName: r.owner_name,
+          ownerEmail: r.owner_email,
+          sharedPermission: r.permission === 'edit' ? 'edit' : 'view',
+        })),
+      });
+    } catch (err) {
+      console.error('Failed to load shared notes from PostgreSQL:', err);
+      return res.status(500).json({ error: 'Failed to load shared notes' });
     }
   });
 
@@ -420,6 +563,29 @@ async function startServer() {
       if (!auth) return;
       const { pool, user } = auth;
 
+      const noteCheck = await pool.query<{ user_id: string }>(
+        'SELECT user_id FROM notes WHERE id = $1',
+        [req.params.id]
+      );
+      const targetNote = noteCheck.rows[0];
+      if (!targetNote) {
+        return res.status(404).json({ error: 'Note not found' });
+      }
+
+      const isOwner = targetNote.user_id === user.id;
+      let canEditShared = false;
+      if (!isOwner) {
+        const shareCheck = await pool.query<{ permission: string }>(
+          'SELECT permission FROM note_shares WHERE note_id = $1 AND recipient_email = $2',
+          [req.params.id, user.email.toLowerCase()]
+        );
+        canEditShared = shareCheck.rows[0]?.permission === 'edit';
+      }
+
+      if (!isOwner && !canEditShared) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
       const { title, content, folderId, starred, updatedAt } = req.body || {};
       const sets: string[] = [];
       const values: unknown[] = [];
@@ -432,11 +598,11 @@ async function startServer() {
         values.push(content);
         sets.push(`content = $${values.length}`);
       }
-      if (folderId !== undefined) {
+      if (isOwner && folderId !== undefined) {
         values.push(folderId);
         sets.push(`folder_id = $${values.length}`);
       }
-      if (starred !== undefined) {
+      if (isOwner && starred !== undefined) {
         values.push(Boolean(starred));
         sets.push(`starred = $${values.length}`);
       }
@@ -445,13 +611,8 @@ async function startServer() {
 
       values.push(req.params.id);
       const idIdx = values.length;
-      values.push(user.id);
-      const userIdx = values.length;
 
-      await pool.query(
-        `UPDATE notes SET ${sets.join(', ')} WHERE id = $${idIdx} AND user_id = $${userIdx}`,
-        values
-      );
+      await pool.query(`UPDATE notes SET ${sets.join(', ')} WHERE id = $${idIdx}`, values);
       return res.json({ ok: true });
     } catch (err) {
       console.error('Failed to update note:', err);
@@ -473,6 +634,82 @@ async function startServer() {
     } catch (err) {
       console.error('Failed to delete note:', err);
       return res.status(500).json({ error: 'Failed to delete note' });
+    }
+  });
+
+  // Note Sharing CRUD (by recipient email)
+  app.post('/api/notes/:id/shares', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const rawEmail =
+        typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+      const permission = req.body?.permission === 'edit' ? 'edit' : 'view';
+
+      if (!isValidEmail(rawEmail)) {
+        return res.status(400).json({ error: 'Please enter a valid recipient email address.' });
+      }
+      if (rawEmail === user.email.toLowerCase()) {
+        return res.status(400).json({ error: 'You already own this note.' });
+      }
+
+      const ownedNote = await pool.query<{ id: string }>(
+        'SELECT id FROM notes WHERE id = $1 AND user_id = $2',
+        [req.params.id, user.id]
+      );
+      if (ownedNote.rows.length === 0) {
+        return res.status(404).json({ error: 'Note not found or not owned by you.' });
+      }
+
+      const shareId = `shr-${randomUUID()}`;
+      const now = Date.now();
+      const upsertRes = await pool.query<{ id: string; created_at: string | number }>(
+        `INSERT INTO note_shares (id, note_id, owner_user_id, recipient_email, permission, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (note_id, recipient_email) DO UPDATE SET
+           permission = EXCLUDED.permission
+         RETURNING id, created_at`,
+        [shareId, req.params.id, user.id, rawEmail, permission, now]
+      );
+
+      const recipientUser = await pool.query<{ id: string; name: string }>(
+        'SELECT id, name FROM users WHERE LOWER(email) = $1',
+        [rawEmail]
+      );
+
+      return res.status(201).json({
+        share: {
+          id: upsertRes.rows[0].id,
+          noteId: req.params.id,
+          recipientEmail: rawEmail,
+          recipientName: recipientUser.rows[0]?.name ?? null,
+          recipientUserId: recipientUser.rows[0]?.id ?? null,
+          permission,
+          createdAt: Number(upsertRes.rows[0].created_at),
+        },
+      });
+    } catch (err) {
+      console.error('Failed to share note:', err);
+      return res.status(500).json({ error: 'Failed to share note.' });
+    }
+  });
+
+  app.delete('/api/notes/:id/shares/:shareId', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      await pool.query(
+        'DELETE FROM note_shares WHERE id = $1 AND note_id = $2 AND owner_user_id = $3',
+        [req.params.shareId, req.params.id, user.id]
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Failed to remove note share:', err);
+      return res.status(500).json({ error: 'Failed to remove access.' });
     }
   });
 
@@ -572,8 +809,21 @@ async function startServer() {
       const { pool, user } = auth;
 
       const result = await pool.query<{ data_url: string }>(
-        'SELECT data_url FROM note_images WHERE id = $1 AND user_id = $2',
-        [req.params.id, user.id]
+        `SELECT ni.data_url
+         FROM note_images ni
+         WHERE ni.id = $1
+           AND (
+             ni.user_id = $2
+             OR EXISTS (
+               SELECT 1
+               FROM note_shares ns
+               JOIN notes n ON n.id = ns.note_id
+               WHERE ns.recipient_email = $3
+                 AND n.user_id = ni.user_id
+                 AND n.content LIKE '%' || $1 || '%'
+             )
+           )`,
+        [req.params.id, user.id, user.email.toLowerCase()]
       );
       const row = result.rows[0];
       if (!row) return res.status(404).json({ error: 'Image not found' });

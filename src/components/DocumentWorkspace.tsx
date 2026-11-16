@@ -22,8 +22,10 @@ import {
   Quote,
   Redo2,
   Search,
+  Share2,
   Star,
   Table,
+  Type,
   Undo2,
 } from 'lucide-react';
 import { NoteSelection, NoteUpdateMeta } from '../hooks/useNoteHistory';
@@ -65,9 +67,22 @@ interface DocumentWorkspaceProps {
     meta?: NoteUpdateMeta
   ) => void;
   onCreateNote: () => void;
+  onDuplicateSharedNote: (note: NoteDocument) => void;
+  onOpenShareModal: () => void;
   onOpenSnippetModal: (prefillContent?: string) => void;
   onOpenSnippetsLibrary: () => void;
 }
+
+type EditorFontId = 'kantumruy' | 'noto-khmer' | 'battambang' | 'plus-jakarta';
+
+const EDITOR_FONT_STORAGE_KEY = 'notecraft.editorFont.v1';
+
+const EDITOR_FONTS: { id: EditorFontId; label: string }[] = [
+  { id: 'kantumruy', label: 'Kantumruy Pro' },
+  { id: 'noto-khmer', label: 'Noto Sans Khmer' },
+  { id: 'battambang', label: 'Battambang' },
+  { id: 'plus-jakarta', label: 'Plus Jakarta' },
+];
 
 export function DocumentWorkspace({
   note,
@@ -87,6 +102,8 @@ export function DocumentWorkspace({
   onChangeViewMode,
   onUpdateNote,
   onCreateNote,
+  onDuplicateSharedNote,
+  onOpenShareModal,
   onOpenSnippetModal,
   onOpenSnippetsLibrary,
 }: DocumentWorkspaceProps) {
@@ -102,6 +119,30 @@ export function DocumentWorkspace({
   const [hasSelection, setHasSelection] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [editorFont, setEditorFont] = useState<EditorFontId>(() => {
+    try {
+      const saved = localStorage.getItem(EDITOR_FONT_STORAGE_KEY);
+      if (
+        saved === 'kantumruy' ||
+        saved === 'noto-khmer' ||
+        saved === 'battambang' ||
+        saved === 'plus-jakarta'
+      ) {
+        return saved;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return 'kantumruy';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(EDITOR_FONT_STORAGE_KEY, editorFont);
+    } catch {
+      // ignore storage errors
+    }
+  }, [editorFont]);
 
   const syncTextareaSelection = (el: HTMLTextAreaElement) => {
     const start = el.selectionStart ?? 0;
@@ -565,9 +606,14 @@ export function DocumentWorkspace({
     );
   }
 
+  const isSharedWithMe = Boolean(note.isSharedWithMe);
+  const isReadOnly = Boolean(isSharedWithMe && note.sharedPermission !== 'edit');
+  const shareCount = note.shares?.length ?? 0;
+
   return (
     <div
       data-document-workspace="true"
+      data-editor-font={editorFont}
       className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#121214]"
     >
       {/* Top Document Bar */}
@@ -593,50 +639,58 @@ export function DocumentWorkspace({
 
             <span className="text-neutral-300 dark:text-neutral-700 shrink-0">/</span>
 
-            <div className="relative flex items-center shrink-0">
-              <select
-                value={note.folderId || ''}
-                onChange={(e) =>
-                  onUpdateNote(
-                    note.id,
-                    { folderId: e.target.value ? e.target.value : null },
-                    { source: 'discrete', field: 'folderId' }
-                  )
-                }
-                aria-label="Move note to project folder"
-                className="appearance-none bg-transparent pr-5 pl-1.5 py-1 rounded-md text-[13px] text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] focus:outline-none cursor-pointer"
-              >
-                <option value="" className="bg-white dark:bg-[#1a1a1e]">
-                  Unfiled
-                </option>
-                {folders.map((folder) => (
-                  <option key={folder.id} value={folder.id} className="bg-white dark:bg-[#1a1a1e]">
-                    {folder.name}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute right-1" />
-            </div>
+            {isSharedWithMe ? (
+              <span className="text-[12.5px] text-neutral-500 dark:text-neutral-400 truncate max-w-[220px] hidden sm:inline">
+                Shared by {note.ownerName || note.ownerEmail} · {isReadOnly ? 'View only' : 'Can edit'}
+              </span>
+            ) : (
+              <>
+                <div className="relative flex items-center shrink-0">
+                  <select
+                    value={note.folderId || ''}
+                    onChange={(e) =>
+                      onUpdateNote(
+                        note.id,
+                        { folderId: e.target.value ? e.target.value : null },
+                        { source: 'discrete', field: 'folderId' }
+                      )
+                    }
+                    aria-label="Move note to project folder"
+                    className="appearance-none bg-transparent pr-5 pl-1.5 py-1 rounded-md text-[13px] text-neutral-500 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] focus:outline-none cursor-pointer"
+                  >
+                    <option value="" className="bg-white dark:bg-[#1a1a1e]">
+                      Unfiled
+                    </option>
+                    {folders.map((folder) => (
+                      <option key={folder.id} value={folder.id} className="bg-white dark:bg-[#1a1a1e]">
+                        {folder.name}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown className="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute right-1" />
+                </div>
 
-            <button
-              type="button"
-              onClick={() =>
-                onUpdateNote(
-                  note.id,
-                  { starred: !note.starred },
-                  { source: 'discrete', field: 'starred' }
-                )
-              }
-              aria-label={note.starred ? 'Remove star' : 'Star note'}
-              title={note.starred ? 'Starred' : 'Star this note'}
-              className={`p-1.5 rounded-lg transition-colors cursor-pointer shrink-0 ${
-                note.starred
-                  ? 'text-amber-500 hover:bg-amber-500/10'
-                  : 'text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06]'
-              }`}
-            >
-              <Star className="w-3.5 h-3.5" fill={note.starred ? 'currentColor' : 'none'} />
-            </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateNote(
+                      note.id,
+                      { starred: !note.starred },
+                      { source: 'discrete', field: 'starred' }
+                    )
+                  }
+                  aria-label={note.starred ? 'Remove star' : 'Star note'}
+                  title={note.starred ? 'Starred' : 'Star this note'}
+                  className={`p-1.5 rounded-lg transition-colors cursor-pointer shrink-0 ${
+                    note.starred
+                      ? 'text-amber-500 hover:bg-amber-500/10'
+                      : 'text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06]'
+                  }`}
+                >
+                  <Star className="w-3.5 h-3.5" fill={note.starred ? 'currentColor' : 'none'} />
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -737,127 +791,178 @@ export function DocumentWorkspace({
             <Download className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Export .md</span>
           </button>
+
+          {!isSharedWithMe && (
+            <button
+              type="button"
+              onClick={onOpenShareModal}
+              title="Share note by email"
+              aria-label="Share note by email"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap tabular-nums"
+            >
+              <Share2 className="w-3.5 h-3.5" />
+              <span>{shareCount > 0 ? `Share · ${shareCount}` : 'Share'}</span>
+            </button>
+          )}
         </div>
       </header>
 
-      {/* Formatting & Snippet Toolbar (available directly in Document, Split, and Markdown modes) */}
+      {/* Formatting & Snippet Toolbar */}
       <div className="shrink-0 px-4 sm:px-5 py-2 border-b border-neutral-200 dark:border-white/[0.07] bg-neutral-50/70 dark:bg-[#151518] flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-0.5 flex-wrap">
-          <ToolbarButton
-            label="Undo (Ctrl+Z)"
-            onClick={onUndo}
-            disabled={!canUndo}
-            icon={<Undo2 className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Redo (Ctrl+Y)"
-            onClick={onRedo}
-            disabled={!canRedo}
-            icon={<Redo2 className="w-4 h-4" />}
-          />
-          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
-          <ToolbarButton
-            label="Heading 2"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.toggleOrInsertBlock('h2')
-                : insertAtCursor('## ', 3, 3)
-            }
-            icon={<Heading2 className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Heading 3"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.toggleOrInsertBlock('h3')
-                : insertAtCursor('### ', 4, 4)
-            }
-            icon={<Heading3 className="w-4 h-4" />}
-          />
-          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
-          <ToolbarButton
-            label="Bold (Ctrl+B)"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.applyInlineFormat('bold')
-                : wrapSelection('**', '**', 'bold text')
-            }
-            icon={<Bold className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Italic (Ctrl+I)"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.applyInlineFormat('italic')
-                : wrapSelection('*', '*', 'italic text')
-            }
-            icon={<Italic className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Inline code"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.applyInlineFormat('code')
-                : wrapSelection('`', '`', 'code')
-            }
-            icon={<Code className="w-4 h-4" />}
-          />
-          <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
-          <ToolbarButton
-            label="Code block"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.insertCodeBlock('bash', '')
-                : insertAtCursor('```bash\n\n```\n', 8, 8)
-            }
-            icon={<FileCode2 className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Insert image"
-            onClick={() => setImageModalOpen(true)}
-            icon={<ImagePlus className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Table"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.insertTableBlock()
-                : insertAtCursor(
-                    '| Column A | Column B |\n| :--- | :--- |\n| Value 1 | Value 2 |\n'
-                  )
-            }
-            icon={<Table className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Checklist"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.toggleOrInsertBlock('task-item')
-                : insertAtCursor('- [ ] Task item\n')
-            }
-            icon={<CheckSquare className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Callout quote"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.toggleOrInsertBlock('blockquote')
-                : insertAtCursor('> Note: ')
-            }
-            icon={<Quote className="w-4 h-4" />}
-          />
-          <ToolbarButton
-            label="Horizontal rule"
-            onClick={() =>
-              viewMode === 'read'
-                ? liveEditorRef.current?.insertDividerBlock()
-                : insertAtCursor('\n---\n\n')
-            }
-            icon={<Minus className="w-4 h-4" />}
-          />
+          {!isReadOnly && (
+            <>
+              <ToolbarButton
+                label="Undo (Ctrl+Z)"
+                onClick={onUndo}
+                disabled={!canUndo}
+                icon={<Undo2 className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Redo (Ctrl+Y)"
+                onClick={onRedo}
+                disabled={!canRedo}
+                icon={<Redo2 className="w-4 h-4" />}
+              />
+              <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+              <ToolbarButton
+                label="Heading 2"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.toggleOrInsertBlock('h2')
+                    : insertAtCursor('## ', 3, 3)
+                }
+                icon={<Heading2 className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Heading 3"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.toggleOrInsertBlock('h3')
+                    : insertAtCursor('### ', 4, 4)
+                }
+                icon={<Heading3 className="w-4 h-4" />}
+              />
+              <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+              <ToolbarButton
+                label="Bold (Ctrl+B)"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.applyInlineFormat('bold')
+                    : wrapSelection('**', '**', 'bold text')
+                }
+                icon={<Bold className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Italic (Ctrl+I)"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.applyInlineFormat('italic')
+                    : wrapSelection('*', '*', 'italic text')
+                }
+                icon={<Italic className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Inline code"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.applyInlineFormat('code')
+                    : wrapSelection('`', '`', 'code')
+                }
+                icon={<Code className="w-4 h-4" />}
+              />
+              <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+              <ToolbarButton
+                label="Code block"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.insertCodeBlock('bash', '')
+                    : insertAtCursor('```bash\n\n```\n', 8, 8)
+                }
+                icon={<FileCode2 className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Insert image"
+                onClick={() => setImageModalOpen(true)}
+                icon={<ImagePlus className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Table"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.insertTableBlock()
+                    : insertAtCursor(
+                        '| Column A | Column B |\n| :--- | :--- |\n| Value 1 | Value 2 |\n'
+                      )
+                }
+                icon={<Table className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Checklist"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.toggleOrInsertBlock('task-item')
+                    : insertAtCursor('- [ ] Task item\n')
+                }
+                icon={<CheckSquare className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Callout quote"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.toggleOrInsertBlock('blockquote')
+                    : insertAtCursor('> Note: ')
+                }
+                icon={<Quote className="w-4 h-4" />}
+              />
+              <ToolbarButton
+                label="Horizontal rule"
+                onClick={() =>
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.insertDividerBlock()
+                    : insertAtCursor('\n---\n\n')
+                }
+                icon={<Minus className="w-4 h-4" />}
+              />
+              <div className="w-px h-4 bg-neutral-200 dark:bg-white/10 mx-1" />
+            </>
+          )}
+          <div className="relative flex items-center shrink-0">
+            <Type className="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute left-2" />
+            <select
+              value={editorFont}
+              onChange={(e) => setEditorFont(e.target.value as EditorFontId)}
+              aria-label="Editor font"
+              title="Editor font"
+              className="appearance-none bg-transparent pl-7 pr-6 py-1 rounded-md text-[12px] font-medium text-neutral-600 dark:text-neutral-300 hover:text-neutral-950 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] focus:outline-none cursor-pointer"
+            >
+              {EDITOR_FONTS.map((font) => (
+                <option key={font.id} value={font.id} className="bg-white dark:bg-[#1a1a1e]">
+                  {font.label}
+                </option>
+              ))}
+            </select>
+            <ChevronDown className="w-3 h-3 text-neutral-400 pointer-events-none absolute right-1.5" />
+          </div>
+          {isReadOnly && (
+            <span className="text-[12px] text-neutral-500 dark:text-neutral-400 ml-2">
+              View-only shared document
+            </span>
+          )}
         </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {isReadOnly ? (
+              <button
+                type="button"
+                onClick={() => onDuplicateSharedNote(note)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Save a copy to my notes</span>
+              </button>
+            ) : (
+              <>
             <button
               type="button"
               onClick={handleSaveSelectionAsSnippet}
@@ -935,6 +1040,8 @@ export function DocumentWorkspace({
                 </div>
               )}
             </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -948,6 +1055,7 @@ export function DocumentWorkspace({
                 ref={titleInputRef}
                 data-note-field="title"
                 type="text"
+                readOnly={isReadOnly}
                 value={note.title}
                 onFocus={(e) => syncTitleSelection(e.currentTarget)}
                 onSelect={(e) => syncTitleSelection(e.currentTarget)}
@@ -956,6 +1064,7 @@ export function DocumentWorkspace({
                 onPaste={(e) => syncTitleSelection(e.currentTarget)}
                 onCut={(e) => syncTitleSelection(e.currentTarget)}
                 onChange={(e) => {
+                  if (isReadOnly) return;
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTitleSelectionRef.current;
@@ -973,10 +1082,14 @@ export function DocumentWorkspace({
                 }}
                 placeholder="Document title..."
                 aria-label="Document title"
-                className="w-full bg-transparent text-[26px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
+                className="editor-prose-font w-full bg-transparent text-[26px] font-bold leading-[1.5] py-1 text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
               />
               <div className="flex items-center gap-2 text-[12.5px] text-neutral-500 dark:text-neutral-400 mb-5 tabular-nums">
-                <span>{folderName}</span>
+                <span>
+                  {isSharedWithMe
+                    ? `Shared by ${note.ownerName || note.ownerEmail}`
+                    : folderName}
+                </span>
                 <span aria-hidden="true">·</span>
                 <span>Updated {formatRelativeDate(note.updatedAt)}</span>
                 {stats && (
@@ -989,12 +1102,14 @@ export function DocumentWorkspace({
               <textarea
                 ref={textareaRef}
                 data-note-field="content"
+                readOnly={isReadOnly}
                 value={note.content}
                 onFocus={(e) => syncTextareaSelection(e.currentTarget)}
                 onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onCut={(e) => syncTextareaSelection(e.currentTarget)}
                 onChange={(e) => {
+                  if (isReadOnly) return;
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTextareaSelectionRef.current;
@@ -1011,20 +1126,23 @@ export function DocumentWorkspace({
                     }
                   );
                 }}
-                onKeyDown={handleEditorKeyDown}
+                onKeyDown={(e) => {
+                  if (!isReadOnly) handleEditorKeyDown(e);
+                }}
                 onPaste={async (e) => {
+                  if (isReadOnly) return;
                   syncTextareaSelection(e.currentTarget);
                   await handleEditorPaste(e);
                 }}
                 onDragOver={(e) => {
-                  if (e.dataTransfer.types.includes('Files')) {
+                  if (!isReadOnly && e.dataTransfer.types.includes('Files')) {
                     e.preventDefault();
                     setIsDraggingOver(true);
                   }
                 }}
                 onDragLeave={() => setIsDraggingOver(false)}
                 onDrop={async (e) => {
-                  if (e.dataTransfer.files?.length) {
+                  if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
                     setIsDraggingOver(false);
                     await handleImageFiles(e.dataTransfer.files);
@@ -1033,7 +1151,7 @@ export function DocumentWorkspace({
                 onSelect={(e) => syncTextareaSelection(e.currentTarget)}
                 placeholder="Write Markdown notes, paste screenshots, or press Insert snippet above..."
                 aria-label="Markdown document editor"
-                className={`flex-1 w-full min-h-[420px] bg-transparent font-mono-code text-[14px] leading-[1.7] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
+                className={`editor-source-font flex-1 w-full min-h-[420px] bg-transparent text-[14px] leading-[1.8] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
                   isDraggingOver ? 'ring-2 ring-blue-500/60 bg-blue-500/5' : ''
                 }`}
               />
@@ -1042,22 +1160,29 @@ export function DocumentWorkspace({
             {/* Right Pane: Live Document Preview */}
             <div className="overflow-y-auto px-6 sm:px-8 py-6">
               <div className="max-w-[720px] mx-auto">
-                <h1 className="text-[28px] font-bold tracking-tight text-neutral-950 dark:text-white mb-2 leading-tight">
+                <h1 className="editor-prose-font text-[28px] font-bold text-neutral-950 dark:text-white mb-2 leading-[1.45]">
                   {note.title || 'Untitled Note'}
                 </h1>
                 <div className="flex items-center gap-2 text-[12.5px] text-neutral-500 dark:text-neutral-400 mb-7 tabular-nums">
-                  <span>{folderName}</span>
+                  <span>
+                    {isSharedWithMe
+                      ? `Shared by ${note.ownerName || note.ownerEmail}`
+                      : folderName}
+                  </span>
                   <span aria-hidden="true">·</span>
                   <span>{stats?.readMinutes ?? 1} min read</span>
                 </div>
                 <MarkdownRenderer
                   content={note.content || '*Start typing in the editor to preview your Markdown document.*'}
-                  onToggleCheckbox={(idx) =>
-                    onUpdateNote(
-                      note.id,
-                      { content: toggleTaskCheckbox(note.content, idx) },
-                      { source: 'discrete', field: 'content' }
-                    )
+                  onToggleCheckbox={
+                    isReadOnly
+                      ? undefined
+                      : (idx) =>
+                          onUpdateNote(
+                            note.id,
+                            { content: toggleTaskCheckbox(note.content, idx) },
+                            { source: 'discrete', field: 'content' }
+                          )
                   }
                 />
               </div>
@@ -1070,6 +1195,7 @@ export function DocumentWorkspace({
                 ref={titleInputRef}
                 data-note-field="title"
                 type="text"
+                readOnly={isReadOnly}
                 value={note.title}
                 onFocus={(e) => syncTitleSelection(e.currentTarget)}
                 onSelect={(e) => syncTitleSelection(e.currentTarget)}
@@ -1078,6 +1204,7 @@ export function DocumentWorkspace({
                 onPaste={(e) => syncTitleSelection(e.currentTarget)}
                 onCut={(e) => syncTitleSelection(e.currentTarget)}
                 onChange={(e) => {
+                  if (isReadOnly) return;
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTitleSelectionRef.current;
@@ -1095,10 +1222,14 @@ export function DocumentWorkspace({
                 }}
                 placeholder="Document title..."
                 aria-label="Document title"
-                className="w-full bg-transparent text-[30px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
+                className="editor-prose-font w-full bg-transparent text-[30px] font-bold leading-[1.5] py-1 text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none mb-2"
               />
               <div className="flex items-center gap-2 text-[12.5px] text-neutral-500 dark:text-neutral-400 mb-6 tabular-nums">
-                <span>{folderName}</span>
+                <span>
+                  {isSharedWithMe
+                    ? `Shared by ${note.ownerName || note.ownerEmail}`
+                    : folderName}
+                </span>
                 <span aria-hidden="true">·</span>
                 <span>Updated {formatRelativeDate(note.updatedAt)}</span>
                 {stats && (
@@ -1113,12 +1244,14 @@ export function DocumentWorkspace({
               <textarea
                 ref={textareaRef}
                 data-note-field="content"
+                readOnly={isReadOnly}
                 value={note.content}
                 onFocus={(e) => syncTextareaSelection(e.currentTarget)}
                 onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onCut={(e) => syncTextareaSelection(e.currentTarget)}
                 onChange={(e) => {
+                  if (isReadOnly) return;
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTextareaSelectionRef.current;
@@ -1135,20 +1268,23 @@ export function DocumentWorkspace({
                     }
                   );
                 }}
-                onKeyDown={handleEditorKeyDown}
+                onKeyDown={(e) => {
+                  if (!isReadOnly) handleEditorKeyDown(e);
+                }}
                 onPaste={async (e) => {
+                  if (isReadOnly) return;
                   syncTextareaSelection(e.currentTarget);
                   await handleEditorPaste(e);
                 }}
                 onDragOver={(e) => {
-                  if (e.dataTransfer.types.includes('Files')) {
+                  if (!isReadOnly && e.dataTransfer.types.includes('Files')) {
                     e.preventDefault();
                     setIsDraggingOver(true);
                   }
                 }}
                 onDragLeave={() => setIsDraggingOver(false)}
                 onDrop={async (e) => {
-                  if (e.dataTransfer.files?.length) {
+                  if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
                     setIsDraggingOver(false);
                     await handleImageFiles(e.dataTransfer.files);
@@ -1157,27 +1293,27 @@ export function DocumentWorkspace({
                 onSelect={(e) => syncTextareaSelection(e.currentTarget)}
                 placeholder="Write technical notes in Markdown, paste screenshots, or insert organized snippets..."
                 aria-label="Markdown document editor"
-                className={`flex-1 w-full min-h-[540px] bg-transparent font-mono-code text-[14.5px] leading-[1.75] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
+                className={`editor-source-font flex-1 w-full min-h-[540px] bg-transparent text-[14.5px] leading-[1.8] text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none resize-none rounded-lg transition-colors ${
                   isDraggingOver ? 'ring-2 ring-blue-500/60 bg-blue-500/5' : ''
                 }`}
               />
             </div>
           </div>
         ) : (
-          /* Document Mode — Direct in-place editable rich document without needing to click Edit */
+          /* Document Mode — Direct in-place editable rich document (or read-only for view-only shares) */
           <div
             className={`flex-1 overflow-y-auto px-6 sm:px-10 py-8 sm:py-10 transition-colors ${
               isDraggingOver ? 'bg-blue-500/[0.04]' : ''
             }`}
             onDragOver={(e) => {
-              if (e.dataTransfer.types.includes('Files')) {
+              if (!isReadOnly && e.dataTransfer.types.includes('Files')) {
                 e.preventDefault();
                 setIsDraggingOver(true);
               }
             }}
             onDragLeave={() => setIsDraggingOver(false)}
             onDrop={async (e) => {
-              if (e.dataTransfer.files?.length) {
+              if (!isReadOnly && e.dataTransfer.files?.length) {
                 e.preventDefault();
                 setIsDraggingOver(false);
                 await handleImageFiles(e.dataTransfer.files);
@@ -1186,40 +1322,50 @@ export function DocumentWorkspace({
           >
             <article className="max-w-[760px] mx-auto pb-16">
               <div className="mb-7">
-                <input
-                  ref={titleInputRef}
-                  data-note-field="title"
-                  type="text"
-                  value={note.title}
-                  onFocus={(e) => syncTitleSelection(e.currentTarget)}
-                  onSelect={(e) => syncTitleSelection(e.currentTarget)}
-                  onKeyDown={(e) => syncTitleSelection(e.currentTarget)}
-                  onMouseUp={(e) => syncTitleSelection(e.currentTarget)}
-                  onPaste={(e) => syncTitleSelection(e.currentTarget)}
-                  onCut={(e) => syncTitleSelection(e.currentTarget)}
-                  onChange={(e) => {
-                    const nextStart = e.target.selectionStart ?? e.target.value.length;
-                    const nextEnd = e.target.selectionEnd ?? nextStart;
-                    const prevSel = lastTitleSelectionRef.current;
-                    lastTitleSelectionRef.current = { start: nextStart, end: nextEnd };
-                    onUpdateNote(
-                      note.id,
-                      { title: e.target.value },
-                      {
-                        source: 'typing',
-                        field: 'title',
-                        prevSelection: { target: 'title', ...prevSel },
-                        nextSelection: { target: 'title', start: nextStart, end: nextEnd },
-                      }
-                    );
-                  }}
-                  placeholder="Untitled Note"
-                  aria-label="Document title"
-                  className="w-full bg-transparent text-[30px] sm:text-[32px] font-bold tracking-tight text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none leading-tight"
-                />
+                {isReadOnly ? (
+                  <h1 className="editor-prose-font text-[30px] sm:text-[32px] font-bold text-neutral-950 dark:text-white leading-[1.48] py-1">
+                    {note.title || 'Untitled Note'}
+                  </h1>
+                ) : (
+                  <input
+                    ref={titleInputRef}
+                    data-note-field="title"
+                    type="text"
+                    value={note.title}
+                    onFocus={(e) => syncTitleSelection(e.currentTarget)}
+                    onSelect={(e) => syncTitleSelection(e.currentTarget)}
+                    onKeyDown={(e) => syncTitleSelection(e.currentTarget)}
+                    onMouseUp={(e) => syncTitleSelection(e.currentTarget)}
+                    onPaste={(e) => syncTitleSelection(e.currentTarget)}
+                    onCut={(e) => syncTitleSelection(e.currentTarget)}
+                    onChange={(e) => {
+                      const nextStart = e.target.selectionStart ?? e.target.value.length;
+                      const nextEnd = e.target.selectionEnd ?? nextStart;
+                      const prevSel = lastTitleSelectionRef.current;
+                      lastTitleSelectionRef.current = { start: nextStart, end: nextEnd };
+                      onUpdateNote(
+                        note.id,
+                        { title: e.target.value },
+                        {
+                          source: 'typing',
+                          field: 'title',
+                          prevSelection: { target: 'title', ...prevSel },
+                          nextSelection: { target: 'title', start: nextStart, end: nextEnd },
+                        }
+                      );
+                    }}
+                    placeholder="Untitled Note"
+                    aria-label="Document title"
+                    className="editor-prose-font w-full bg-transparent text-[30px] sm:text-[32px] font-bold text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none leading-[1.48] py-1"
+                  />
+                )}
 
                 <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[12.5px] text-neutral-500 dark:text-neutral-400 tabular-nums">
-                  <span>{folderName}</span>
+                  <span>
+                    {isSharedWithMe
+                      ? `Shared by ${note.ownerName || note.ownerEmail}`
+                      : folderName}
+                  </span>
                   <span aria-hidden="true">·</span>
                   <span>Updated {formatRelativeDate(note.updatedAt)}</span>
                   {stats && (
@@ -1233,16 +1379,20 @@ export function DocumentWorkspace({
                 </div>
               </div>
 
-              <LiveDocumentEditor
-                ref={liveEditorRef}
-                noteId={note.id}
-                content={note.content}
-                onChangeContent={(nextMarkdown, meta) =>
-                  onUpdateNote(note.id, { content: nextMarkdown }, meta)
-                }
-                onPasteImageFiles={handleImageFiles}
-                onSelectionStateChange={setHasSelection}
-              />
+              {isReadOnly ? (
+                <MarkdownRenderer content={note.content || '*This note has no content yet.*'} />
+              ) : (
+                <LiveDocumentEditor
+                  ref={liveEditorRef}
+                  noteId={note.id}
+                  content={note.content}
+                  onChangeContent={(nextMarkdown, meta) =>
+                    onUpdateNote(note.id, { content: nextMarkdown }, meta)
+                  }
+                  onPasteImageFiles={handleImageFiles}
+                  onSelectionStateChange={setHasSelection}
+                />
+              )}
             </article>
           </div>
         )}
@@ -1269,7 +1419,7 @@ export function DocumentWorkspace({
                     type="button"
                     onClick={() => scrollToHeading(h.id)}
                     style={{ paddingLeft: `${(h.level - 1) * 10 + 8}px` }}
-                    className="w-full text-left py-1 pr-2 rounded-md text-[12.5px] text-neutral-600 dark:text-neutral-400 hover:text-neutral-950 dark:hover:text-white hover:bg-neutral-200/60 dark:hover:bg-white/[0.05] transition-colors truncate cursor-pointer"
+                    className="editor-prose-font w-full text-left py-1.5 pr-2 rounded-md text-[12.5px] leading-[1.55] text-neutral-600 dark:text-neutral-400 hover:text-neutral-950 dark:hover:text-white hover:bg-neutral-200/60 dark:hover:bg-white/[0.05] transition-colors truncate cursor-pointer"
                     title={h.text}
                   >
                     {h.text}

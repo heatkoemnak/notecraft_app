@@ -365,13 +365,13 @@ function EditableCodeBlock({
         <pre
           ref={preRef}
           aria-hidden="true"
-          className="m-0 p-4 overflow-x-auto text-[13.5px] leading-[1.65] font-mono-code pointer-events-none select-none whitespace-pre"
+          className="m-0 p-4 overflow-x-auto text-[13.5px] leading-[1.75] font-mono-code pointer-events-none select-none whitespace-pre"
         >
           <code>
             {lines.map((line, lineIdx) => {
               const tokens = tokenizeCodeLine(line, language || 'text');
               return (
-                <div key={lineIdx} className="min-h-[1.65em]">
+                <div key={lineIdx} className="min-h-[1.75em]">
                   {tokens.map((tok, tokIdx) => (
                     <span key={tokIdx} className={TOKEN_CLASSES[tok.type]}>
                       {tok.value}
@@ -410,7 +410,7 @@ function EditableCodeBlock({
               });
             }
           }}
-          className="absolute inset-0 w-full h-full m-0 p-4 bg-transparent text-transparent caret-neutral-900 dark:caret-white text-[13.5px] leading-[1.65] font-mono-code resize-none overflow-x-auto overflow-y-hidden whitespace-pre focus:outline-none selection:bg-blue-500/25"
+          className="absolute inset-0 w-full h-full m-0 p-4 bg-transparent text-transparent caret-neutral-900 dark:caret-white text-[13.5px] leading-[1.75] font-mono-code resize-none overflow-x-auto overflow-y-hidden whitespace-pre focus:outline-none selection:bg-blue-500/25"
         />
       </div>
     </div>
@@ -1098,7 +1098,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
     return (
       <div
         data-live-editor="true"
-        className="text-[15.5px] leading-[1.72] text-neutral-800 dark:text-[#e4e4ea] break-words"
+        className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words"
       >
         {blocks.map((block, index) => {
           const prevType = index > 0 ? blocks[index - 1].type : null;
@@ -1107,12 +1107,12 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           if (block.type === 'heading') {
             const headingClasses =
               block.level === 1
-                ? 'text-[28px] font-semibold tracking-tight text-neutral-950 dark:text-white mt-8 mb-4 first:mt-0 leading-tight'
+                ? 'text-[28px] font-semibold text-neutral-950 dark:text-white mt-8 mb-4 first:mt-0 leading-[1.45]'
                 : block.level === 2
-                ? 'text-[21px] font-semibold tracking-tight text-neutral-950 dark:text-white mt-8 mb-3 first:mt-0 pb-1.5 border-b border-neutral-200/80 dark:border-white/[0.07]'
+                ? 'text-[21px] font-semibold text-neutral-950 dark:text-white mt-8 mb-3 first:mt-0 pb-1.5 border-b border-neutral-200/80 dark:border-white/[0.07] leading-[1.45]'
                 : block.level === 3
-                ? 'text-[17px] font-semibold text-neutral-900 dark:text-neutral-100 mt-6 mb-2.5'
-                : 'text-[15px] font-semibold text-neutral-900 dark:text-neutral-100 mt-5 mb-2';
+                ? 'text-[17px] font-semibold text-neutral-900 dark:text-neutral-100 mt-6 mb-2.5 leading-[1.5]'
+                : 'text-[15px] font-semibold text-neutral-900 dark:text-neutral-100 mt-5 mb-2 leading-[1.55]';
 
             return (
               <RichInlineField
@@ -1143,7 +1143,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   externalSyncSeq={externalSyncSeq}
                   placeholder="Write a note or callout..."
                   ariaLabel="Callout quote"
-                  className="leading-[1.65]"
+                  className="leading-[1.78]"
                   registerRef={(el) => registerBlockRef(block.id, el)}
                   onFocusBlock={() => setFocusedBlockId(block.id)}
                   onChangeMarkdown={(val) => handleInlineChange(block.id, val)}
@@ -1160,7 +1160,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
             return (
               <div
                 key={block.id}
-                className={`flex items-start gap-2.5 leading-[1.65] ${topGap} ${bottomGap}`}
+                className={`flex items-start gap-2.5 leading-[1.78] ${topGap} ${bottomGap}`}
               >
                 <input
                   type="checkbox"
@@ -1174,14 +1174,14 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                     commitBlocks(nextBlocks, 'discrete');
                   }}
                   aria-label="Toggle task item"
-                  className="mt-1.5 h-4 w-4 rounded border-neutral-300 dark:border-white/25 bg-white dark:bg-neutral-900 accent-blue-600 cursor-pointer shrink-0"
+                  className="mt-2 h-4 w-4 rounded border-neutral-300 dark:border-white/25 bg-white dark:bg-neutral-900 accent-blue-600 cursor-pointer shrink-0"
                 />
                 <RichInlineField
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="Task item..."
                   ariaLabel="Task item text"
-                  className={`flex-1 min-w-0 leading-[1.65] ${
+                  className={`flex-1 min-w-0 leading-[1.78] ${
                     block.checked
                       ? 'line-through text-neutral-400 dark:text-neutral-500'
                       : 'text-neutral-800 dark:text-[#dcdce4]'
@@ -1202,18 +1202,18 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
             return (
               <div
                 key={block.id}
-                className={`flex items-start gap-2.5 pl-2 leading-[1.7] ${topGap} ${bottomGap}`}
+                className={`flex items-start gap-2.5 pl-2 leading-[1.8] ${topGap} ${bottomGap}`}
               >
                 <span
                   aria-hidden="true"
-                  className="mt-[0.62em] h-1.5 w-1.5 rounded-full bg-neutral-400 dark:bg-neutral-500 shrink-0"
+                  className="mt-[0.68em] h-1.5 w-1.5 rounded-full bg-neutral-400 dark:bg-neutral-500 shrink-0"
                 />
                 <RichInlineField
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="List item..."
                   ariaLabel="Bullet list item"
-                  className="flex-1 min-w-0 leading-[1.7] text-neutral-800 dark:text-[#dcdce4]"
+                  className="flex-1 min-w-0 leading-[1.8] text-neutral-800 dark:text-[#dcdce4]"
                   registerRef={(el) => registerBlockRef(block.id, el)}
                   onFocusBlock={() => setFocusedBlockId(block.id)}
                   onChangeMarkdown={(val) => handleInlineChange(block.id, val)}
@@ -1231,7 +1231,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
             return (
               <div
                 key={block.id}
-                className={`flex items-start gap-2.5 pl-2 leading-[1.7] ${topGap} ${bottomGap}`}
+                className={`flex items-start gap-2.5 pl-2 leading-[1.8] ${topGap} ${bottomGap}`}
               >
                 <span
                   aria-hidden="true"
@@ -1244,7 +1244,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   externalSyncSeq={externalSyncSeq}
                   placeholder="List item..."
                   ariaLabel="Numbered list item"
-                  className="flex-1 min-w-0 leading-[1.7] text-neutral-800 dark:text-[#dcdce4]"
+                  className="flex-1 min-w-0 leading-[1.8] text-neutral-800 dark:text-[#dcdce4]"
                   registerRef={(el) => registerBlockRef(block.id, el)}
                   onFocusBlock={() => setFocusedBlockId(block.id)}
                   onChangeMarkdown={(val) => handleInlineChange(block.id, val)}
@@ -1456,7 +1456,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   : 'Write here...'
               }
               ariaLabel="Document paragraph"
-              className="my-3.5 text-neutral-800 dark:text-[#dcdce4] leading-[1.72] min-h-[1.72em]"
+              className="my-3.5 text-neutral-800 dark:text-[#dcdce4] leading-[1.82] min-h-[1.82em]"
               registerRef={(el) => registerBlockRef(block.id, el)}
               onFocusBlock={() => setFocusedBlockId(block.id)}
               onChangeMarkdown={(val) => handleInlineChange(block.id, val)}

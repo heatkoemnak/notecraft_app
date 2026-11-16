@@ -236,7 +236,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
   };
 
   return (
-    <div className="text-[15.5px] leading-[1.72] text-neutral-800 dark:text-[#e4e4ea] break-words">
+    <div className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         urlTransform={(url) => {
@@ -251,7 +251,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             return (
               <h1
                 id={id}
-                className="scroll-mt-20 text-[28px] font-semibold tracking-tight text-neutral-950 dark:text-white mt-8 mb-4 first:mt-0 leading-tight"
+                className="scroll-mt-20 text-[28px] font-semibold text-neutral-950 dark:text-white mt-8 mb-4 first:mt-0 leading-[1.45]"
               >
                 {children}
               </h1>
@@ -262,7 +262,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             return (
               <h2
                 id={id}
-                className="scroll-mt-20 text-[21px] font-semibold tracking-tight text-neutral-950 dark:text-white mt-8 mb-3 first:mt-0 pb-1.5 border-b border-neutral-200/80 dark:border-white/[0.07]"
+                className="scroll-mt-20 text-[21px] font-semibold text-neutral-950 dark:text-white mt-8 mb-3 first:mt-0 pb-1.5 border-b border-neutral-200/80 dark:border-white/[0.07] leading-[1.45]"
               >
                 {children}
               </h2>
@@ -273,14 +273,14 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             return (
               <h3
                 id={id}
-                className="scroll-mt-20 text-[17px] font-semibold text-neutral-900 dark:text-neutral-100 mt-6 mb-2.5"
+                className="scroll-mt-20 text-[17px] font-semibold text-neutral-900 dark:text-neutral-100 mt-6 mb-2.5 leading-[1.5]"
               >
                 {children}
               </h3>
             );
           },
           h4: ({ children }) => (
-            <h4 className="text-[15px] font-semibold text-neutral-900 dark:text-neutral-100 mt-5 mb-2">
+            <h4 className="text-[15px] font-semibold text-neutral-900 dark:text-neutral-100 mt-5 mb-2 leading-[1.55]">
               {children}
             </h4>
           ),
@@ -293,7 +293,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
               return <>{children}</>;
             }
             return (
-              <p className="my-3.5 text-neutral-800 dark:text-[#dcdce4] leading-[1.72]">{children}</p>
+              <p className="my-3.5 text-neutral-800 dark:text-[#dcdce4] leading-[1.82]">{children}</p>
             );
           },
           img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
@@ -331,7 +331,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
           li: ({ children, className }) => {
             const isTask = className?.includes('task-list-item');
             return (
-              <li className={isTask ? 'flex items-start gap-2.5 leading-[1.65]' : 'leading-[1.7]'}>
+              <li className={isTask ? 'flex items-start gap-2.5 leading-[1.78]' : 'leading-[1.8]'}>
                 {children}
               </li>
             );

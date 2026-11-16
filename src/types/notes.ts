@@ -6,6 +6,18 @@ export type SidebarFilter =
   | { type: 'snippets' }
   | { type: 'folder'; folderId: string };
 
+export type SharePermission = 'view' | 'edit';
+
+export interface NoteShareEntry {
+  id: string;
+  noteId: string;
+  recipientEmail: string;
+  recipientName?: string | null;
+  recipientUserId?: string | null;
+  permission: SharePermission;
+  createdAt: number;
+}
+
 export interface Folder {
   id: string;
   name: string;
@@ -20,6 +32,11 @@ export interface NoteDocument {
   starred: boolean;
   createdAt: number;
   updatedAt: number;
+  isSharedWithMe?: boolean;
+  ownerName?: string;
+  ownerEmail?: string;
+  sharedPermission?: SharePermission;
+  shares?: NoteShareEntry[];
 }
 
 export interface Snippet {
@@ -45,4 +62,5 @@ export interface AuthUser {
   email: string;
   createdAt: number;
 }
+
 

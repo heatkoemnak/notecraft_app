@@ -100,6 +100,16 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           created_at BIGINT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS note_shares (
+          id TEXT PRIMARY KEY,
+          note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+          owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          recipient_email TEXT NOT NULL,
+          permission TEXT NOT NULL DEFAULT 'view',
+          created_at BIGINT NOT NULL,
+          UNIQUE (note_id, recipient_email)
+        );
+
         ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE snippets ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
@@ -110,6 +120,8 @@ export async function ensureSchema(pool: Pool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
         CREATE INDEX IF NOT EXISTS idx_snippets_user_id ON snippets(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_images_user_id ON note_images(user_id);
+        CREATE INDEX IF NOT EXISTS idx_note_shares_recipient_email ON note_shares(recipient_email);
+        CREATE INDEX IF NOT EXISTS idx_note_shares_note_id ON note_shares(note_id);
       `);
 
       schemaInitialized = true;
