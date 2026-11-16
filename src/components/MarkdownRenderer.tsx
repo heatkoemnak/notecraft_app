@@ -97,6 +97,32 @@ function remarkGroupImages() {
   };
 }
 
+function remarkTableWidths() {
+  return (tree: SimpleMdastNode) => {
+    if (!tree.children || !Array.isArray(tree.children)) return;
+    const nextChildren: SimpleMdastNode[] = [];
+    for (let i = 0; i < tree.children.length; i += 1) {
+      const current = tree.children[i];
+      if (current.type === 'html' && typeof current.value === 'string') {
+        const match = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/.exec(current.value);
+        const nextNode = tree.children[i + 1];
+        if (match && nextNode && nextNode.type === 'table') {
+          nextNode.data = {
+            ...(nextNode.data || {}),
+            hProperties: {
+              ...((nextNode.data?.hProperties as Record<string, unknown>) || {}),
+              'data-col-widths': match[1].replace(/\s+/g, ''),
+            },
+          };
+          continue;
+        }
+      }
+      nextChildren.push(current);
+    }
+    tree.children = nextChildren;
+  };
+}
+
 function extractDocumentImages(markdown: string): LightboxImageItem[] {
   const items: LightboxImageItem[] = [];
   const regex = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
@@ -331,7 +357,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
     <LightboxTriggerContext.Provider value={handleOpenLightbox}>
       <div className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words">
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkGroupImages]}
+          remarkPlugins={[remarkGfm, remarkGroupImages, remarkTableWidths]}
           urlTransform={(url) => {
             if (
               url.startsWith(IMAGE_REF_PREFIX) ||
@@ -484,13 +510,39 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             </blockquote>
           ),
           hr: () => <hr className="my-7 border-neutral-200 dark:border-white/[0.08]" />,
-          table: ({ children }) => (
-            <div className="my-5 overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
-              <table className="w-full border-collapse text-left text-[14px] tabular-nums">
-                {children}
-              </table>
-            </div>
-          ),
+          table: ({ children, ...props }) => {
+            const rawWidths = (props as Record<string, unknown>)['data-col-widths'];
+            const colWidths =
+              typeof rawWidths === 'string' && rawWidths.trim()
+                ? rawWidths
+                    .split(',')
+                    .map((n) => Math.max(72, Math.min(800, Number(n.trim()) || 140)))
+                : null;
+            const totalWidth = colWidths ? colWidths.reduce((sum, w) => sum + w, 0) : null;
+            return (
+              <div className="my-5 overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
+                <table
+                  style={
+                    totalWidth
+                      ? { width: `${totalWidth}px`, minWidth: '100%' }
+                      : undefined
+                  }
+                  className={`${
+                    colWidths ? 'table-fixed' : 'w-full'
+                  } border-collapse text-left text-[14px] tabular-nums`}
+                >
+                  {colWidths && (
+                    <colgroup>
+                      {colWidths.map((w, idx) => (
+                        <col key={idx} style={{ width: `${w}px` }} />
+                      ))}
+                    </colgroup>
+                  )}
+                  {children}
+                </table>
+              </div>
+            );
+          },
           thead: ({ children }) => (
             <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
               {children}

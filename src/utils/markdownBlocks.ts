@@ -12,6 +12,7 @@ export type DocBlock =
       headers: string[];
       alignments: ('left' | 'center' | 'right')[];
       rows: string[][];
+      colWidths?: number[];
     }
   | { id: string; type: 'image'; alt: string; src: string }
   | { id: string; type: 'file'; label: string; src: string }
@@ -294,9 +295,34 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
       continue;
     }
 
+    // Optional table column widths comment right before a GFM table
+    let pendingColWidths: number[] | undefined;
+    const widthCommentMatch = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/.exec(line);
+    if (widthCommentMatch) {
+      let tableStart = i + 1;
+      while (tableStart < lines.length && !lines[tableStart].trim()) {
+        tableStart += 1;
+      }
+      if (
+        tableStart + 1 < lines.length &&
+        lines[tableStart].includes('|') &&
+        isTableSeparatorLine(lines[tableStart + 1])
+      ) {
+        pendingColWidths = widthCommentMatch[1]
+          .split(',')
+          .map((n) => Math.max(72, Math.min(800, Math.round(Number(n.trim()) || 140))));
+        i = tableStart;
+      } else {
+        i += 1;
+        continue;
+      }
+    }
+
+    const activeLine = lines[i];
+
     // GFM Table
-    if (line.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
-      const headers = parseTableRow(line);
+    if (activeLine.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+      const headers = parseTableRow(activeLine);
       const alignments = parseTableAlignments(lines[i + 1], headers.length);
       const rows: string[][] = [];
       i += 2;
@@ -306,12 +332,17 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
         rows.push(row.slice(0, headers.length));
         i += 1;
       }
+      const normalizedWidths =
+        pendingColWidths && pendingColWidths.length === headers.length
+          ? pendingColWidths
+          : undefined;
       blocks.push({
         id: createBlockId(),
         type: 'table',
         headers,
         alignments,
         rows,
+        ...(normalizedWidths ? { colWidths: normalizedWidths } : {}),
       });
       continue;
     }
@@ -384,6 +415,7 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
         /^\s*(?:[-*+])\s+\[[ xX]\]\s+/.test(next) ||
         /^\s*[-*+]\s+/.test(next) ||
         /^\s*\d+\.\s+/.test(next) ||
+        /^\s*<!--\s*table-widths:/.test(next) ||
         (next.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1]))
       ) {
         break;
@@ -471,7 +503,11 @@ export function serializeBlocksToMarkdown(blocks: DocBlock[]): string {
               (row[idx] || '').replace(/\|/g, '\\|')
             ).join(' | ')} |`
         );
-        serialized = [headerLine, sepLine, ...rowLines].join('\n');
+        const widthComment =
+          block.colWidths && block.colWidths.length === colCount
+            ? `<!-- table-widths: ${block.colWidths.map((w) => Math.round(w)).join(',')} -->\n`
+            : '';
+        serialized = `${widthComment}${[headerLine, sepLine, ...rowLines].join('\n')}`;
         break;
       }
       case 'image': {

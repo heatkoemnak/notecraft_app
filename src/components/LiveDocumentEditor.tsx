@@ -12,8 +12,11 @@ import {
   Copy,
   ImageOff,
   Maximize2,
+  Minus,
   Plus,
+  RotateCcw,
   Trash2,
+  X,
 } from 'lucide-react';
 import { NoteUpdateMeta } from '../hooks/useNoteHistory';
 import {
@@ -559,6 +562,319 @@ function EditableImageBlock({
         />
       </figcaption>
     </figure>
+  );
+}
+
+function EditableTableBlock({
+  block,
+  externalSyncSeq,
+  onFocusBlock,
+  onPasteImages,
+  onUpdateHeader,
+  onUpdateCell,
+  onAddRow,
+  onDeleteRow,
+  onAddColumn,
+  onDeleteColumn,
+  onChangeColWidths,
+  onDeleteTable,
+}: {
+  block: Extract<DocBlock, { type: 'table' }>;
+  externalSyncSeq: number;
+  onFocusBlock: () => void;
+  onPasteImages?: (files: File[]) => void;
+  onUpdateHeader: (colIdx: number, val: string) => void;
+  onUpdateCell: (rowIdx: number, colIdx: number, val: string) => void;
+  onAddRow: () => void;
+  onDeleteRow: (rowIdx: number) => void;
+  onAddColumn: () => void;
+  onDeleteColumn: (colIdx: number) => void;
+  onChangeColWidths: (colWidths: number[] | undefined) => void;
+  onDeleteTable: () => void;
+}) {
+  const tableRef = useRef<HTMLTableElement>(null);
+  const [localSyncSeq, setLocalSyncSeq] = useState(0);
+  const [draftWidths, setDraftWidths] = useState<number[] | null>(null);
+  const [resizingColIdx, setResizingColIdx] = useState<number | null>(null);
+  const cleanupDragRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      cleanupDragRef.current?.();
+    };
+  }, []);
+
+  const persistedWidths =
+    block.colWidths && block.colWidths.length === block.headers.length
+      ? block.colWidths
+      : null;
+  const activeWidths = draftWidths ?? persistedWidths;
+  const actionColWidth = 36;
+  const totalWidth = activeWidths
+    ? activeWidths.reduce((sum, w) => sum + w, 0) + actionColWidth
+    : null;
+
+  const startColumnResize = (e: React.PointerEvent<HTMLDivElement>, colIdx: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const tableEl = tableRef.current;
+    if (!tableEl) return;
+
+    const headerCells = Array.from(
+      tableEl.querySelectorAll<HTMLTableCellElement>('thead th[data-col-header]')
+    );
+    if (headerCells.length !== block.headers.length) return;
+
+    const initialWidths = activeWidths
+      ? [...activeWidths]
+      : headerCells.map((th) => Math.max(72, Math.round(th.getBoundingClientRect().width)));
+
+    const startX = e.clientX;
+    const baseWidth = initialWidths[colIdx] ?? 140;
+    let latestWidths = [...initialWidths];
+
+    setResizingColIdx(colIdx);
+    setDraftWidths(latestWidths);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const nextWidth = Math.max(72, Math.min(720, Math.round(baseWidth + delta)));
+      latestWidths = latestWidths.map((w, idx) => (idx === colIdx ? nextWidth : w));
+      setDraftWidths(latestWidths);
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      cleanupDragRef.current = null;
+    };
+
+    const handlePointerUp = () => {
+      cleanup();
+      setDraftWidths(null);
+      setResizingColIdx(null);
+      onChangeColWidths(latestWidths);
+    };
+
+    cleanupDragRef.current = cleanup;
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+  };
+
+  const syncSeq = externalSyncSeq + localSyncSeq;
+  const canDeleteCol = block.headers.length > 1;
+
+  return (
+    <div className="group my-5">
+      <div className="overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
+        <table
+          ref={tableRef}
+          style={totalWidth ? { width: `${totalWidth}px`, minWidth: '100%' } : undefined}
+          className={`${
+            activeWidths ? 'table-fixed' : 'w-full'
+          } border-collapse text-left text-[14px] tabular-nums`}
+        >
+          {activeWidths && (
+            <colgroup>
+              {activeWidths.map((w, idx) => (
+                <col key={idx} style={{ width: `${w}px` }} />
+              ))}
+              <col style={{ width: `${actionColWidth}px` }} />
+            </colgroup>
+          )}
+          <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
+            <tr>
+              {block.headers.map((header, colIdx) => (
+                <th
+                  key={colIdx}
+                  data-col-header={colIdx}
+                  className={`group/col relative pl-4 pr-7 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200 align-top ${
+                    colIdx > 0 ? 'border-l border-neutral-200/70 dark:border-white/[0.06]' : ''
+                  } ${resizingColIdx === colIdx ? 'bg-blue-500/[0.06]' : ''}`}
+                >
+                  <RichInlineField
+                    markdown={header}
+                    externalSyncSeq={syncSeq}
+                    placeholder="Header"
+                    ariaLabel={`Table column ${colIdx + 1} header`}
+                    className="min-w-[44px]"
+                    onFocusBlock={onFocusBlock}
+                    onChangeMarkdown={(val) => onUpdateHeader(colIdx, val)}
+                    onPasteImages={onPasteImages}
+                  />
+
+                  {canDeleteCol && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLocalSyncSeq((s) => s + 1);
+                        onDeleteColumn(colIdx);
+                      }}
+                      title={`Delete column ${colIdx + 1}`}
+                      aria-label={`Delete column ${colIdx + 1}`}
+                      className="opacity-0 group-hover/col:opacity-100 focus:opacity-100 absolute top-2 right-2.5 p-0.5 rounded text-neutral-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-neutral-200/70 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+
+                  {resizingColIdx === colIdx && activeWidths && (
+                    <span className="pointer-events-none absolute -top-0.5 right-2 z-20 px-1.5 py-0.5 rounded bg-neutral-900 dark:bg-white text-[10px] font-mono-code font-medium text-white dark:text-neutral-950 tabular-nums shadow">
+                      {activeWidths[colIdx]}px
+                    </span>
+                  )}
+
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label={`Resize column ${colIdx + 1} width`}
+                    title="Drag to resize column (double-click to reset)"
+                    onPointerDown={(e) => startColumnResize(e, colIdx)}
+                    onDoubleClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onChangeColWidths(undefined);
+                    }}
+                    className="group/resizer absolute top-0 right-0 bottom-0 w-2.5 z-10 cursor-col-resize flex justify-end select-none touch-none"
+                  >
+                    <span
+                      className={`w-[2px] h-full transition-colors ${
+                        resizingColIdx === colIdx
+                          ? 'bg-blue-500'
+                          : 'bg-transparent group-hover/resizer:bg-blue-500/75'
+                      }`}
+                    />
+                  </div>
+                </th>
+              ))}
+              <th
+                className="w-9 px-1 py-2.5 border-l border-neutral-200/70 dark:border-white/[0.06] text-center align-middle"
+                aria-label="Row actions"
+              />
+            </tr>
+          </thead>
+          <tbody>
+            {block.rows.map((row, rowIdx) => (
+              <tr
+                key={rowIdx}
+                className="group/row hover:bg-neutral-50/70 dark:hover:bg-white/[0.015] transition-colors"
+              >
+                {block.headers.map((_, colIdx) => (
+                  <td
+                    key={colIdx}
+                    className={`px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top ${
+                      colIdx > 0 ? 'border-l border-neutral-200/50 dark:border-white/[0.04]' : ''
+                    } ${resizingColIdx === colIdx ? 'bg-blue-500/[0.03]' : ''}`}
+                  >
+                    <RichInlineField
+                      markdown={row[colIdx] || ''}
+                      externalSyncSeq={syncSeq}
+                      placeholder="Cell..."
+                      ariaLabel={`Table row ${rowIdx + 1} column ${colIdx + 1}`}
+                      className="min-w-[44px]"
+                      onFocusBlock={onFocusBlock}
+                      onChangeMarkdown={(val) => onUpdateCell(rowIdx, colIdx, val)}
+                      onPasteImages={onPasteImages}
+                    />
+                  </td>
+                ))}
+                <td className="w-9 px-1 py-2 border-t border-l border-neutral-200/70 dark:border-white/[0.06] text-center align-middle">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLocalSyncSeq((s) => s + 1);
+                      onDeleteRow(rowIdx);
+                    }}
+                    title={`Delete row ${rowIdx + 1}`}
+                    aria-label={`Delete row ${rowIdx + 1}`}
+                    className="opacity-0 group-hover/row:opacity-100 focus:opacity-100 p-1 rounded text-neutral-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-neutral-200/60 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 opacity-80 sm:opacity-55 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onAddRow}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-300 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+          >
+            <Plus className="w-3 h-3" />
+            <span>Add row</span>
+          </button>
+          <button
+            type="button"
+            disabled={block.rows.length === 0}
+            onClick={() => {
+              if (block.rows.length === 0) return;
+              setLocalSyncSeq((s) => s + 1);
+              onDeleteRow(block.rows.length - 1);
+            }}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium whitespace-nowrap ${
+              block.rows.length === 0
+                ? 'text-neutral-300 dark:text-neutral-600 cursor-not-allowed'
+                : 'text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer'
+            }`}
+          >
+            <Minus className="w-3 h-3" />
+            <span>Delete row</span>
+          </button>
+          <button
+            type="button"
+            onClick={onAddColumn}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-300 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+          >
+            <Plus className="w-3 h-3" />
+            <span>Add col</span>
+          </button>
+          {canDeleteCol && (
+            <button
+              type="button"
+              onClick={() => {
+                setLocalSyncSeq((s) => s + 1);
+                onDeleteColumn(block.headers.length - 1);
+              }}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+            >
+              <Minus className="w-3 h-3" />
+              <span>Delete col</span>
+            </button>
+          )}
+          {persistedWidths && (
+            <button
+              type="button"
+              onClick={() => onChangeColWidths(undefined)}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Reset widths</span>
+            </button>
+          )}
+        </div>
+
+        <button
+          type="button"
+          onClick={onDeleteTable}
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer whitespace-nowrap"
+        >
+          <Trash2 className="w-3 h-3" />
+          <span>Delete table</span>
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1404,122 +1720,100 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
 
           if (block.type === 'table') {
             return (
-              <div key={block.id} className="group my-5">
-                <div className="overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
-                  <table className="w-full border-collapse text-left text-[14px] tabular-nums">
-                    <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
-                      <tr>
-                        {block.headers.map((header, colIdx) => (
-                          <th
-                            key={colIdx}
-                            className="px-4 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200"
-                          >
-                            <RichInlineField
-                              markdown={header}
-                              externalSyncSeq={externalSyncSeq}
-                              placeholder="Header"
-                              ariaLabel={`Table column ${colIdx + 1} header`}
-                              className="min-w-[80px]"
-                              onFocusBlock={() => setFocusedBlockId(block.id)}
-                              onChangeMarkdown={(val) => {
-                                const nextBlocks = blocksRef.current.map((b) => {
-                                  if (b.id !== block.id || b.type !== 'table') return b;
-                                  const headers = b.headers.map((h, i) => (i === colIdx ? val : h));
-                                  return { ...b, headers };
-                                });
-                                commitBlocks(nextBlocks, 'typing');
-                              }}
-                              onPasteImages={onPasteImageFiles}
-                            />
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {block.rows.map((row, rowIdx) => (
-                        <tr key={rowIdx}>
-                          {block.headers.map((_, colIdx) => (
-                            <td
-                              key={colIdx}
-                              className="px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top"
-                            >
-                              <RichInlineField
-                                markdown={row[colIdx] || ''}
-                                externalSyncSeq={externalSyncSeq}
-                                placeholder="Cell..."
-                                ariaLabel={`Table row ${rowIdx + 1} column ${colIdx + 1}`}
-                                className="min-w-[80px]"
-                                onFocusBlock={() => setFocusedBlockId(block.id)}
-                                onChangeMarkdown={(val) => {
-                                  const nextBlocks = blocksRef.current.map((b) => {
-                                    if (b.id !== block.id || b.type !== 'table') return b;
-                                    const rows = b.rows.map((r, rI) =>
-                                      rI === rowIdx
-                                        ? r.map((c, cI) => (cI === colIdx ? val : c))
-                                        : r
-                                    );
-                                    return { ...b, rows };
-                                  });
-                                  commitBlocks(nextBlocks, 'typing');
-                                }}
-                                onPasteImages={onPasteImageFiles}
-                              />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="mt-1.5 flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextBlocks = blocksRef.current.map((b) =>
-                        b.id === block.id && b.type === 'table'
-                          ? { ...b, rows: [...b.rows, b.headers.map(() => '')] }
-                          : b
-                      );
-                      commitBlocks(nextBlocks, 'discrete');
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer"
-                  >
-                    <Plus className="w-3 h-3" />
-                    <span>Row</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextBlocks = blocksRef.current.map((b) =>
-                        b.id === block.id && b.type === 'table'
-                          ? {
-                              ...b,
-                              headers: [...b.headers, `Column ${b.headers.length + 1}`],
-                              alignments: [...b.alignments, 'left' as const],
-                              rows: b.rows.map((r) => [...r, '']),
-                            }
-                          : b
-                      );
-                      commitBlocks(nextBlocks, 'discrete');
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer"
-                  >
-                    <Plus className="w-3 h-3" />
-                    <span>Column</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
-                      commitBlocks(nextBlocks, 'discrete');
-                    }}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11.5px] font-medium text-neutral-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-neutral-100 dark:hover:bg-white/[0.06] cursor-pointer"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                    <span>Remove</span>
-                  </button>
-                </div>
-              </div>
+              <EditableTableBlock
+                key={block.id}
+                block={block}
+                externalSyncSeq={externalSyncSeq}
+                onFocusBlock={() => setFocusedBlockId(block.id)}
+                onPasteImages={onPasteImageFiles}
+                onUpdateHeader={(colIdx, val) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    const headers = b.headers.map((h, i) => (i === colIdx ? val : h));
+                    return { ...b, headers };
+                  });
+                  commitBlocks(nextBlocks, 'typing');
+                }}
+                onUpdateCell={(rowIdx, colIdx, val) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    const rows = b.rows.map((r, rI) =>
+                      rI === rowIdx
+                        ? r.map((c, cI) => (cI === colIdx ? val : c))
+                        : r
+                    );
+                    return { ...b, rows };
+                  });
+                  commitBlocks(nextBlocks, 'typing');
+                }}
+                onAddRow={() => {
+                  const nextBlocks = blocksRef.current.map((b) =>
+                    b.id === block.id && b.type === 'table'
+                      ? { ...b, rows: [...b.rows, b.headers.map(() => '')] }
+                      : b
+                  );
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+                onDeleteRow={(rowIdx) => {
+                  const nextBlocks = blocksRef.current.map((b) =>
+                    b.id === block.id && b.type === 'table'
+                      ? { ...b, rows: b.rows.filter((_, idx) => idx !== rowIdx) }
+                      : b
+                  );
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+                onAddColumn={() => {
+                  const nextBlocks = blocksRef.current.map((b) =>
+                    b.id === block.id && b.type === 'table'
+                      ? {
+                          ...b,
+                          headers: [...b.headers, `Column ${b.headers.length + 1}`],
+                          alignments: [...b.alignments, 'left' as const],
+                          rows: b.rows.map((r) => [...r, '']),
+                          colWidths:
+                            b.colWidths && b.colWidths.length === b.headers.length
+                              ? [...b.colWidths, 160]
+                              : b.colWidths,
+                        }
+                      : b
+                  );
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+                onDeleteColumn={(colIdx) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table' || b.headers.length <= 1) {
+                      return b;
+                    }
+                    const nextWidths =
+                      b.colWidths && b.colWidths.length === b.headers.length
+                        ? b.colWidths.filter((_, i) => i !== colIdx)
+                        : undefined;
+                    return {
+                      ...b,
+                      headers: b.headers.filter((_, i) => i !== colIdx),
+                      alignments: b.alignments.filter((_, i) => i !== colIdx),
+                      rows: b.rows.map((r) => r.filter((_, i) => i !== colIdx)),
+                      colWidths: nextWidths,
+                    };
+                  });
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+                onChangeColWidths={(colWidths) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    if (!colWidths) {
+                      const { colWidths: _removed, ...rest } = b;
+                      return rest;
+                    }
+                    return { ...b, colWidths };
+                  });
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+                onDeleteTable={() => {
+                  const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+              />
             );
           }
 
