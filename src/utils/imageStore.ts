@@ -87,6 +87,10 @@ export function getCachedImageDataUrl(refOrId: string): string | null {
   return memoryCache.get(id) ?? null;
 }
 
+export function clearImageMemoryCache(): void {
+  memoryCache.clear();
+}
+
 export async function getImageDataUrl(refOrId: string): Promise<string | null> {
   const id = refOrId.startsWith(IMAGE_REF_PREFIX) ? extractImageId(refOrId) : refOrId;
   if (!id) return null;
@@ -117,7 +121,9 @@ export async function getImageDataUrl(refOrId: string): Promise<string | null> {
   }
 
   try {
-    const res = await fetch(`/api/images/${encodeURIComponent(id)}`);
+    const res = await fetch(`/api/images/${encodeURIComponent(id)}`, {
+      credentials: 'same-origin',
+    });
     if (res.ok) {
       const json = (await res.json()) as { dataUrl?: string };
       if (json.dataUrl) {
@@ -170,6 +176,7 @@ export async function saveImageFile(
   try {
     await fetch('/api/images', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, dataUrl, mimeType, name, createdAt }),
     });

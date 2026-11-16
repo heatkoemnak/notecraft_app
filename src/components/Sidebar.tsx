@@ -5,6 +5,7 @@ import {
   FileText,
   Folder as FolderIcon,
   FolderPlus,
+  LogOut,
   Moon,
   PanelLeftClose,
   Pencil,
@@ -16,7 +17,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { Folder, NoteDocument, SidebarFilter } from '../types/notes';
+import { AuthUser, Folder, NoteDocument, SidebarFilter } from '../types/notes';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -27,6 +28,8 @@ interface SidebarProps {
   activeNoteId: string | null;
   filter: SidebarFilter;
   theme: 'dark' | 'light';
+  user: AuthUser;
+  onLogout: () => void;
   onToggleTheme: () => void;
   onOpenSearch: () => void;
   onSelectFilter: (filter: SidebarFilter) => void;
@@ -49,6 +52,8 @@ export function Sidebar({
   activeNoteId,
   filter,
   theme,
+  user,
+  onLogout,
   onToggleTheme,
   onOpenSearch,
   onSelectFilter,
@@ -473,48 +478,80 @@ export function Sidebar({
           </div>
         </div>
 
-        {/* Bottom Utility Row */}
-        <div className="border-t border-neutral-200 dark:border-white/[0.07] p-2.5 flex items-center justify-between gap-2 shrink-0">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".md,.markdown,.txt"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) {
-                onImportMarkdown(file);
-                e.target.value = '';
-              }
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-2 px-2.5 py-2 rounded-lg text-[12.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
-          >
-            <Upload className="w-3.5 h-3.5 shrink-0" />
-            <span>Import .md</span>
-          </button>
+        {/* Bottom Utility & Account Footer */}
+        <div className="border-t border-neutral-200 dark:border-white/[0.07] shrink-0">
+          <div className="px-2.5 pt-2.5 pb-1.5 flex items-center justify-between gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".md,.markdown,.txt"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  onImportMarkdown(file);
+                  e.target.value = '';
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Upload className="w-3.5 h-3.5 shrink-0" />
+              <span>Import .md</span>
+            </button>
 
-          <button
-            type="button"
-            onClick={onToggleTheme}
-            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            className="flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-[12.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
-          >
-            {theme === 'dark' ? (
-              <>
-                <Sun className="w-3.5 h-3.5 shrink-0" />
-                <span>Light</span>
-              </>
-            ) : (
-              <>
-                <Moon className="w-3.5 h-3.5 shrink-0" />
-                <span>Dark</span>
-              </>
-            )}
-          </button>
+            <button
+              type="button"
+              onClick={onToggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              {theme === 'dark' ? (
+                <>
+                  <Sun className="w-3.5 h-3.5 shrink-0" />
+                  <span>Light</span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-3.5 h-3.5 shrink-0" />
+                  <span>Dark</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          <div className="px-3 py-2.5 border-t border-neutral-200/70 dark:border-white/[0.05] flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-7 h-7 rounded-lg bg-neutral-900 dark:bg-white/10 text-white dark:text-neutral-100 text-[11.5px] font-semibold flex items-center justify-center shrink-0 uppercase">
+                {user.name
+                  .split(/\s+/)
+                  .slice(0, 2)
+                  .map((p) => p[0] || '')
+                  .join('') || 'U'}
+              </div>
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-medium text-neutral-900 dark:text-neutral-100 truncate leading-tight">
+                  {user.name}
+                </div>
+                <div className="text-[11px] text-neutral-500 dark:text-neutral-400 truncate leading-tight">
+                  {user.email}
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={onLogout}
+              title="Sign out"
+              aria-label="Sign out"
+              className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       </aside>
     </>

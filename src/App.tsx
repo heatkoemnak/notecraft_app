@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AuthScreen } from './components/AuthScreen';
 import { CommandPalette } from './components/CommandPalette';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
 import { Sidebar } from './components/Sidebar';
@@ -11,12 +12,20 @@ import {
   NoteUpdateMeta,
   useNoteHistory,
 } from './hooks/useNoteHistory';
-import { Folder, NoteDocument, SidebarFilter, Snippet, ViewMode } from './types/notes';
+import { AuthUser, Folder, NoteDocument, SidebarFilter, Snippet, ViewMode } from './types/notes';
+import {
+  fetchAuthSession,
+  getUserStorageKeys,
+  logoutAccount,
+  StorageBackendMode,
+} from './utils/authClient';
+import { clearImageMemoryCache } from './utils/imageStore';
 
 async function syncApi(url: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown) {
   try {
     await fetch(url, {
       method,
+      credentials: 'same-origin',
       headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
@@ -25,13 +34,7 @@ async function syncApi(url: string, method: 'POST' | 'PATCH' | 'DELETE', body?: 
   }
 }
 
-const STORAGE_KEYS = {
-  folders: 'notecraft.folders.v1',
-  notes: 'notecraft.notes.v1',
-  snippets: 'notecraft.snippets.v1',
-  activeNoteId: 'notecraft.activeNoteId.v1',
-  theme: 'notecraft.theme.v1',
-};
+const THEME_STORAGE_KEY = 'notecraft.theme.v1';
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -45,20 +48,17 @@ function readStorage<T>(key: string, fallback: T): T {
 
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() =>
-    readStorage<'dark' | 'light'>(STORAGE_KEYS.theme, 'dark')
+    readStorage<'dark' | 'light'>(THEME_STORAGE_KEY, 'dark')
   );
-  const [folders, setFolders] = useState<Folder[]>(() =>
-    readStorage<Folder[]>(STORAGE_KEYS.folders, INITIAL_FOLDERS)
-  );
-  const [notes, setNotes] = useState<NoteDocument[]>(() =>
-    readStorage<NoteDocument[]>(STORAGE_KEYS.notes, INITIAL_NOTES)
-  );
-  const [snippets, setSnippets] = useState<Snippet[]>(() =>
-    readStorage<Snippet[]>(STORAGE_KEYS.snippets, INITIAL_SNIPPETS)
-  );
-  const [activeNoteId, setActiveNoteId] = useState<string | null>(() =>
-    readStorage<string | null>(STORAGE_KEYS.activeNoteId, INITIAL_NOTES[0]?.id ?? null)
-  );
+  const [authReady, setAuthReady] = useState(false);
+  const [storageMode, setStorageMode] = useState<StorageBackendMode>('local');
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
+
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [notes, setNotes] = useState<NoteDocument[]>([]);
+  const [snippets, setSnippets] = useState<Snippet[]>([]);
+  const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
 
   const [filter, setFilter] = useState<SidebarFilter>({ type: 'all' });
   const [viewMode, setViewMode] = useState<ViewMode>('read');
@@ -89,37 +89,100 @@ export default function App() {
   const { canUndo, canRedo, recordChange, undo, redo, clearNoteHistory } =
     useNoteHistory(activeNoteId);
 
-  // Hydrate from PostgreSQL backend when configured
+  // Resolve authentication session & backend mode on mount
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/workspace')
-      .then(async (res) => {
-        if (!res.ok) return null;
-        return (await res.json()) as {
-          folders: Folder[];
-          notes: NoteDocument[];
-          snippets: Snippet[];
-        };
-      })
-      .then((data) => {
-        if (!data || cancelled) return;
-        dbEnabledRef.current = true;
-        notesRef.current = data.notes;
-        setFolders(data.folders);
-        setNotes(data.notes);
-        setSnippets(data.snippets);
-        setActiveNoteId((prev) =>
-          prev && data.notes.some((n) => n.id === prev) ? prev : data.notes[0]?.id ?? null
-        );
-      })
-      .catch(() => {
-        // Stay in browser localStorage mode when PostgreSQL is not active
-      });
-
+    fetchAuthSession().then(({ storage, user }) => {
+      if (cancelled) return;
+      setStorageMode(storage);
+      dbEnabledRef.current = storage === 'postgres';
+      setCurrentUser(user);
+      setAuthReady(true);
+    });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Load authenticated user's workspace
+  useEffect(() => {
+    if (!authReady) return;
+
+    if (!currentUser) {
+      for (const timer of notePatchTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      notePatchTimersRef.current.clear();
+      setWorkspaceLoaded(false);
+      notesRef.current = [];
+      setFolders([]);
+      setNotes([]);
+      setSnippets([]);
+      setActiveNoteId(null);
+      return;
+    }
+
+    let cancelled = false;
+    const userKeys = getUserStorageKeys(currentUser.id);
+    setWorkspaceLoaded(false);
+
+    if (storageMode === 'postgres') {
+      fetch('/api/workspace', { credentials: 'same-origin' })
+        .then(async (res) => {
+          if (res.status === 401) {
+            if (!cancelled) setCurrentUser(null);
+            return null;
+          }
+          if (!res.ok) return null;
+          return (await res.json()) as {
+            folders: Folder[];
+            notes: NoteDocument[];
+            snippets: Snippet[];
+          };
+        })
+        .then((data) => {
+          if (!data || cancelled) return;
+          dbEnabledRef.current = true;
+          notesRef.current = data.notes;
+          setFolders(data.folders);
+          setNotes(data.notes);
+          setSnippets(data.snippets);
+          const storedActive = readStorage<string | null>(userKeys.activeNoteId, null);
+          const resolvedActive =
+            storedActive && data.notes.some((n) => n.id === storedActive)
+              ? storedActive
+              : data.notes[0]?.id ?? null;
+          setActiveNoteId(resolvedActive);
+          setWorkspaceLoaded(true);
+        })
+        .catch(() => {
+          if (!cancelled) setWorkspaceLoaded(true);
+        });
+    } else {
+      const loadedFolders = readStorage<Folder[]>(userKeys.folders, INITIAL_FOLDERS);
+      const loadedNotes = readStorage<NoteDocument[]>(userKeys.notes, INITIAL_NOTES);
+      const loadedSnippets = readStorage<Snippet[]>(userKeys.snippets, INITIAL_SNIPPETS);
+      const storedActive = readStorage<string | null>(
+        userKeys.activeNoteId,
+        loadedNotes[0]?.id ?? null
+      );
+      const resolvedActive =
+        storedActive && loadedNotes.some((n) => n.id === storedActive)
+          ? storedActive
+          : loadedNotes[0]?.id ?? null;
+
+      notesRef.current = loadedNotes;
+      setFolders(loadedFolders);
+      setNotes(loadedNotes);
+      setSnippets(loadedSnippets);
+      setActiveNoteId(resolvedActive);
+      setWorkspaceLoaded(true);
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, currentUser, storageMode]);
 
   // Sync theme class on <html>
   useEffect(() => {
@@ -130,44 +193,52 @@ export default function App() {
       root.classList.remove('dark');
     }
     try {
-      localStorage.setItem(STORAGE_KEYS.theme, JSON.stringify(theme));
+      localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(theme));
     } catch {
       // ignore storage quota errors
     }
   }, [theme]);
 
-  // Persist workspace entities to localStorage
+  // Persist authenticated user's workspace entities to per-user localStorage
   useEffect(() => {
+    if (!currentUser || !workspaceLoaded) return;
     try {
-      localStorage.setItem(STORAGE_KEYS.folders, JSON.stringify(folders));
+      const keys = getUserStorageKeys(currentUser.id);
+      localStorage.setItem(keys.folders, JSON.stringify(folders));
     } catch {
       // ignore
     }
-  }, [folders]);
+  }, [folders, currentUser, workspaceLoaded]);
 
   useEffect(() => {
+    if (!currentUser || !workspaceLoaded) return;
     try {
-      localStorage.setItem(STORAGE_KEYS.notes, JSON.stringify(notes));
+      const keys = getUserStorageKeys(currentUser.id);
+      localStorage.setItem(keys.notes, JSON.stringify(notes));
     } catch {
       // ignore
     }
-  }, [notes]);
+  }, [notes, currentUser, workspaceLoaded]);
 
   useEffect(() => {
+    if (!currentUser || !workspaceLoaded) return;
     try {
-      localStorage.setItem(STORAGE_KEYS.snippets, JSON.stringify(snippets));
+      const keys = getUserStorageKeys(currentUser.id);
+      localStorage.setItem(keys.snippets, JSON.stringify(snippets));
     } catch {
       // ignore
     }
-  }, [snippets]);
+  }, [snippets, currentUser, workspaceLoaded]);
 
   useEffect(() => {
+    if (!currentUser || !workspaceLoaded) return;
     try {
-      localStorage.setItem(STORAGE_KEYS.activeNoteId, JSON.stringify(activeNoteId));
+      const keys = getUserStorageKeys(currentUser.id);
+      localStorage.setItem(keys.activeNoteId, JSON.stringify(activeNoteId));
     } catch {
       // ignore
     }
-  }, [activeNoteId]);
+  }, [activeNoteId, currentUser, workspaceLoaded]);
 
   const applyHistorySnapshot = useCallback((noteId: string, snapshot: NoteSnapshot) => {
     const updatedAt = Date.now();
@@ -227,6 +298,7 @@ export default function App() {
   // Global keyboard shortcuts (Cmd/Ctrl+Z undo, Cmd/Ctrl+Y or Cmd/Ctrl+Shift+Z redo, Cmd/Ctrl+K search, Cmd/Ctrl+E view mode)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!currentUser) return;
       const mod = (e.ctrlKey || e.metaKey) && !e.altKey;
       const key = e.key.toLowerCase();
 
@@ -277,7 +349,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [filter.type, activeNoteId, searchOpen, snippetModalState.open, handleUndo, handleRedo]);
+  }, [currentUser, filter.type, activeNoteId, searchOpen, snippetModalState.open, handleUndo, handleRedo]);
 
   const activeNote = useMemo(
     () => notes.find((n) => n.id === activeNoteId) ?? null,
@@ -547,6 +619,41 @@ export default function App() {
     }
   };
 
+  const handleLogout = async () => {
+    for (const timer of notePatchTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    notePatchTimersRef.current.clear();
+    for (const n of notesRef.current) {
+      clearNoteHistory(n.id);
+    }
+    clearImageMemoryCache();
+    await logoutAccount(storageMode);
+    setFilter({ type: 'all' });
+    setSearchOpen(false);
+    setSnippetModalState({ open: false });
+    setCurrentUser(null);
+  };
+
+  if (!authReady) {
+    return (
+      <div className="h-screen w-screen flex items-center justify-center bg-white dark:bg-[#121214] text-neutral-500 dark:text-neutral-400 text-[13.5px]">
+        Loading NoteCraft...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthScreen
+        storageMode={storageMode}
+        theme={theme}
+        onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+        onAuthenticated={(user) => setCurrentUser(user)}
+      />
+    );
+  }
+
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-white dark:bg-[#121214] text-neutral-900 dark:text-[#ececf1]">
       <Sidebar
@@ -558,6 +665,8 @@ export default function App() {
         activeNoteId={activeNoteId}
         filter={filter}
         theme={theme}
+        user={currentUser}
+        onLogout={handleLogout}
         onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
         onOpenSearch={() => setSearchOpen(true)}
         onSelectFilter={(nextFilter) => {

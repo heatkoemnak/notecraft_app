@@ -46,14 +46,31 @@ export async function ensureSchema(pool: Pool): Promise<void> {
   schemaInitPromise = (async () => {
     try {
       await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          email TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          created_at BIGINT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS folders (
           id TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
           name TEXT NOT NULL,
           created_at BIGINT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS notes (
           id TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
           title TEXT NOT NULL DEFAULT '',
           content TEXT NOT NULL DEFAULT '',
           folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL,
@@ -64,6 +81,7 @@ export async function ensureSchema(pool: Pool): Promise<void> {
 
         CREATE TABLE IF NOT EXISTS snippets (
           id TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
           title TEXT NOT NULL,
           description TEXT NOT NULL DEFAULT '',
           category TEXT NOT NULL DEFAULT 'General',
@@ -75,61 +93,24 @@ export async function ensureSchema(pool: Pool): Promise<void> {
 
         CREATE TABLE IF NOT EXISTS note_images (
           id TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
           data_url TEXT NOT NULL,
           mime_type TEXT NOT NULL,
           name TEXT NOT NULL,
           created_at BIGINT NOT NULL
         );
+
+        ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+        ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+        ALTER TABLE snippets ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+        ALTER TABLE note_images ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_folders_user_id ON folders(user_id);
+        CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
+        CREATE INDEX IF NOT EXISTS idx_snippets_user_id ON snippets(user_id);
+        CREATE INDEX IF NOT EXISTS idx_note_images_user_id ON note_images(user_id);
       `);
-
-      const folderCountRes = await pool.query<{ count: number }>(
-        'SELECT COUNT(*)::int AS count FROM folders'
-      );
-      const noteCountRes = await pool.query<{ count: number }>(
-        'SELECT COUNT(*)::int AS count FROM notes'
-      );
-
-      if (folderCountRes.rows[0]?.count === 0 && noteCountRes.rows[0]?.count === 0) {
-        for (const folder of INITIAL_FOLDERS) {
-          await pool.query(
-            'INSERT INTO folders (id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
-            [folder.id, folder.name, folder.createdAt]
-          );
-        }
-
-        for (const note of INITIAL_NOTES) {
-          await pool.query(
-            `INSERT INTO notes (id, title, content, folder_id, starred, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
-            [
-              note.id,
-              note.title,
-              note.content,
-              note.folderId,
-              note.starred,
-              note.createdAt,
-              note.updatedAt,
-            ]
-          );
-        }
-
-        for (const snippet of INITIAL_SNIPPETS) {
-          await pool.query(
-            `INSERT INTO snippets (id, title, description, category, language, content, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
-            [
-              snippet.id,
-              snippet.title,
-              snippet.description,
-              snippet.category,
-              snippet.language,
-              snippet.content,
-              snippet.createdAt,
-              snippet.updatedAt,
-            ]
-          );
-        }
-      }
 
       schemaInitialized = true;
     } catch (err) {
@@ -139,4 +120,77 @@ export async function ensureSchema(pool: Pool): Promise<void> {
   })();
 
   return schemaInitPromise;
+}
+
+export async function seedUserWorkspace(pool: Pool, userId: string): Promise<void> {
+  await ensureSchema(pool);
+
+  // If upgrading from a single-user database with unowned records, claim them for the first user
+  const legacyRes = await pool.query<{ count: number }>(
+    `SELECT (
+       (SELECT COUNT(*)::int FROM folders WHERE user_id IS NULL) +
+       (SELECT COUNT(*)::int FROM notes WHERE user_id IS NULL) +
+       (SELECT COUNT(*)::int FROM snippets WHERE user_id IS NULL)
+     ) AS count`
+  );
+
+  if ((legacyRes.rows[0]?.count ?? 0) > 0) {
+    await Promise.all([
+      pool.query('UPDATE folders SET user_id = $1 WHERE user_id IS NULL', [userId]),
+      pool.query('UPDATE notes SET user_id = $1 WHERE user_id IS NULL', [userId]),
+      pool.query('UPDATE snippets SET user_id = $1 WHERE user_id IS NULL', [userId]),
+      pool.query('UPDATE note_images SET user_id = $1 WHERE user_id IS NULL', [userId]),
+    ]);
+    return;
+  }
+
+  const suffix = userId.replace(/[^a-zA-Z0-9]/g, '').slice(-8);
+  const folderIdMap = new Map<string, string>();
+
+  for (const folder of INITIAL_FOLDERS) {
+    const scopedFolderId = `${folder.id}-${suffix}`;
+    folderIdMap.set(folder.id, scopedFolderId);
+    await pool.query(
+      'INSERT INTO folders (id, user_id, name, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING',
+      [scopedFolderId, userId, folder.name, folder.createdAt]
+    );
+  }
+
+  for (const note of INITIAL_NOTES) {
+    const scopedNoteId = `${note.id}-${suffix}`;
+    const scopedFolderId = note.folderId ? folderIdMap.get(note.folderId) ?? null : null;
+    await pool.query(
+      `INSERT INTO notes (id, user_id, title, content, folder_id, starred, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
+      [
+        scopedNoteId,
+        userId,
+        note.title,
+        note.content,
+        scopedFolderId,
+        note.starred,
+        note.createdAt,
+        note.updatedAt,
+      ]
+    );
+  }
+
+  for (const snippet of INITIAL_SNIPPETS) {
+    const scopedSnippetId = `${snippet.id}-${suffix}`;
+    await pool.query(
+      `INSERT INTO snippets (id, user_id, title, description, category, language, content, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
+      [
+        scopedSnippetId,
+        userId,
+        snippet.title,
+        snippet.description,
+        snippet.category,
+        snippet.language,
+        snippet.content,
+        snippet.createdAt,
+        snippet.updatedAt,
+      ]
+    );
+  }
 }
