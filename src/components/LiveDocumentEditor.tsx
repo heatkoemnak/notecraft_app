@@ -21,6 +21,7 @@ import {
   getImageDataUrl,
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
+import { FileAttachmentCard } from './FileAttachmentCard';
 import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 import { slugifyHeading, tokenizeCodeLine, TokenType } from '../utils/markdown';
 import {
@@ -1491,6 +1492,20 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   );
                   commitBlocks(nextBlocks, 'typing');
                 }}
+                onDelete={() => {
+                  const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
+              />
+            );
+          }
+
+          if (block.type === 'file') {
+            return (
+              <FileAttachmentCard
+                key={block.id}
+                src={block.src}
+                label={block.label}
                 onDelete={() => {
                   const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
                   commitBlocks(nextBlocks, 'discrete');

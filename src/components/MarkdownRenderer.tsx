@@ -8,6 +8,8 @@ import {
   getImageDataUrl,
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
+import { FILE_REF_PREFIX } from '../utils/fileStore';
+import { FileAttachmentCard } from './FileAttachmentCard';
 import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 
 interface MarkdownRendererProps {
@@ -329,7 +331,11 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkGroupImages]}
           urlTransform={(url) => {
-            if (url.startsWith(IMAGE_REF_PREFIX) || url.startsWith('data:image/')) {
+            if (
+              url.startsWith(IMAGE_REF_PREFIX) ||
+              url.startsWith(FILE_REF_PREFIX) ||
+              url.startsWith('data:image/')
+            ) {
               return url;
             }
             return defaultUrlTransform(url);
@@ -392,11 +398,18 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             </h4>
           ),
           p: ({ node, children }) => {
+            const firstChild = node?.children?.[0];
             const hasOnlyImage =
               node?.children?.length === 1 &&
-              node.children[0].type === 'element' &&
-              node.children[0].tagName === 'img';
-            if (hasOnlyImage) {
+              firstChild?.type === 'element' &&
+              firstChild.tagName === 'img';
+            const hasOnlyFileLink =
+              node?.children?.length === 1 &&
+              firstChild?.type === 'element' &&
+              firstChild.tagName === 'a' &&
+              typeof firstChild.properties?.href === 'string' &&
+              firstChild.properties.href.startsWith(FILE_REF_PREFIX);
+            if (hasOnlyImage || hasOnlyFileLink) {
               return <>{children}</>;
             }
             return (
@@ -408,16 +421,21 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             <strong className="font-semibold text-neutral-950 dark:text-white">{children}</strong>
           ),
           em: ({ children }) => <em className="italic text-neutral-700 dark:text-neutral-300">{children}</em>,
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 dark:text-blue-400 underline underline-offset-2 decoration-blue-600/40 dark:decoration-blue-400/40 hover:decoration-blue-600 dark:hover:decoration-blue-400 transition-colors"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            if (href && href.startsWith(FILE_REF_PREFIX)) {
+              return <FileAttachmentCard src={href} label={getNodeText(children)} />;
+            }
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 dark:text-blue-400 underline underline-offset-2 decoration-blue-600/40 dark:decoration-blue-400/40 hover:decoration-blue-600 dark:hover:decoration-blue-400 transition-colors"
+              >
+                {children}
+              </a>
+            );
+          },
           ul: ({ children, className }) => {
             const isTaskList = className?.includes('contains-task-list');
             return (

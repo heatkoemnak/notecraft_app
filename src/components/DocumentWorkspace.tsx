@@ -11,6 +11,7 @@ import {
   Download,
   FileCode2,
   FileText,
+  FileUp,
   Heading2,
   Heading3,
   ImagePlus,
@@ -36,6 +37,7 @@ import {
   getDocumentStats,
   toggleTaskCheckbox,
 } from '../utils/markdown';
+import { importSingleFile } from '../utils/fileImporter';
 import { isImageFile, resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
 import { ImageInsertModal } from './ImageInsertModal';
 import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
@@ -69,6 +71,7 @@ interface DocumentWorkspaceProps {
   onCreateNote: () => void;
   onDuplicateSharedNote: (note: NoteDocument) => void;
   onOpenShareModal: () => void;
+  onOpenImportModal: () => void;
   onOpenSnippetModal: (prefillContent?: string) => void;
   onOpenSnippetsLibrary: () => void;
 }
@@ -104,6 +107,7 @@ export function DocumentWorkspace({
   onCreateNote,
   onDuplicateSharedNote,
   onOpenShareModal,
+  onOpenImportModal,
   onOpenSnippetModal,
   onOpenSnippetsLibrary,
 }: DocumentWorkspaceProps) {
@@ -416,6 +420,32 @@ export function DocumentWorkspace({
     }
   };
 
+  const handleDroppedFiles = async (files: FileList | File[]) => {
+    if (!note || isReadOnly) return;
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
+    if (list.every(isImageFile)) {
+      await handleImageFiles(list);
+      return;
+    }
+
+    setUploadingImagesCount((c) => c + list.length);
+    try {
+      const resultGroups = await Promise.all(list.map((file) => importSingleFile(file)));
+      const combined = resultGroups
+        .flat()
+        .map((item) => item.content.trimEnd())
+        .filter(Boolean)
+        .join('\n\n');
+      if (combined) {
+        handleInsertImageMarkdown(combined);
+      }
+    } finally {
+      setUploadingImagesCount((c) => Math.max(0, c - list.length));
+    }
+  };
+
   const handleEditorPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData?.items || []);
     const imageItems = items.filter((item) => item.type.startsWith('image/'));
@@ -587,19 +617,27 @@ export function DocumentWorkspace({
             <p className="text-[14px] text-neutral-600 dark:text-neutral-400 leading-relaxed">
               Write structured Markdown documentation, organize project folders, and insert reusable code or command snippets.
             </p>
-            <div className="flex items-center justify-center gap-3 pt-2">
+            <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
               <button
                 type="button"
                 onClick={onCreateNote}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-4 h-4" />
                 <span>New note</span>
               </button>
               <button
                 type="button"
+                onClick={onOpenImportModal}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13.5px] font-medium border border-neutral-200 dark:border-white/12 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <FileUp className="w-4 h-4" />
+                <span>Import file</span>
+              </button>
+              <button
+                type="button"
                 onClick={onOpenSnippetsLibrary}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13.5px] font-medium border border-neutral-200 dark:border-white/12 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[13.5px] font-medium border border-neutral-200 dark:border-white/12 text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Braces className="w-4 h-4" />
                 <span>Browse snippets</span>
@@ -892,6 +930,11 @@ export function DocumentWorkspace({
                 icon={<ImagePlus className="w-4 h-4" />}
               />
               <ToolbarButton
+                label="Import file"
+                onClick={onOpenImportModal}
+                icon={<FileUp className="w-4 h-4" />}
+              />
+              <ToolbarButton
                 label="Table"
                 onClick={() =>
                   viewMode === 'read'
@@ -951,8 +994,8 @@ export function DocumentWorkspace({
           </div>
           {uploadingImagesCount > 0 && (
             <span className="text-[12px] text-blue-600 dark:text-blue-400 ml-2 tabular-nums">
-              Uploading {uploadingImagesCount}{' '}
-              {uploadingImagesCount === 1 ? 'image' : 'images'}...
+              Processing {uploadingImagesCount}{' '}
+              {uploadingImagesCount === 1 ? 'file' : 'files'}...
             </span>
           )}
           {isReadOnly && (
@@ -1160,7 +1203,7 @@ export function DocumentWorkspace({
                   if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
                     setIsDraggingOver(false);
-                    await handleImageFiles(e.dataTransfer.files);
+                    await handleDroppedFiles(e.dataTransfer.files);
                   }
                 }}
                 onSelect={(e) => syncTextareaSelection(e.currentTarget)}
@@ -1306,7 +1349,7 @@ export function DocumentWorkspace({
                   if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
                     setIsDraggingOver(false);
-                    await handleImageFiles(e.dataTransfer.files);
+                    await handleDroppedFiles(e.dataTransfer.files);
                   }
                 }}
                 onSelect={(e) => syncTextareaSelection(e.currentTarget)}
@@ -1339,7 +1382,7 @@ export function DocumentWorkspace({
               if (!isReadOnly && e.dataTransfer.files?.length) {
                 e.preventDefault();
                 setIsDraggingOver(false);
-                await handleImageFiles(e.dataTransfer.files);
+                await handleDroppedFiles(e.dataTransfer.files);
               }
             }}
           >

@@ -14,6 +14,7 @@ export type DocBlock =
       rows: string[][];
     }
   | { id: string; type: 'image'; alt: string; src: string }
+  | { id: string; type: 'file'; label: string; src: string }
   | { id: string; type: 'hr' };
 
 let blockIdCounter = 0;
@@ -33,7 +34,7 @@ function escapeHtml(text: string): string {
 
 function sanitizeHref(url: string): string {
   const trimmed = url.trim();
-  if (/^(https?:|mailto:|\/|#)/i.test(trimmed)) {
+  if (/^(https?:|mailto:|notecraft-file:\/\/|\/|#)/i.test(trimmed)) {
     return trimmed.replace(/"/g, '&quot;');
   }
   return '#';
@@ -280,6 +281,19 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
       continue;
     }
 
+    // Standalone file attachment: [label](notecraft-file://...)
+    const fileMatch = /^\s*\[([^\]]+)\]\((notecraft-file:\/\/[^)\s]+)\)\s*$/.exec(line);
+    if (fileMatch) {
+      blocks.push({
+        id: createBlockId(),
+        type: 'file',
+        label: fileMatch[1],
+        src: fileMatch[2].trim(),
+      });
+      i += 1;
+      continue;
+    }
+
     // GFM Table
     if (line.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
       const headers = parseTableRow(line);
@@ -365,6 +379,7 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
         /^(#{1,4})\s+/.test(next) ||
         /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(next) ||
         /^\s*!\[[^\]]*\]\([^)]+\)\s*$/.test(next) ||
+        /^\s*\[[^\]]+\]\(notecraft-file:\/\/[^)\s]+\)\s*$/.test(next) ||
         /^\s*>\s?/.test(next) ||
         /^\s*(?:[-*+])\s+\[[ xX]\]\s+/.test(next) ||
         /^\s*[-*+]\s+/.test(next) ||
@@ -461,6 +476,10 @@ export function serializeBlocksToMarkdown(blocks: DocBlock[]): string {
       }
       case 'image': {
         serialized = `![${block.alt}](${block.src})`;
+        break;
+      }
+      case 'file': {
+        serialized = `[${block.label}](${block.src})`;
         break;
       }
       case 'hr': {

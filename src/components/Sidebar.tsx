@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Braces,
   Check,
@@ -46,7 +46,8 @@ interface SidebarProps {
   onCreateFolder: (name: string) => void;
   onRenameFolder: (folderId: string, name: string) => void;
   onDeleteFolder: (folderId: string) => void;
-  onImportMarkdown: (file: File) => void;
+  onOpenImportModal: () => void;
+  onDropImportFiles?: (files: File[]) => void;
 }
 
 export function Sidebar({
@@ -72,7 +73,8 @@ export function Sidebar({
   onCreateFolder,
   onRenameFolder,
   onDeleteFolder,
-  onImportMarkdown,
+  onOpenImportModal,
+  onDropImportFiles,
 }: SidebarProps) {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
@@ -81,7 +83,7 @@ export function Sidebar({
   const [confirmDeleteNoteId, setConfirmDeleteNoteId] = useState<string | null>(null);
   const [confirmDeleteFolderId, setConfirmDeleteFolderId] = useState<string | null>(null);
   const [sharedExpanded, setSharedExpanded] = useState(true);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
 
   const starredCount = notes.filter((n) => n.starred).length;
 
@@ -128,9 +130,27 @@ export function Sidebar({
       )}
 
       <aside
+        onDragOver={(e) => {
+          if (onDropImportFiles && e.dataTransfer.types.includes('Files')) {
+            e.preventDefault();
+            setIsDraggingFiles(true);
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setIsDraggingFiles(false);
+          }
+        }}
+        onDrop={(e) => {
+          if (onDropImportFiles && e.dataTransfer.files?.length) {
+            e.preventDefault();
+            setIsDraggingFiles(false);
+            onDropImportFiles(Array.from(e.dataTransfer.files));
+          }
+        }}
         className={`fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col border-r border-neutral-200 dark:border-white/[0.07] bg-[#f4f4f6] dark:bg-[#0b0b0c] text-neutral-800 dark:text-[#ececf1] transition-transform duration-200 ease-out lg:static ${
           isOpen ? 'translate-x-0' : '-translate-x-full lg:hidden'
-        }`}
+        } ${isDraggingFiles ? 'ring-2 ring-inset ring-blue-500/70' : ''}`}
         aria-label="Workspace sidebar"
       >
         {/* Top Row: Brand + Search + Collapse */}
@@ -571,26 +591,13 @@ export function Sidebar({
         {/* Bottom Utility & Account Footer */}
         <div className="border-t border-neutral-200 dark:border-white/[0.07] shrink-0">
           <div className="px-2.5 pt-2.5 pb-1.5 flex items-center justify-between gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".md,.markdown,.txt"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  onImportMarkdown(file);
-                  e.target.value = '';
-                }
-              }}
-            />
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
+              onClick={onOpenImportModal}
               className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-600 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
             >
               <Upload className="w-3.5 h-3.5 shrink-0" />
-              <span>Import .md</span>
+              <span>Import file</span>
             </button>
 
             <button

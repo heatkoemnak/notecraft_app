@@ -100,6 +100,16 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           created_at BIGINT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS note_files (
+          id TEXT PRIMARY KEY,
+          user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+          data_url TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          name TEXT NOT NULL,
+          size_bytes BIGINT NOT NULL DEFAULT 0,
+          created_at BIGINT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS note_shares (
           id TEXT PRIMARY KEY,
           note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
@@ -120,6 +130,7 @@ export async function ensureSchema(pool: Pool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
         CREATE INDEX IF NOT EXISTS idx_snippets_user_id ON snippets(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_images_user_id ON note_images(user_id);
+        CREATE INDEX IF NOT EXISTS idx_note_files_user_id ON note_files(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_shares_recipient_email ON note_shares(recipient_email);
         CREATE INDEX IF NOT EXISTS idx_note_shares_note_id ON note_shares(note_id);
       `);
@@ -152,6 +163,7 @@ export async function seedUserWorkspace(pool: Pool, userId: string): Promise<voi
       pool.query('UPDATE notes SET user_id = $1 WHERE user_id IS NULL', [userId]),
       pool.query('UPDATE snippets SET user_id = $1 WHERE user_id IS NULL', [userId]),
       pool.query('UPDATE note_images SET user_id = $1 WHERE user_id IS NULL', [userId]),
+      pool.query('UPDATE note_files SET user_id = $1 WHERE user_id IS NULL', [userId]),
     ]);
     return;
   }

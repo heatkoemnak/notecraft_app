@@ -834,6 +834,80 @@ async function startServer() {
     }
   });
 
+  // File attachments storage
+  app.post('/api/files', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const { id, dataUrl, mimeType, name, sizeBytes, createdAt } = req.body || {};
+      if (!id || !dataUrl || !name) {
+        return res.status(400).json({ error: 'Missing file payload' });
+      }
+
+      await pool.query(
+        `INSERT INTO note_files (id, user_id, data_url, mime_type, name, size_bytes, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+        [
+          id,
+          user.id,
+          dataUrl,
+          mimeType ?? 'application/octet-stream',
+          name,
+          Number(sizeBytes || 0),
+          Number(createdAt || Date.now()),
+        ]
+      );
+      return res.status(201).json({ ok: true });
+    } catch (err) {
+      console.error('Failed to store file in PostgreSQL:', err);
+      return res.status(500).json({ error: 'Failed to save file' });
+    }
+  });
+
+  app.get('/api/files/:id', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const result = await pool.query<{
+        data_url: string;
+        mime_type: string;
+        name: string;
+        size_bytes: string | number;
+      }>(
+        `SELECT nf.data_url, nf.mime_type, nf.name, nf.size_bytes
+         FROM note_files nf
+         WHERE nf.id = $1
+           AND (
+             nf.user_id = $2
+             OR EXISTS (
+               SELECT 1
+               FROM note_shares ns
+               JOIN notes n ON n.id = ns.note_id
+               WHERE ns.recipient_email = $3
+                 AND n.user_id = nf.user_id
+                 AND n.content LIKE '%' || $1 || '%'
+             )
+           )`,
+        [req.params.id, user.id, user.email.toLowerCase()]
+      );
+      const row = result.rows[0];
+      if (!row) return res.status(404).json({ error: 'File not found' });
+      return res.json({
+        dataUrl: row.data_url,
+        mimeType: row.mime_type,
+        name: row.name,
+        sizeBytes: Number(row.size_bytes),
+      });
+    } catch (err) {
+      console.error('Failed to fetch file from PostgreSQL:', err);
+      return res.status(500).json({ error: 'Failed to fetch file' });
+    }
+  });
+
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { CommandPalette } from './components/CommandPalette';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
+import { ImportDestinationMode, ImportFileModal } from './components/ImportFileModal';
 import { ShareNoteModal } from './components/ShareNoteModal';
 import { Sidebar } from './components/Sidebar';
 import { SnippetModal } from './components/SnippetModal';
@@ -28,6 +29,8 @@ import {
   logoutAccount,
   StorageBackendMode,
 } from './utils/authClient';
+import { importSingleFile } from './utils/fileImporter';
+import { clearFileMemoryCache } from './utils/fileStore';
 import { clearImageMemoryCache } from './utils/imageStore';
 import {
   deleteSharesForNoteLocal,
@@ -86,6 +89,7 @@ export default function App() {
   const [outlineOpen, setOutlineOpen] = useState<boolean>(false);
   const [searchOpen, setSearchOpen] = useState<boolean>(false);
   const [shareModalOpen, setShareModalOpen] = useState<boolean>(false);
+  const [importModalOpen, setImportModalOpen] = useState<boolean>(false);
   const [snippetModalState, setSnippetModalState] = useState<{
     open: boolean;
     initial?: Partial<Snippet> | null;
@@ -381,6 +385,7 @@ export default function App() {
           !activeNoteId ||
           searchOpen ||
           shareModalOpen ||
+          importModalOpen ||
           snippetModalState.open
         ) {
           return;
@@ -429,6 +434,7 @@ export default function App() {
     activeNoteId,
     searchOpen,
     shareModalOpen,
+    importModalOpen,
     snippetModalState.open,
     handleUndo,
     handleRedo,
@@ -621,38 +627,69 @@ export default function App() {
     }
   };
 
-  const handleImportMarkdown = async (file: File) => {
-    try {
-      const rawText = await file.text();
-      const cleanedTitle = file.name.replace(/\.(md|markdown|txt)$/i, '');
-      const headingMatch = /^#\s+(.+)\n+/.exec(rawText);
-      const title = headingMatch ? headingMatch[1].trim() : cleanedTitle;
-      const content = headingMatch ? rawText.slice(headingMatch[0].length) : rawText;
+  const handleImportFiles = async ({
+    files,
+    mode,
+    folderId,
+  }: {
+    files: File[];
+    mode: ImportDestinationMode;
+    folderId: string | null;
+  }) => {
+    if (files.length === 0) return;
 
-      const now = Date.now();
-      const targetFolder = filter.type === 'folder' ? filter.folderId : 'documents';
-      const imported: NoteDocument = {
-        id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
-        title,
-        content,
-        folderId: folders.some((f) => f.id === targetFolder) ? targetFolder : null,
-        starred: false,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const nextNotes = [imported, ...notesRef.current];
-      notesRef.current = nextNotes;
-      setNotes(nextNotes);
-      setActiveNoteId(imported.id);
-      if (filter.type === 'snippets') setFilter({ type: 'all' });
-      setViewMode('read');
-      if (window.innerWidth < 1024) setSidebarOpen(false);
+    const resultsByFile = await Promise.all(files.map((file) => importSingleFile(file)));
+    const importedItems = resultsByFile.flat();
+    if (importedItems.length === 0) return;
 
-      if (dbEnabledRef.current) {
-        void syncApi('/api/notes', 'POST', imported);
+    const canInsert =
+      mode === 'insert-current' &&
+      activeNote &&
+      (!activeNote.isSharedWithMe || activeNote.sharedPermission === 'edit');
+
+    if (canInsert && activeNote) {
+      const combined = importedItems
+        .map((item) => item.content.trimEnd())
+        .filter(Boolean)
+        .join('\n\n');
+      if (combined) {
+        const prefix = activeNote.content.trimEnd() ? `${activeNote.content.trimEnd()}\n\n` : '';
+        handleUpdateNote(
+          activeNote.id,
+          { content: `${prefix}${combined}\n` },
+          { source: 'discrete', field: 'content' }
+        );
       }
-    } catch {
-      // Ignore unreadable files
+      if (filter.type === 'snippets') setFilter({ type: 'all' });
+      return;
+    }
+
+    const baseTime = Date.now();
+    const validFolderId =
+      folderId && folders.some((f) => f.id === folderId) ? folderId : null;
+
+    const createdNotes: NoteDocument[] = importedItems.map((item, index) => ({
+      id: `note-${baseTime + index}-${Math.random().toString(36).slice(2, 6)}`,
+      title: item.title,
+      content: item.content,
+      folderId: validFolderId,
+      starred: false,
+      createdAt: baseTime + index,
+      updatedAt: baseTime + index,
+    }));
+
+    const nextNotes = [...createdNotes, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(createdNotes[0].id);
+    if (filter.type === 'snippets') setFilter({ type: 'all' });
+    setViewMode('read');
+    if (window.innerWidth < 1024) setSidebarOpen(false);
+
+    if (dbEnabledRef.current) {
+      for (const created of createdNotes) {
+        void syncApi('/api/notes', 'POST', created);
+      }
     }
   };
 
@@ -834,10 +871,12 @@ export default function App() {
       clearNoteHistory(n.id);
     }
     clearImageMemoryCache();
+    clearFileMemoryCache();
     await logoutAccount(storageMode);
     setFilter({ type: 'all' });
     setSearchOpen(false);
     setShareModalOpen(false);
+    setImportModalOpen(false);
     setSnippetModalState({ open: false });
     setCurrentUser(null);
   };
@@ -906,7 +945,12 @@ export default function App() {
         onCreateFolder={handleCreateFolder}
         onRenameFolder={handleRenameFolder}
         onDeleteFolder={handleDeleteFolder}
-        onImportMarkdown={handleImportMarkdown}
+        onOpenImportModal={() => setImportModalOpen(true)}
+        onDropImportFiles={(files) => {
+          const defaultFolder =
+            filter.type === 'folder' ? filter.folderId : folders[0]?.id ?? null;
+          void handleImportFiles({ files, mode: 'new-notes', folderId: defaultFolder });
+        }}
       />
 
       {filter.type === 'snippets' ? (
@@ -941,6 +985,7 @@ export default function App() {
           onCreateNote={() => handleCreateNote()}
           onDuplicateSharedNote={handleDuplicateSharedNote}
           onOpenShareModal={() => setShareModalOpen(true)}
+          onOpenImportModal={() => setImportModalOpen(true)}
           onOpenSnippetModal={(prefillContent) =>
             setSnippetModalState({
               open: true,
@@ -971,6 +1016,20 @@ export default function App() {
         onClose={() => setShareModalOpen(false)}
         onShare={handleShareNote}
         onRevoke={handleRevokeShare}
+      />
+
+      <ImportFileModal
+        isOpen={importModalOpen}
+        folders={folders}
+        defaultFolderId={
+          filter.type === 'folder' ? filter.folderId : folders[0]?.id ?? null
+        }
+        canInsertIntoCurrent={Boolean(
+          activeNote && (!activeNote.isSharedWithMe || activeNote.sharedPermission === 'edit')
+        )}
+        currentNoteTitle={activeNote?.title ?? null}
+        onClose={() => setImportModalOpen(false)}
+        onImport={handleImportFiles}
       />
 
       <SnippetModal
