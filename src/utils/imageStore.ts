@@ -13,6 +13,12 @@ interface StoredImageRecord {
 }
 
 const memoryCache = new Map<string, string>();
+let imageIdSeq = 0;
+
+export function isImageFile(file: File): boolean {
+  if (file.type && file.type.startsWith('image/')) return true;
+  return /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i.test(file.name);
+}
 
 function openImageDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -143,7 +149,8 @@ export async function saveImageFile(
   customAlt?: string
 ): Promise<{ id: string; refUrl: string; alt: string }> {
   const dataUrl = await optimizeImageToDataUrl(file);
-  const id = `img-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  imageIdSeq += 1;
+  const id = `img-${Date.now()}-${imageIdSeq}-${Math.random().toString(36).slice(2, 7)}`;
   const cleanName = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim();
   const alt = (customAlt || cleanName || 'Screenshot').trim();
 

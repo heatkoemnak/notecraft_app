@@ -14,7 +14,6 @@ import {
   Maximize2,
   Plus,
   Trash2,
-  X,
 } from 'lucide-react';
 import { NoteUpdateMeta } from '../hooks/useNoteHistory';
 import {
@@ -22,6 +21,7 @@ import {
   getImageDataUrl,
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
+import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 import { slugifyHeading, tokenizeCodeLine, TokenType } from '../utils/markdown';
 import {
   createBlockId,
@@ -420,11 +420,15 @@ function EditableCodeBlock({
 function EditableImageBlock({
   src,
   alt,
+  compact = false,
+  onOpenLightbox,
   onChangeAlt,
   onDelete,
 }: {
   src: string;
   alt: string;
+  compact?: boolean;
+  onOpenLightbox: () => void;
   onChangeAlt: (nextAlt: string) => void;
   onDelete: () => void;
 }) {
@@ -434,7 +438,6 @@ function EditableImageBlock({
     Boolean(src.startsWith(IMAGE_REF_PREFIX) && !initialCached)
   );
   const [failed, setFailed] = useState<boolean>(!src);
-  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -473,105 +476,84 @@ function EditableImageBlock({
     };
   }, [src]);
 
-  useEffect(() => {
-    if (!lightboxOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setLightboxOpen(false);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [lightboxOpen]);
-
   return (
-    <>
-      <figure className="group my-5">
-        {loading ? (
-          <div className="h-48 w-full rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-100 dark:bg-[#19191d] animate-pulse" />
-        ) : failed || !resolvedSrc ? (
-          <div className="relative flex flex-col items-center justify-center gap-2 py-8 px-4 rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] text-neutral-500 dark:text-neutral-400">
-            <ImageOff className="w-6 h-6" />
-            <span className="text-[13px]">
-              {alt ? `Image unavailable: ${alt}` : 'Image unavailable'}
-            </span>
-            <button
-              type="button"
-              onClick={onDelete}
-              aria-label="Remove image"
-              className="absolute top-2.5 right-2.5 p-1.5 rounded-lg bg-black/50 text-white hover:bg-red-600 transition-colors cursor-pointer"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        ) : (
-          <div className="relative overflow-hidden rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d]">
-            <img
-              src={resolvedSrc}
-              alt={alt || 'Embedded note image'}
-              referrerPolicy="no-referrer"
-              onError={() => setFailed(true)}
-              onClick={() => setLightboxOpen(true)}
-              className="w-full max-h-[520px] object-contain mx-auto cursor-zoom-in block"
-            />
-            <div className="absolute top-2.5 right-2.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-              <button
-                type="button"
-                onClick={() => setLightboxOpen(true)}
-                aria-label="Expand image"
-                title="Expand image"
-                className="p-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-white cursor-pointer"
-              >
-                <Maximize2 className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={onDelete}
-                aria-label="Remove image"
-                title="Remove image"
-                className="p-1.5 rounded-lg bg-black/60 hover:bg-red-600 text-white cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        )}
-        <figcaption className="mt-2 flex justify-center">
-          <input
-            type="text"
-            value={alt}
-            onChange={(e) => onChangeAlt(e.target.value)}
-            placeholder="Add image caption..."
-            aria-label="Image caption"
-            className="w-full max-w-md text-center bg-transparent text-[12.5px] text-neutral-500 dark:text-neutral-400 placeholder:text-neutral-400/60 focus:text-neutral-800 dark:focus:text-neutral-200 focus:outline-none"
-          />
-        </figcaption>
-      </figure>
-
-      {lightboxOpen && resolvedSrc && (
+    <figure className={compact ? 'group flex flex-col' : 'group my-5'}>
+      {loading ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 sm:p-8"
-          onClick={() => setLightboxOpen(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-label={alt || 'Image preview'}
+          className={`w-full rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-100 dark:bg-[#19191d] animate-pulse ${
+            compact ? 'h-52' : 'h-48'
+          }`}
+        />
+      ) : failed || !resolvedSrc ? (
+        <div
+          className={`relative flex flex-col items-center justify-center gap-2 px-4 rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] text-neutral-500 dark:text-neutral-400 ${
+            compact ? 'h-52' : 'py-8'
+          }`}
         >
+          <ImageOff className="w-6 h-6" />
+          <span className="text-[13px] text-center truncate max-w-full">
+            {alt ? `Image unavailable: ${alt}` : 'Image unavailable'}
+          </span>
           <button
             type="button"
-            onClick={() => setLightboxOpen(false)}
-            aria-label="Close image preview"
-            className="absolute top-4 right-4 p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors cursor-pointer"
+            onClick={onDelete}
+            aria-label="Remove image"
+            className="absolute top-2.5 right-2.5 p-1.5 rounded-lg bg-black/50 text-white hover:bg-red-600 transition-colors cursor-pointer"
           >
-            <X className="w-5 h-5" />
+            <Trash2 className="w-3.5 h-3.5" />
           </button>
+        </div>
+      ) : (
+        <div
+          className={`relative overflow-hidden rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] ${
+            compact ? 'h-52 flex items-center justify-center' : ''
+          }`}
+        >
           <img
             src={resolvedSrc}
             alt={alt || 'Embedded note image'}
             referrerPolicy="no-referrer"
-            onClick={(e) => e.stopPropagation()}
-            className="max-w-full max-h-full rounded-xl object-contain shadow-2xl"
+            onError={() => setFailed(true)}
+            onClick={onOpenLightbox}
+            className={
+              compact
+                ? 'max-w-full max-h-full object-contain cursor-zoom-in block'
+                : 'w-full max-h-[520px] object-contain mx-auto cursor-zoom-in block'
+            }
           />
+          <div className="absolute top-2.5 right-2.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+            <button
+              type="button"
+              onClick={onOpenLightbox}
+              aria-label="Expand image"
+              title="Expand image"
+              className="p-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-white cursor-pointer"
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={onDelete}
+              aria-label="Remove image"
+              title="Remove image"
+              className="p-1.5 rounded-lg bg-black/60 hover:bg-red-600 text-white cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       )}
-    </>
+      <figcaption className="mt-1.5 flex justify-center">
+        <input
+          type="text"
+          value={alt}
+          onChange={(e) => onChangeAlt(e.target.value)}
+          placeholder="Add image caption..."
+          aria-label="Image caption"
+          className="w-full max-w-md text-center bg-transparent text-[12.5px] text-neutral-500 dark:text-neutral-400 placeholder:text-neutral-400/60 focus:text-neutral-800 dark:focus:text-neutral-200 focus:outline-none"
+        />
+      </figcaption>
+    </figure>
   );
 }
 
@@ -583,6 +565,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
     const [blocks, setBlocks] = useState<DocBlock[]>(() => parseMarkdownToBlocks(content));
     const [externalSyncSeq, setExternalSyncSeq] = useState(0);
     const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+    const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
     const blocksRef = useRef<DocBlock[]>(blocks);
     blocksRef.current = blocks;
@@ -806,6 +789,17 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           } else {
             const insertAt = idx >= 0 ? idx + 1 : list.length;
             nextBlocks = [...list.slice(0, insertAt), ...parsed, ...list.slice(insertAt)];
+          }
+          const lastBlock = nextBlocks[nextBlocks.length - 1];
+          if (lastBlock && lastBlock.type === 'image') {
+            const trailingPara: DocBlock = {
+              id: createBlockId(),
+              type: 'paragraph',
+              text: '',
+            };
+            nextBlocks = [...nextBlocks, trailingPara];
+            commitBlocks(nextBlocks, 'discrete', { id: trailingPara.id, position: 'start' });
+            return;
           }
           const lastInserted = parsed[parsed.length - 1];
           commitBlocks(nextBlocks, 'discrete', { id: lastInserted.id, position: 'end' });
@@ -1095,12 +1089,90 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
       commitBlocks([...list, para], 'discrete', { id: para.id, position: 'start' });
     };
 
+    const { documentImages, imageIndexByBlockId } = useMemo(() => {
+      const items: LightboxImageItem[] = [];
+      const indexMap = new Map<string, number>();
+      for (const b of blocks) {
+        if (b.type === 'image') {
+          indexMap.set(b.id, items.length);
+          items.push({ src: b.src, alt: b.alt });
+        }
+      }
+      return { documentImages: items, imageIndexByBlockId: indexMap };
+    }, [blocks]);
+
+    const groupedEntries = useMemo(() => {
+      const entries: Array<
+        | { kind: 'single'; block: DocBlock; index: number }
+        | { kind: 'image-group'; blocks: Array<Extract<DocBlock, { type: 'image' }>> }
+      > = [];
+
+      let i = 0;
+      while (i < blocks.length) {
+        const current = blocks[i];
+        if (current.type === 'image') {
+          const run: Array<Extract<DocBlock, { type: 'image' }>> = [current];
+          while (i + 1 < blocks.length && blocks[i + 1].type === 'image') {
+            i += 1;
+            run.push(blocks[i] as Extract<DocBlock, { type: 'image' }>);
+          }
+          if (run.length > 1) {
+            entries.push({ kind: 'image-group', blocks: run });
+          } else {
+            entries.push({ kind: 'single', block: current, index: i });
+          }
+          i += 1;
+          continue;
+        }
+        entries.push({ kind: 'single', block: current, index: i });
+        i += 1;
+      }
+      return entries;
+    }, [blocks]);
+
     return (
       <div
         data-live-editor="true"
         className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words"
       >
-        {blocks.map((block, index) => {
+        {groupedEntries.map((entry) => {
+          if (entry.kind === 'image-group') {
+            const count = entry.blocks.length;
+            const gridColsClass =
+              count === 2 || count === 4
+                ? 'grid-cols-1 sm:grid-cols-2'
+                : 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3';
+            return (
+              <div
+                key={`img-group-${entry.blocks[0].id}`}
+                className={`my-5 grid gap-3.5 ${gridColsClass}`}
+              >
+                {entry.blocks.map((imgBlock) => (
+                  <EditableImageBlock
+                    key={imgBlock.id}
+                    src={imgBlock.src}
+                    alt={imgBlock.alt}
+                    compact
+                    onOpenLightbox={() =>
+                      setLightboxIndex(imageIndexByBlockId.get(imgBlock.id) ?? 0)
+                    }
+                    onChangeAlt={(nextAlt) => {
+                      const nextBlocks = blocksRef.current.map((b) =>
+                        b.id === imgBlock.id && b.type === 'image' ? { ...b, alt: nextAlt } : b
+                      );
+                      commitBlocks(nextBlocks, 'typing');
+                    }}
+                    onDelete={() => {
+                      const nextBlocks = blocksRef.current.filter((b) => b.id !== imgBlock.id);
+                      commitBlocks(nextBlocks, 'discrete');
+                    }}
+                  />
+                ))}
+              </div>
+            );
+          }
+
+          const { block, index } = entry;
           const prevType = index > 0 ? blocks[index - 1].type : null;
           const nextType = index < blocks.length - 1 ? blocks[index + 1].type : null;
 
@@ -1410,6 +1482,9 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                 key={block.id}
                 src={block.src}
                 alt={block.alt}
+                onOpenLightbox={() =>
+                  setLightboxIndex(imageIndexByBlockId.get(block.id) ?? 0)
+                }
                 onChangeAlt={(nextAlt) => {
                   const nextBlocks = blocksRef.current.map((b) =>
                     b.id === block.id && b.type === 'image' ? { ...b, alt: nextAlt } : b
@@ -1472,6 +1547,14 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           className="min-h-[160px] cursor-text"
           aria-hidden="true"
         />
+
+        {lightboxIndex !== null && documentImages.length > 0 && (
+          <ImageLightbox
+            items={documentImages}
+            initialIndex={lightboxIndex}
+            onClose={() => setLightboxIndex(null)}
+          />
+        )}
       </div>
     );
   }

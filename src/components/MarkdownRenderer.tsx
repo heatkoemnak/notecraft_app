@@ -1,17 +1,106 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Check, Copy, ImageOff, Maximize2, X } from 'lucide-react';
+import { Check, Copy, ImageOff, Maximize2 } from 'lucide-react';
 import { slugifyHeading, tokenizeCodeLine, TokenType } from '../utils/markdown';
 import {
   getCachedImageDataUrl,
   getImageDataUrl,
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
+import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 
 interface MarkdownRendererProps {
   content: string;
   onToggleCheckbox?: (checkboxIndex: number) => void;
+}
+
+const GalleryContext = createContext(false);
+const LightboxTriggerContext = createContext<((src: string, alt: string) => void) | null>(null);
+
+interface SimpleMdastNode {
+  type: string;
+  value?: string;
+  url?: string;
+  alt?: string | null;
+  children?: SimpleMdastNode[];
+  data?: Record<string, unknown>;
+}
+
+function extractImageNodesFromParagraph(node: SimpleMdastNode): SimpleMdastNode[] | null {
+  if (node.type !== 'paragraph' || !node.children || node.children.length === 0) {
+    return null;
+  }
+  const images: SimpleMdastNode[] = [];
+  for (const child of node.children) {
+    if (child.type === 'image') {
+      images.push(child);
+    } else if (child.type === 'break') {
+      continue;
+    } else if (child.type === 'text' && !(child.value || '').trim()) {
+      continue;
+    } else {
+      return null;
+    }
+  }
+  return images.length > 0 ? images : null;
+}
+
+function remarkGroupImages() {
+  return (tree: SimpleMdastNode) => {
+    if (!tree.children || !Array.isArray(tree.children)) return;
+    const nextChildren: SimpleMdastNode[] = [];
+    let i = 0;
+
+    while (i < tree.children.length) {
+      const current = tree.children[i];
+      const firstImages = extractImageNodesFromParagraph(current);
+      if (!firstImages) {
+        nextChildren.push(current);
+        i += 1;
+        continue;
+      }
+
+      const collectedImages: SimpleMdastNode[] = [...firstImages];
+      let endIdx = i;
+      while (endIdx + 1 < tree.children.length) {
+        const nextImgs = extractImageNodesFromParagraph(tree.children[endIdx + 1]);
+        if (!nextImgs) break;
+        collectedImages.push(...nextImgs);
+        endIdx += 1;
+      }
+
+      if (collectedImages.length > 1) {
+        nextChildren.push({
+          type: 'imageGallery',
+          data: {
+            hName: 'div',
+            hProperties: {
+              'data-image-gallery': 'true',
+              'data-count': String(collectedImages.length),
+            },
+          },
+          children: collectedImages,
+        });
+      } else {
+        nextChildren.push(current);
+      }
+
+      i = endIdx + 1;
+    }
+
+    tree.children = nextChildren;
+  };
+}
+
+function extractDocumentImages(markdown: string): LightboxImageItem[] {
+  const items: LightboxImageItem[] = [];
+  const regex = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(markdown)) !== null) {
+    items.push({ alt: match[1] || '', src: match[2].trim() });
+  }
+  return items;
 }
 
 const TOKEN_CLASSES: Record<TokenType, string> = {
@@ -87,13 +176,14 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
 }
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  const isCompact = useContext(GalleryContext);
+  const openLightbox = useContext(LightboxTriggerContext);
   const initialCached = src?.startsWith(IMAGE_REF_PREFIX) ? getCachedImageDataUrl(src) : src ?? null;
   const [resolvedSrc, setResolvedSrc] = useState<string | null>(initialCached);
   const [loading, setLoading] = useState<boolean>(
     Boolean(src?.startsWith(IMAGE_REF_PREFIX) && !initialCached)
   );
   const [failed, setFailed] = useState<boolean>(!src);
-  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -136,81 +226,66 @@ function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
     };
   }, [src]);
 
-  useEffect(() => {
-    if (!lightboxOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setLightboxOpen(false);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [lightboxOpen]);
+  const handleOpen = () => {
+    if (src && openLightbox) {
+      openLightbox(src, alt || '');
+    }
+  };
 
   return (
-    <>
-      <figure className="my-5">
-        {loading ? (
-          <div className="h-48 w-full rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-100 dark:bg-[#19191d] animate-pulse" />
-        ) : failed || !resolvedSrc ? (
-          <div className="flex flex-col items-center justify-center gap-2 py-8 px-4 rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] text-neutral-500 dark:text-neutral-400">
-            <ImageOff className="w-6 h-6" />
-            <span className="text-[13px]">
-              {alt ? `Image unavailable: ${alt}` : 'Image unavailable'}
-            </span>
-          </div>
-        ) : (
-          <div className="group relative overflow-hidden rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d]">
-            <img
-              src={resolvedSrc}
-              alt={alt || 'Embedded note image'}
-              referrerPolicy="no-referrer"
-              onError={() => setFailed(true)}
-              onClick={() => setLightboxOpen(true)}
-              className="w-full max-h-[520px] object-contain mx-auto cursor-zoom-in block"
-            />
-            <button
-              type="button"
-              onClick={() => setLightboxOpen(true)}
-              aria-label="Expand image"
-              title="Expand image"
-              className="absolute top-2.5 right-2.5 p-1.5 rounded-lg bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
-        {alt && !failed && (
-          <figcaption className="mt-2 text-center text-[12.5px] text-neutral-500 dark:text-neutral-400">
-            {alt}
-          </figcaption>
-        )}
-      </figure>
-
-      {lightboxOpen && resolvedSrc && (
+    <figure className={isCompact ? 'flex flex-col' : 'my-5'}>
+      {loading ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 sm:p-8"
-          onClick={() => setLightboxOpen(false)}
-          role="dialog"
-          aria-modal="true"
-          aria-label={alt || 'Image preview'}
+          className={`w-full rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-100 dark:bg-[#19191d] animate-pulse ${
+            isCompact ? 'h-52' : 'h-48'
+          }`}
+        />
+      ) : failed || !resolvedSrc ? (
+        <div
+          className={`flex flex-col items-center justify-center gap-2 px-4 rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] text-neutral-500 dark:text-neutral-400 ${
+            isCompact ? 'h-52' : 'py-8'
+          }`}
         >
-          <button
-            type="button"
-            onClick={() => setLightboxOpen(false)}
-            aria-label="Close image preview"
-            className="absolute top-4 right-4 p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors cursor-pointer"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <ImageOff className="w-6 h-6" />
+          <span className="text-[13px] text-center truncate max-w-full">
+            {alt ? `Image unavailable: ${alt}` : 'Image unavailable'}
+          </span>
+        </div>
+      ) : (
+        <div
+          className={`group relative overflow-hidden rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50 dark:bg-[#19191d] ${
+            isCompact ? 'h-52 flex items-center justify-center' : ''
+          }`}
+        >
           <img
             src={resolvedSrc}
             alt={alt || 'Embedded note image'}
             referrerPolicy="no-referrer"
-            onClick={(e) => e.stopPropagation()}
-            className="max-w-full max-h-full rounded-xl object-contain shadow-2xl"
+            onError={() => setFailed(true)}
+            onClick={handleOpen}
+            className={
+              isCompact
+                ? 'max-w-full max-h-full object-contain cursor-zoom-in block'
+                : 'w-full max-h-[520px] object-contain mx-auto cursor-zoom-in block'
+            }
           />
+          <button
+            type="button"
+            onClick={handleOpen}
+            aria-label="Expand image"
+            title="Expand image"
+            className="absolute top-2.5 right-2.5 p-1.5 rounded-lg bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+          >
+            <Maximize2 className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
-    </>
+      {alt && !failed && (
+        <figcaption className="mt-1.5 text-center text-[12.5px] text-neutral-500 dark:text-neutral-400 truncate">
+          {alt}
+        </figcaption>
+      )}
+    </figure>
   );
 }
 
@@ -224,6 +299,9 @@ function getNodeText(node: React.ReactNode): string {
 }
 
 export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRendererProps) {
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const documentImages = useMemo(() => extractDocumentImages(content), [content]);
+
   const seenHeadingIds = new Map<string, number>();
   let checkboxCounter = 0;
 
@@ -235,17 +313,46 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
     return count === 0 ? base : `${base}-${count}`;
   };
 
+  const handleOpenLightbox = (src: string, alt: string) => {
+    let idx = documentImages.findIndex((item) => item.src === src && item.alt === alt);
+    if (idx < 0) {
+      idx = documentImages.findIndex((item) => item.src === src);
+    }
+    if (idx >= 0) {
+      setLightboxIndex(idx);
+    }
+  };
+
   return (
-    <div className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        urlTransform={(url) => {
-          if (url.startsWith(IMAGE_REF_PREFIX) || url.startsWith('data:image/')) {
-            return url;
-          }
-          return defaultUrlTransform(url);
-        }}
-        components={{
+    <LightboxTriggerContext.Provider value={handleOpenLightbox}>
+      <div className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkGroupImages]}
+          urlTransform={(url) => {
+            if (url.startsWith(IMAGE_REF_PREFIX) || url.startsWith('data:image/')) {
+              return url;
+            }
+            return defaultUrlTransform(url);
+          }}
+          components={{
+            div: (props) => {
+              const record = props as Record<string, unknown>;
+              if (record['data-image-gallery'] === 'true') {
+                const count = Number(record['data-count'] || 2);
+                const gridColsClass =
+                  count === 2 || count === 4
+                    ? 'grid-cols-1 sm:grid-cols-2'
+                    : 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3';
+                return (
+                  <GalleryContext.Provider value={true}>
+                    <div className={`my-5 grid gap-3.5 ${gridColsClass}`}>
+                      {props.children}
+                    </div>
+                  </GalleryContext.Provider>
+                );
+              }
+              return <div {...props} />;
+            },
           h1: ({ children }) => {
             const id = getUniqueHeadingId(children);
             return (
@@ -397,6 +504,15 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
       >
         {content}
       </ReactMarkdown>
+
+      {lightboxIndex !== null && documentImages.length > 0 && (
+        <ImageLightbox
+          items={documentImages}
+          initialIndex={lightboxIndex}
+          onClose={() => setLightboxIndex(null)}
+        />
+      )}
     </div>
+    </LightboxTriggerContext.Provider>
   );
 }

@@ -36,7 +36,7 @@ import {
   getDocumentStats,
   toggleTaskCheckbox,
 } from '../utils/markdown';
-import { resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
+import { isImageFile, resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
 import { ImageInsertModal } from './ImageInsertModal';
 import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
 import { MarkdownRenderer } from './MarkdownRenderer';
@@ -119,6 +119,7 @@ export function DocumentWorkspace({
   const [hasSelection, setHasSelection] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [uploadingImagesCount, setUploadingImagesCount] = useState(0);
   const [editorFont, setEditorFont] = useState<EditorFontId>(() => {
     try {
       const saved = localStorage.getItem(EDITOR_FONT_STORAGE_KEY);
@@ -398,17 +399,21 @@ export function DocumentWorkspace({
   };
 
   const handleImageFiles = async (files: FileList | File[]) => {
-    if (!note) return;
-    const imageFiles = Array.from(files).filter((f) => f.type.startsWith('image/'));
+    if (!note || isReadOnly) return;
+    const imageFiles = Array.from(files).filter(isImageFile);
     if (imageFiles.length === 0) return;
 
-    const blocks: string[] = [];
-    for (const file of imageFiles) {
-      const saved = await saveImageFile(file);
-      const safeAlt = saved.alt.replace(/[\[\]]/g, '');
-      blocks.push(`![${safeAlt}](${saved.refUrl})`);
+    setUploadingImagesCount((c) => c + imageFiles.length);
+    try {
+      const savedList = await Promise.all(imageFiles.map((file) => saveImageFile(file)));
+      const blocks = savedList.map((saved) => {
+        const safeAlt = saved.alt.replace(/[\[\]]/g, '');
+        return `![${safeAlt}](${saved.refUrl})`;
+      });
+      handleInsertImageMarkdown(blocks.join('\n\n'));
+    } finally {
+      setUploadingImagesCount((c) => Math.max(0, c - imageFiles.length));
     }
-    handleInsertImageMarkdown(blocks.join('\n\n'));
   };
 
   const handleEditorPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -882,7 +887,7 @@ export function DocumentWorkspace({
                 icon={<FileCode2 className="w-4 h-4" />}
               />
               <ToolbarButton
-                label="Insert image"
+                label="Insert images"
                 onClick={() => setImageModalOpen(true)}
                 icon={<ImagePlus className="w-4 h-4" />}
               />
@@ -944,6 +949,12 @@ export function DocumentWorkspace({
             </select>
             <ChevronDown className="w-3 h-3 text-neutral-400 pointer-events-none absolute right-1.5" />
           </div>
+          {uploadingImagesCount > 0 && (
+            <span className="text-[12px] text-blue-600 dark:text-blue-400 ml-2 tabular-nums">
+              Uploading {uploadingImagesCount}{' '}
+              {uploadingImagesCount === 1 ? 'image' : 'images'}...
+            </span>
+          )}
           {isReadOnly && (
             <span className="text-[12px] text-neutral-500 dark:text-neutral-400 ml-2">
               View-only shared document
@@ -1140,7 +1151,11 @@ export function DocumentWorkspace({
                     setIsDraggingOver(true);
                   }
                 }}
-                onDragLeave={() => setIsDraggingOver(false)}
+                onDragLeave={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                    setIsDraggingOver(false);
+                  }
+                }}
                 onDrop={async (e) => {
                   if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
@@ -1282,7 +1297,11 @@ export function DocumentWorkspace({
                     setIsDraggingOver(true);
                   }
                 }}
-                onDragLeave={() => setIsDraggingOver(false)}
+                onDragLeave={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                    setIsDraggingOver(false);
+                  }
+                }}
                 onDrop={async (e) => {
                   if (!isReadOnly && e.dataTransfer.files?.length) {
                     e.preventDefault();
@@ -1311,7 +1330,11 @@ export function DocumentWorkspace({
                 setIsDraggingOver(true);
               }
             }}
-            onDragLeave={() => setIsDraggingOver(false)}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setIsDraggingOver(false);
+              }
+            }}
             onDrop={async (e) => {
               if (!isReadOnly && e.dataTransfer.files?.length) {
                 e.preventDefault();
