@@ -8,7 +8,6 @@ import {
   Code,
   Columns2,
   Copy,
-  Download,
   FileCode2,
   FileText,
   FileUp,
@@ -39,7 +38,7 @@ import {
   toggleTaskCheckbox,
 } from '../utils/markdown';
 import { importSingleFile } from '../utils/fileImporter';
-import { isImageFile, resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
+import { isImageFile, saveImageFile } from '../utils/imageStore';
 import { DiagramBuilderModal } from './DiagramBuilderModal';
 import { ImageInsertModal } from './ImageInsertModal';
 import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
@@ -569,24 +568,6 @@ export function DocumentWorkspace({
     }
   };
 
-  const handleExportMarkdown = async () => {
-    if (!note) return;
-    const rawDoc = `# ${note.title || 'Untitled Note'}\n\n${note.content}`;
-    const resolvedDoc = await resolveMarkdownImagesForExport(rawDoc);
-    const blob = new Blob([resolvedDoc], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const slug =
-      (note.title || 'note')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-|-$/g, '') || 'notecraft-document';
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${slug}.md`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  };
-
   const scrollToHeading = (headingId: string) => {
     if (viewMode === 'write') {
       onChangeViewMode('split');
@@ -834,27 +815,14 @@ export function DocumentWorkspace({
 
           <button
             type="button"
-            onClick={handleExportMarkdown}
-            title="Download as .md file"
-            aria-label="Export Markdown file"
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-white dark:text-neutral-950 dark:hover:bg-neutral-200 transition-colors cursor-pointer whitespace-nowrap"
+            onClick={onOpenShareModal}
+            title="Share by email or export PDF / DOC / MD"
+            aria-label="Share and export note"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap tabular-nums"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Export .md</span>
+            <Share2 className="w-3.5 h-3.5" />
+            <span>{!isSharedWithMe && shareCount > 0 ? `Share · ${shareCount}` : 'Share'}</span>
           </button>
-
-          {!isSharedWithMe && (
-            <button
-              type="button"
-              onClick={onOpenShareModal}
-              title="Share note by email"
-              aria-label="Share note by email"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap tabular-nums"
-            >
-              <Share2 className="w-3.5 h-3.5" />
-              <span>{shareCount > 0 ? `Share · ${shareCount}` : 'Share'}</span>
-            </button>
-          )}
         </div>
       </header>
 

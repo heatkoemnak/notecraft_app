@@ -1011,7 +1011,7 @@ export default function App() {
 
       <ShareNoteModal
         isOpen={shareModalOpen}
-        note={activeNote && !activeNote.isSharedWithMe ? activeNote : null}
+        note={activeNote}
         currentUser={currentUser}
         onClose={() => setShareModalOpen(false)}
         onShare={handleShareNote}

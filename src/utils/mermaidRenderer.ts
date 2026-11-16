@@ -337,11 +337,12 @@ export function parseMermaidToFlowchart(code: string): FlowchartModel | null {
 
 let renderQueue: Promise<unknown> = Promise.resolve();
 let renderSeq = 0;
-let lastInitializedDark: boolean | null = null;
+let lastInitializedKey: string | null = null;
 
-function configureMermaid(isDark: boolean) {
-  if (lastInitializedDark === isDark) return;
-  lastInitializedDark = isDark;
+function configureMermaid(isDark: boolean, htmlLabels = true) {
+  const key = `${isDark ? 'dark' : 'light'}-${htmlLabels ? 'html' : 'svg'}`;
+  if (lastInitializedKey === key) return;
+  lastInitializedKey = key;
 
   mermaid.initialize({
     startOnLoad: false,
@@ -351,7 +352,7 @@ function configureMermaid(isDark: boolean) {
     theme: 'base',
     flowchart: {
       curve: 'basis',
-      htmlLabels: true,
+      htmlLabels,
       padding: 14,
       nodeSpacing: 40,
       rankSpacing: 48,
@@ -422,15 +423,17 @@ function configureMermaid(isDark: boolean) {
 
 export function renderMermaidSvg(
   code: string,
-  isDark: boolean
+  isDark: boolean,
+  options?: { htmlLabels?: boolean }
 ): Promise<{ svg: string; bindFunctions?: (element: Element) => void }> {
   const trimmed = code.trim();
   if (!trimmed) {
     return Promise.reject(new Error('Diagram source is empty.'));
   }
 
+  const htmlLabels = options?.htmlLabels ?? true;
   const task = renderQueue.then(async () => {
-    configureMermaid(isDark);
+    configureMermaid(isDark, htmlLabels);
     renderSeq += 1;
     const id = `notecraft-mmd-${renderSeq}`;
     try {
