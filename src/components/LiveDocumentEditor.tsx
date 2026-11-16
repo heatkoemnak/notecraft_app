@@ -21,6 +21,8 @@ import {
   getImageDataUrl,
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
+import { isDiagramLanguage } from '../utils/mermaidRenderer';
+import { DiagramBlock } from './DiagramBlock';
 import { FileAttachmentCard } from './FileAttachmentCard';
 import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 import { slugifyHeading, tokenizeCodeLine, TokenType } from '../utils/markdown';
@@ -39,6 +41,7 @@ export interface LiveDocumentEditorHandle {
     kind: 'h2' | 'h3' | 'paragraph' | 'blockquote' | 'task-item' | 'bullet-item' | 'ordered-item'
   ) => void;
   insertCodeBlock: (language?: string, code?: string) => void;
+  updateCodeBlock: (blockId: string, nextCode: string) => void;
   insertTableBlock: () => void;
   insertDividerBlock: () => void;
   insertMarkdownContent: (markdown: string) => void;
@@ -51,6 +54,7 @@ interface LiveDocumentEditorProps {
   onChangeContent: (nextMarkdown: string, meta?: NoteUpdateMeta) => void;
   onPasteImageFiles?: (files: File[]) => void;
   onSelectionStateChange?: (hasSelection: boolean) => void;
+  onEditDiagram?: (blockId: string, currentCode: string) => void;
 }
 
 const TOKEN_CLASSES: Record<TokenType, string> = {
@@ -560,7 +564,7 @@ function EditableImageBlock({
 
 export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocumentEditorProps>(
   function LiveDocumentEditor(
-    { noteId, content, onChangeContent, onPasteImageFiles, onSelectionStateChange },
+    { noteId, content, onChangeContent, onPasteImageFiles, onSelectionStateChange, onEditDiagram },
     ref
   ) {
     const [blocks, setBlocks] = useState<DocBlock[]>(() => parseMarkdownToBlocks(content));
@@ -751,6 +755,13 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           commitBlocks(nextBlocks, 'discrete', { id: created.id, position: 'start' });
         },
 
+        updateCodeBlock(blockId: string, nextCode: string) {
+          const nextBlocks = blocksRef.current.map((b) =>
+            b.id === blockId && b.type === 'code' ? { ...b, code: nextCode } : b
+          );
+          commitBlocks(nextBlocks, 'discrete');
+        },
+
         insertTableBlock() {
           const list = blocksRef.current;
           const insertAt = getInsertionIndex();
@@ -792,7 +803,13 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
             nextBlocks = [...list.slice(0, insertAt), ...parsed, ...list.slice(insertAt)];
           }
           const lastBlock = nextBlocks[nextBlocks.length - 1];
-          if (lastBlock && lastBlock.type === 'image') {
+          if (
+            lastBlock &&
+            (lastBlock.type === 'image' ||
+              lastBlock.type === 'file' ||
+              lastBlock.type === 'table' ||
+              (lastBlock.type === 'code' && isDiagramLanguage(lastBlock.language)))
+          ) {
             const trailingPara: DocBlock = {
               id: createBlockId(),
               type: 'paragraph',
@@ -885,11 +902,14 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
 
         const fenceShortcut = /^```([a-zA-Z0-9_-]*)\s$/.exec(nextText);
         if (fenceShortcut) {
+          const lang = fenceShortcut[1] || 'bash';
           const created: DocBlock = {
             id: createBlockId(),
             type: 'code',
-            language: fenceShortcut[1] || 'bash',
-            code: '',
+            language: lang,
+            code: isDiagramLanguage(lang)
+              ? 'flowchart TD\n  N1(["Start"]) --> N2["Next Step"]'
+              : '',
           };
           const nextBlocks = list.map((b, i) => (i === idx ? created : b));
           commitBlocks(nextBlocks, 'discrete', { id: created.id, position: 'start' });
@@ -928,11 +948,14 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
         if (block.type === 'paragraph') {
           const fenceMatch = /^```([a-zA-Z0-9_-]*)$/.exec(block.text.trim());
           if (fenceMatch) {
+            const lang = fenceMatch[1] || 'bash';
             const codeBlock: DocBlock = {
               id: createBlockId(),
               type: 'code',
-              language: fenceMatch[1] || 'bash',
-              code: '',
+              language: lang,
+              code: isDiagramLanguage(lang)
+                ? 'flowchart TD\n  N1(["Start"]) --> N2["Next Step"]'
+                : '',
             };
             const nextBlocks = list.map((b, i) => (i === idx ? codeBlock : b));
             commitBlocks(nextBlocks, 'discrete', { id: codeBlock.id, position: 'start' });
@@ -1329,6 +1352,29 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           }
 
           if (block.type === 'code') {
+            if (isDiagramLanguage(block.language)) {
+              return (
+                <DiagramBlock
+                  key={block.id}
+                  editable
+                  language={block.language}
+                  code={block.code}
+                  onEditVisual={
+                    onEditDiagram ? () => onEditDiagram(block.id, block.code) : undefined
+                  }
+                  onChangeCode={(nextCode) => {
+                    const nextBlocks = blocksRef.current.map((b) =>
+                      b.id === block.id && b.type === 'code' ? { ...b, code: nextCode } : b
+                    );
+                    commitBlocks(nextBlocks, 'typing');
+                  }}
+                  onDelete={() => {
+                    const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
+                    commitBlocks(nextBlocks, 'discrete');
+                  }}
+                />
+              );
+            }
             return (
               <EditableCodeBlock
                 key={block.id}

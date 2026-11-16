@@ -71,6 +71,7 @@ export function describeImportFile(file: File): string {
   if (ext === 'html' || ext === 'htm') return 'HTML document';
   if (ext === 'csv' || ext === 'tsv') return 'Table (CSV)';
   if (ext === 'json') return 'JSON';
+  if (ext === 'mmd' || ext === 'mermaid') return 'Mermaid diagram';
   if (ext === 'docx') return 'Word document';
   if (ext === 'pdf') return 'PDF attachment';
   if (CODE_EXTENSION_MAP[ext]) return `${CODE_EXTENSION_MAP[ext]} code`;
@@ -539,6 +540,18 @@ export async function importSingleFile(file: File): Promise<ImportedNoteResult[]
         title,
         content: content.endsWith('\n') ? content : `${content}\n`,
         kindLabel: ext === 'txt' || ext === 'log' ? 'Text note' : 'Markdown',
+      },
+    ];
+  }
+
+  // 2b. Mermaid diagram files (.mmd, .mermaid)
+  if (ext === 'mmd' || ext === 'mermaid') {
+    const rawDiagram = (await file.text()).trimEnd();
+    return [
+      {
+        title: baseTitle,
+        content: `\`\`\`mermaid\n${rawDiagram}\n\`\`\`\n`,
+        kindLabel: 'Mermaid diagram',
       },
     ];
   }

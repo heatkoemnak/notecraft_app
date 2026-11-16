@@ -9,6 +9,8 @@ import {
   IMAGE_REF_PREFIX,
 } from '../utils/imageStore';
 import { FILE_REF_PREFIX } from '../utils/fileStore';
+import { isDiagramLanguage } from '../utils/mermaidRenderer';
+import { DiagramBlock } from './DiagramBlock';
 import { FileAttachmentCard } from './FileAttachmentCard';
 import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
 
@@ -507,10 +509,14 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
           pre: ({ children }) => <>{children}</>,
           code: ({ className, children }) => {
             const match = /language-([a-zA-Z0-9_-]+)/.exec(className || '');
+            const lang = match?.[1] || '';
             const text = String(children).replace(/\n$/, '');
+            if (isDiagramLanguage(lang)) {
+              return <DiagramBlock language={lang} code={text} />;
+            }
             const isBlock = Boolean(match) || text.includes('\n');
             if (isBlock) {
-              return <CodeBlock language={match?.[1] || 'text'} code={text} />;
+              return <CodeBlock language={lang || 'text'} code={text} />;
             }
             return (
               <code className="font-mono-code text-[13px] px-1.5 py-0.5 rounded-md bg-neutral-100 dark:bg-white/[0.08] text-neutral-900 dark:text-neutral-100 border border-neutral-200/70 dark:border-white/[0.06]">

@@ -28,6 +28,7 @@ import {
   Table,
   Type,
   Undo2,
+  Workflow,
 } from 'lucide-react';
 import { NoteSelection, NoteUpdateMeta } from '../hooks/useNoteHistory';
 import { Folder, NoteDocument, Snippet, ViewMode } from '../types/notes';
@@ -39,6 +40,7 @@ import {
 } from '../utils/markdown';
 import { importSingleFile } from '../utils/fileImporter';
 import { isImageFile, resolveMarkdownImagesForExport, saveImageFile } from '../utils/imageStore';
+import { DiagramBuilderModal } from './DiagramBuilderModal';
 import { ImageInsertModal } from './ImageInsertModal';
 import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
 import { MarkdownRenderer } from './MarkdownRenderer';
@@ -122,6 +124,12 @@ export function DocumentWorkspace({
   const [snippetQuery, setSnippetQuery] = useState('');
   const [hasSelection, setHasSelection] = useState(false);
   const [imageModalOpen, setImageModalOpen] = useState(false);
+  const [diagramModalState, setDiagramModalState] = useState<{
+    open: boolean;
+    mode: 'insert' | 'edit';
+    blockId?: string;
+    initialCode?: string;
+  }>({ open: false, mode: 'insert' });
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [uploadingImagesCount, setUploadingImagesCount] = useState(0);
   const [editorFont, setEditorFont] = useState<EditorFontId>(() => {
@@ -946,6 +954,13 @@ export function DocumentWorkspace({
                 icon={<Table className="w-4 h-4" />}
               />
               <ToolbarButton
+                label="Insert diagram or flowchart"
+                onClick={() =>
+                  setDiagramModalState({ open: true, mode: 'insert' })
+                }
+                icon={<Workflow className="w-4 h-4" />}
+              />
+              <ToolbarButton
                 label="Checklist"
                 onClick={() =>
                   viewMode === 'read'
@@ -1457,6 +1472,14 @@ export function DocumentWorkspace({
                   }
                   onPasteImageFiles={handleImageFiles}
                   onSelectionStateChange={setHasSelection}
+                  onEditDiagram={(blockId, currentCode) =>
+                    setDiagramModalState({
+                      open: true,
+                      mode: 'edit',
+                      blockId,
+                      initialCode: currentCode,
+                    })
+                  }
                 />
               )}
             </article>
@@ -1524,6 +1547,20 @@ export function DocumentWorkspace({
         isOpen={imageModalOpen}
         onClose={() => setImageModalOpen(false)}
         onInsert={handleInsertImageMarkdown}
+      />
+
+      <DiagramBuilderModal
+        isOpen={diagramModalState.open}
+        mode={diagramModalState.mode}
+        initialCode={diagramModalState.initialCode}
+        onClose={() => setDiagramModalState({ open: false, mode: 'insert' })}
+        onSave={(mermaidCode) => {
+          if (diagramModalState.mode === 'edit' && diagramModalState.blockId) {
+            liveEditorRef.current?.updateCodeBlock(diagramModalState.blockId, mermaidCode);
+          } else {
+            handleInsertImageMarkdown(`\`\`\`mermaid\n${mermaidCode.trimEnd()}\n\`\`\``);
+          }
+        }}
       />
     </div>
   );
