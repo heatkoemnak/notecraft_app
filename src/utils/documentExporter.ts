@@ -869,7 +869,210 @@ async function renderBlockToPrintHtml(
   }
 }
 
-export async function exportNoteAsPdf(note: NoteDocument): Promise<void> {
+export type PdfSlotPlacement = 'header' | 'footer' | 'hidden';
+
+export interface PdfExportOptions {
+  showHeader: boolean;
+  showFooter: boolean;
+  titlePlacement: PdfSlotPlacement;
+  pageNumberPlacement: PdfSlotPlacement;
+  datePlacement: PdfSlotPlacement;
+  timePlacement: PdfSlotPlacement;
+}
+
+export const DEFAULT_PDF_EXPORT_OPTIONS: PdfExportOptions = {
+  showHeader: true,
+  showFooter: true,
+  titlePlacement: 'header',
+  datePlacement: 'header',
+  timePlacement: 'hidden',
+  pageNumberPlacement: 'footer',
+};
+
+export interface PdfRegionSlots {
+  left: string;
+  center: string;
+  right: string;
+  hasContent: boolean;
+}
+
+function escapeCssContent(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
+}
+
+export function formatPdfTimestampParts(now: Date = new Date()): {
+  dateStr: string;
+  timeStr: string;
+} {
+  return {
+    dateStr: now.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    }),
+    timeStr: now.toLocaleTimeString(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
+  };
+}
+
+export function getPdfRegionPreviewSlots(
+  region: 'header' | 'footer',
+  noteTitle: string,
+  options: PdfExportOptions,
+  now: Date = new Date()
+): PdfRegionSlots {
+  const regionEnabled =
+    region === 'header' ? options.showHeader : options.showFooter;
+  if (!regionEnabled) {
+    return { left: '', center: '', right: '', hasContent: false };
+  }
+
+  const hasTitle = options.titlePlacement === region;
+  const hasPage = options.pageNumberPlacement === region;
+  const hasDate = options.datePlacement === region;
+  const hasTime = options.timePlacement === region;
+
+  const { dateStr, timeStr } = formatPdfTimestampParts(now);
+  const dateTimeText =
+    hasDate && hasTime
+      ? `${dateStr} · ${timeStr}`
+      : hasDate
+      ? dateStr
+      : hasTime
+      ? timeStr
+      : '';
+  const pageText = hasPage ? 'Page 1 of 3' : '';
+  const cleanTitle = (noteTitle || 'Untitled Note').trim();
+
+  let left = '';
+  let center = '';
+  let right = '';
+
+  if (hasTitle) {
+    left = cleanTitle;
+    if (dateTimeText && pageText) {
+      center = dateTimeText;
+      right = pageText;
+    } else if (dateTimeText) {
+      right = dateTimeText;
+    } else if (pageText) {
+      right = pageText;
+    }
+  } else if (dateTimeText && pageText) {
+    left = dateTimeText;
+    right = pageText;
+  } else if (dateTimeText) {
+    right = dateTimeText;
+  } else if (pageText) {
+    right = pageText;
+  }
+
+  return {
+    left,
+    center,
+    right,
+    hasContent: Boolean(left || center || right),
+  };
+}
+
+function buildMarginBoxCss(
+  region: 'header' | 'footer',
+  noteTitle: string,
+  options: PdfExportOptions,
+  now: Date
+): { css: string; hasContent: boolean } {
+  const regionEnabled =
+    region === 'header' ? options.showHeader : options.showFooter;
+  const hasTitle = regionEnabled && options.titlePlacement === region;
+  const hasPage = regionEnabled && options.pageNumberPlacement === region;
+  const hasDate = regionEnabled && options.datePlacement === region;
+  const hasTime = regionEnabled && options.timePlacement === region;
+
+  const { dateStr, timeStr } = formatPdfTimestampParts(now);
+  const dateTimeText =
+    hasDate && hasTime
+      ? `${dateStr} · ${timeStr}`
+      : hasDate
+      ? dateStr
+      : hasTime
+      ? timeStr
+      : '';
+
+  const titleExpr = hasTitle ? `"${escapeCssContent(noteTitle || 'Untitled Note')}"` : '';
+  const dateTimeExpr = dateTimeText ? `"${escapeCssContent(dateTimeText)}"` : '';
+  const pageExpr = hasPage ? '"Page " counter(page) " of " counter(pages)' : '';
+
+  let leftExpr = '""';
+  let centerExpr = '""';
+  let rightExpr = '""';
+
+  if (titleExpr) {
+    leftExpr = titleExpr;
+    if (dateTimeExpr && pageExpr) {
+      centerExpr = dateTimeExpr;
+      rightExpr = pageExpr;
+    } else if (dateTimeExpr) {
+      rightExpr = dateTimeExpr;
+    } else if (pageExpr) {
+      rightExpr = pageExpr;
+    }
+  } else if (dateTimeExpr && pageExpr) {
+    leftExpr = dateTimeExpr;
+    rightExpr = pageExpr;
+  } else if (dateTimeExpr) {
+    rightExpr = dateTimeExpr;
+  } else if (pageExpr) {
+    rightExpr = pageExpr;
+  }
+
+  const hasContent = Boolean(titleExpr || dateTimeExpr || pageExpr);
+  const prefix = region === 'header' ? 'top' : 'bottom';
+  const alignRule =
+    region === 'header'
+      ? 'vertical-align: bottom; padding-bottom: 4.5mm;'
+      : 'vertical-align: top; padding-top: 4.5mm;';
+
+  const sharedStyle = `
+      font-family: 'Kantumruy Pro', 'Noto Sans Khmer', 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 8.5pt;
+      font-weight: 400;
+      color: #6b7280;
+      white-space: nowrap;
+      ${alignRule}`;
+
+  const css = `
+      @${prefix}-left {
+        content: ${leftExpr};
+        ${leftExpr !== '""' ? sharedStyle : ''}
+      }
+      @${prefix}-center {
+        content: ${centerExpr};
+        ${centerExpr !== '""' ? sharedStyle : ''}
+      }
+      @${prefix}-right {
+        content: ${rightExpr};
+        ${rightExpr !== '""' ? sharedStyle : ''}
+      }`;
+
+  return { css, hasContent };
+}
+
+export async function exportNoteAsPdf(
+  note: NoteDocument,
+  customOptions?: Partial<PdfExportOptions>
+): Promise<void> {
+  const options: PdfExportOptions = {
+    ...DEFAULT_PDF_EXPORT_OPTIONS,
+    ...customOptions,
+  };
+  const now = new Date();
+
   const blocks = parseMarkdownToBlocks(note.content);
   const renderedParts: string[] = [];
   let orderedCounter = 0;
@@ -884,8 +1087,14 @@ export async function exportNoteAsPdf(note: NoteDocument): Promise<void> {
     if (html) renderedParts.push(html);
   }
 
-  const title = escapeHtml(note.title || 'Untitled Note');
+  const rawTitle = note.title || 'Untitled Note';
+  const title = escapeHtml(rawTitle);
   const updatedText = escapeHtml(`Updated ${formatRelativeDate(note.updatedAt)}`);
+
+  const headerMargin = buildMarginBoxCss('header', rawTitle, options, now);
+  const footerMargin = buildMarginBoxCss('footer', rawTitle, options, now);
+  const topMarginMm = headerMargin.hasContent ? 21 : 15;
+  const bottomMarginMm = footerMargin.hasContent ? 21 : 15;
 
   const htmlDoc = `<!DOCTYPE html>
 <html lang="en">
@@ -896,7 +1105,10 @@ export async function exportNoteAsPdf(note: NoteDocument): Promise<void> {
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Kantumruy+Pro:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
-    @page { size: auto; margin: 16mm; }
+    @page {
+      size: auto;
+      margin: ${topMarginMm}mm 16mm ${bottomMarginMm}mm 16mm;${headerMargin.css}${footerMargin.css}
+    }
     * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     body {
       margin: 0;
