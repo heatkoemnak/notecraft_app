@@ -222,10 +222,27 @@ export function registerOAuthRoutes(
     const redirectUri = `${hostUrl}/api/auth/github/callback`;
     const params = new URLSearchParams({
       client_id: clientId,
-      redirect_uri: redirectUri,
       scope: 'read:user user:email',
       prompt: 'consent',
     });
+
+    // GitHub's OAuth server displays "The redirect_uri is not associated with this application"
+    // if redirect_uri does not strictly match the single callback URL registered in the GitHub OAuth app.
+    // When redirect_uri is omitted, GitHub defaults to the registered Authorization callback URL.
+    const appUrlEnv = process.env.APP_URL?.trim();
+    let isAppUrlMatch = false;
+    if (appUrlEnv) {
+      try {
+        isAppUrlMatch = hostUrl.includes(new URL(appUrlEnv).hostname);
+      } catch {
+        isAppUrlMatch = false;
+      }
+    }
+
+    if (req.query.include_redirect_uri === 'true' || isAppUrlMatch) {
+      params.set('redirect_uri', redirectUri);
+    }
+
     const authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
     return res.json({ url: authUrl, redirectUri });
   });
@@ -242,10 +259,24 @@ export function registerOAuthRoutes(
     const redirectUri = `${hostUrl}/api/auth/github/callback`;
     const params = new URLSearchParams({
       client_id: clientId,
-      redirect_uri: redirectUri,
       scope: 'read:user user:email',
       prompt: 'consent',
     });
+
+    const appUrlEnv = process.env.APP_URL?.trim();
+    let isAppUrlMatch = false;
+    if (appUrlEnv) {
+      try {
+        isAppUrlMatch = hostUrl.includes(new URL(appUrlEnv).hostname);
+      } catch {
+        isAppUrlMatch = false;
+      }
+    }
+
+    if (req.query.include_redirect_uri === 'true' || isAppUrlMatch) {
+      params.set('redirect_uri', redirectUri);
+    }
+
     return res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
   });
 
@@ -281,18 +312,34 @@ export function registerOAuthRoutes(
 
     try {
       // 1. Exchange code for token
+      const tokenBody: Record<string, string> = {
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+      };
+
+      // Only pass redirect_uri if explicitly requested or on matching host
+      const appUrlEnv = process.env.APP_URL?.trim();
+      let isAppUrlMatch = false;
+      if (appUrlEnv) {
+        try {
+          isAppUrlMatch = hostUrl.includes(new URL(appUrlEnv).hostname);
+        } catch {
+          isAppUrlMatch = false;
+        }
+      }
+
+      if (isAppUrlMatch || req.query.redirect_uri) {
+        tokenBody.redirect_uri = (req.query.redirect_uri as string) || redirectUri;
+      }
+
       const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-          code,
-          redirect_uri: redirectUri,
-        }),
+        body: JSON.stringify(tokenBody),
       });
 
       const tokenData = (await tokenRes.json()) as {
@@ -305,7 +352,7 @@ export function registerOAuthRoutes(
         return renderOAuthResult(res, {
           success: false,
           error: `GitHub token exchange failed: ${tokenData.error_description || tokenData.error || tokenRes.statusText}`,
-          hint: `Check that your Authorization callback URL in GitHub OAuth settings is: ${redirectUri}`,
+          hint: `Ensure the Authorization callback URL in GitHub Developer Settings is: ${redirectUri}`,
         });
       }
 

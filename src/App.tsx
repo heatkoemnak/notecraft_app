@@ -116,6 +116,13 @@ export default function App() {
 
   // Resolve authentication session & backend mode on mount
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    if (code && !params.get('error')) {
+      window.location.href = `/api/auth/github/callback?code=${encodeURIComponent(code)}`;
+      return;
+    }
+
     let cancelled = false;
     fetchAuthSession().then(({ storage, user }) => {
       if (cancelled) return;
