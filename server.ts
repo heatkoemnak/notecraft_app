@@ -17,12 +17,12 @@ import {
 import { ensureSchema, getPool, seedUserWorkspace } from './server/db.ts';
 import {
   GroqProofreadError,
-  ProofreadMode,
+  type ProofreadMode,
   proofreadWithGroq,
 } from './server/groqProofread.ts';
 import {
-  GenerateDocLength,
-  GenerateDocType,
+  type GenerateDocLength,
+  type GenerateDocType,
   generateDocumentWithGroq,
 } from './server/groqGenerate.ts';
 
