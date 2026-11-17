@@ -1,3 +1,5 @@
+import { normalizeTableTheme, TableThemeId } from './tableThemes';
+
 export type DocBlock =
   | { id: string; type: 'heading'; level: 1 | 2 | 3 | 4; text: string }
   | { id: string; type: 'paragraph'; text: string }
@@ -13,6 +15,7 @@ export type DocBlock =
       alignments: ('left' | 'center' | 'right')[];
       rows: string[][];
       colWidths?: number[];
+      theme?: TableThemeId;
     }
   | { id: string; type: 'image'; alt: string; src: string }
   | { id: string; type: 'file'; label: string; src: string }
@@ -299,23 +302,43 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
       continue;
     }
 
-    // Optional table column widths comment right before a GFM table
+    // Optional table metadata comments (table-theme / table-widths) right before a GFM table
     let pendingColWidths: number[] | undefined;
-    const widthCommentMatch = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/.exec(line);
-    if (widthCommentMatch) {
-      let tableStart = i + 1;
-      while (tableStart < lines.length && !lines[tableStart].trim()) {
-        tableStart += 1;
+    let pendingTheme: TableThemeId | undefined;
+    const widthCommentRegex = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/;
+    const themeCommentRegex = /^\s*<!--\s*table-theme:\s*([a-zA-Z0-9_-]+)\s*-->\s*$/;
+
+    if (widthCommentRegex.test(line) || themeCommentRegex.test(line)) {
+      let scanIdx = i;
+      while (scanIdx < lines.length) {
+        const currentMeta = lines[scanIdx];
+        if (!currentMeta.trim()) {
+          scanIdx += 1;
+          continue;
+        }
+        const wm = widthCommentRegex.exec(currentMeta);
+        if (wm) {
+          pendingColWidths = wm[1]
+            .split(',')
+            .map((n) => Math.max(72, Math.min(800, Math.round(Number(n.trim()) || 140))));
+          scanIdx += 1;
+          continue;
+        }
+        const tm = themeCommentRegex.exec(currentMeta);
+        if (tm) {
+          pendingTheme = normalizeTableTheme(tm[1]);
+          scanIdx += 1;
+          continue;
+        }
+        break;
       }
+
       if (
-        tableStart + 1 < lines.length &&
-        lines[tableStart].includes('|') &&
-        isTableSeparatorLine(lines[tableStart + 1])
+        scanIdx + 1 < lines.length &&
+        lines[scanIdx].includes('|') &&
+        isTableSeparatorLine(lines[scanIdx + 1])
       ) {
-        pendingColWidths = widthCommentMatch[1]
-          .split(',')
-          .map((n) => Math.max(72, Math.min(800, Math.round(Number(n.trim()) || 140))));
-        i = tableStart;
+        i = scanIdx;
       } else {
         i += 1;
         continue;
@@ -347,6 +370,7 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
         alignments,
         rows,
         ...(normalizedWidths ? { colWidths: normalizedWidths } : {}),
+        ...(pendingTheme && pendingTheme !== 'default' ? { theme: pendingTheme } : {}),
       });
       continue;
     }
@@ -419,7 +443,7 @@ export function parseMarkdownToBlocks(markdown: string): DocBlock[] {
         /^\s*(?:[-*+])\s+\[[ xX]\]\s+/.test(next) ||
         /^\s*[-*+]\s+/.test(next) ||
         /^\s*\d+\.\s+/.test(next) ||
-        /^\s*<!--\s*table-widths:/.test(next) ||
+        /^\s*<!--\s*table-(?:widths|theme):/.test(next) ||
         (next.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1]))
       ) {
         break;
@@ -507,11 +531,15 @@ export function serializeBlocksToMarkdown(blocks: DocBlock[]): string {
               (row[idx] || '').replace(/\|/g, '\\|')
             ).join(' | ')} |`
         );
+        const themeComment =
+          block.theme && block.theme !== 'default'
+            ? `<!-- table-theme: ${block.theme} -->\n`
+            : '';
         const widthComment =
           block.colWidths && block.colWidths.length === colCount
             ? `<!-- table-widths: ${block.colWidths.map((w) => Math.round(w)).join(',')} -->\n`
             : '';
-        serialized = `${widthComment}${[headerLine, sepLine, ...rowLines].join('\n')}`;
+        serialized = `${themeComment}${widthComment}${[headerLine, sepLine, ...rowLines].join('\n')}`;
         break;
       }
       case 'image': {

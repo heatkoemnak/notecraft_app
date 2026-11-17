@@ -7,6 +7,7 @@ import {
   resolveMarkdownImagesForExport,
 } from './imageStore';
 import { isDiagramLanguage, renderMermaidSvg } from './mermaidRenderer';
+import { getTableTheme } from './tableThemes';
 
 function slugifyTitle(title: string): string {
   return (
@@ -573,6 +574,7 @@ export async function exportNoteAsDocx(note: NoteDocument): Promise<void> {
       }
 
       case 'table': {
+        const theme = getTableTheme(block.theme);
         const colCount = Math.max(1, block.headers.length);
         const totalTwips = 9000;
         const widthsTwips =
@@ -587,30 +589,53 @@ export async function exportNoteAsDocx(note: NoteDocument): Promise<void> {
 
         const gridCols = widthsTwips.map((w) => `<w:gridCol w:w="${w}"/>`).join('');
 
-        const renderCell = (text: string, widthTwips: number, isHeader: boolean) => {
-          const shd = isHeader
-            ? '<w:shd w:val="clear" w:color="auto" w:fill="F3F4F6"/>'
+        const renderCell = (
+          text: string,
+          widthTwips: number,
+          isHeader: boolean,
+          rowIndex: number
+        ) => {
+          const fillHex = isHeader
+            ? theme.docx.headerFill
+            : rowIndex % 2 === 1 && theme.docx.stripeFill
+            ? theme.docx.stripeFill
             : '';
+          const shd =
+            fillHex && fillHex !== 'FFFFFF'
+              ? `<w:shd w:val="clear" w:color="auto" w:fill="${fillHex}"/>`
+              : '';
           return `<w:tc><w:tcPr><w:tcW w:w="${widthTwips}" w:type="dxa"/>${shd}</w:tcPr><w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>${renderRunsXml(
             parseInlineRuns(text),
-            { bold: isHeader, sizeHalfPt: 20, color: '1F2937' }
+            {
+              bold: isHeader,
+              sizeHalfPt: 20,
+              color: isHeader ? theme.docx.headerTextColor : '1F2937',
+            }
           )}</w:p></w:tc>`;
         };
 
         const headerRowXml = `<w:tr>${block.headers
-          .map((h, idx) => renderCell(h, widthsTwips[idx], true))
+          .map((h, idx) => renderCell(h, widthsTwips[idx], true, 0))
           .join('')}</w:tr>`;
         const bodyRowsXml = block.rows
           .map(
-            (row) =>
+            (row, rowIdx) =>
               `<w:tr>${block.headers
-                .map((_, idx) => renderCell(row[idx] || '', widthsTwips[idx], false))
+                .map((_, idx) => renderCell(row[idx] || '', widthsTwips[idx], false, rowIdx))
                 .join('')}</w:tr>`
           )
           .join('');
 
+        const outerBorderXml =
+          theme.id === 'minimal'
+            ? '<w:top w:val="none"/><w:left w:val="none"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="D1D5DB"/><w:right w:val="none"/>'
+            : `<w:top w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.outerBorderColor}"/><w:left w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.outerBorderColor}"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.outerBorderColor}"/><w:right w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.outerBorderColor}"/>`;
+        const insideVXml = theme.docx.insideVColor
+          ? `<w:insideV w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.insideVColor}"/>`
+          : '<w:insideV w:val="none"/>';
+
         bodyParts.push(
-          `<w:tbl><w:tblPr><w:tblW w:w="${totalTwips}" w:type="dxa"/><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="D1D5DB"/><w:left w:val="single" w:sz="4" w:space="0" w:color="D1D5DB"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="D1D5DB"/><w:right w:val="single" w:sz="4" w:space="0" w:color="D1D5DB"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="E5E7EB"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="E5E7EB"/></w:tblBorders><w:tblCellMar><w:top w:w="90" w:type="dxa"/><w:left w:w="130" w:type="dxa"/><w:bottom w:w="90" w:type="dxa"/><w:right w:w="130" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${gridCols}</w:tblGrid>${headerRowXml}${bodyRowsXml}</w:tbl>`
+          `<w:tbl><w:tblPr><w:tblW w:w="${totalTwips}" w:type="dxa"/><w:tblBorders>${outerBorderXml}<w:insideH w:val="single" w:sz="4" w:space="0" w:color="${theme.docx.insideHColor}"/>${insideVXml}</w:tblBorders><w:tblCellMar><w:top w:w="90" w:type="dxa"/><w:left w:w="130" w:type="dxa"/><w:bottom w:w="90" w:type="dxa"/><w:right w:w="130" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${gridCols}</w:tblGrid>${headerRowXml}${bodyRowsXml}</w:tbl>`
         );
         bodyParts.push('<w:p><w:pPr><w:spacing w:before="40" w:after="80"/></w:pPr></w:p>');
         break;
@@ -825,6 +850,7 @@ async function renderBlockToPrintHtml(
       )}</div><pre><code>${linesHtml}</code></pre></div>`;
     }
     case 'table': {
+      const theme = getTableTheme(block.theme);
       const colCount = Math.max(1, block.headers.length);
       const hasWidths = block.colWidths && block.colWidths.length === colCount;
       const totalPx = hasWidths
@@ -835,18 +861,33 @@ async function renderBlockToPrintHtml(
             .map((w) => `<col style="width:${((w / totalPx) * 100).toFixed(2)}%"/>`)
             .join('')}</colgroup>`
         : '';
+      const thStyle = `background:${theme.pdf.headerBg};color:${theme.pdf.headerColor};border-bottom:${theme.pdf.headerBottomBorder};`;
       const headersHtml = block.headers
-        .map((h) => `<th>${runsToHtml(parseInlineRuns(h))}</th>`)
-        .join('');
-      const rowsHtml = block.rows
         .map(
-          (row) =>
-            `<tr>${block.headers
-              .map((_, idx) => `<td>${runsToHtml(parseInlineRuns(row[idx] || ''))}</td>`)
-              .join('')}</tr>`
+          (h, idx) =>
+            `<th style="${thStyle}${
+              idx > 0 ? `border-left:${theme.pdf.verticalBorder};` : ''
+            }">${runsToHtml(parseInlineRuns(h))}</th>`
         )
         .join('');
-      return `<div class="table-wrap"><table class="${
+      const rowsHtml = block.rows
+        .map((row, rowIdx) => {
+          const rowBg = rowIdx % 2 === 1 ? theme.pdf.stripeBg : 'transparent';
+          return `<tr style="background:${rowBg};">${block.headers
+            .map(
+              (_, idx) =>
+                `<td style="border-top:${theme.pdf.rowTopBorder};${
+                  idx > 0 ? `border-left:${theme.pdf.verticalBorder};` : ''
+                }">${runsToHtml(parseInlineRuns(row[idx] || ''))}</td>`
+            )
+            .join('')}</tr>`;
+        })
+        .join('');
+      const wrapStyle =
+        theme.id === 'minimal'
+          ? 'border:0;border-radius:0;'
+          : `border:${theme.pdf.wrapperBorder};`;
+      return `<div class="table-wrap" style="${wrapStyle}"><table class="${
         hasWidths ? 'fixed' : ''
       }">${colgroup}<thead><tr>${headersHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
     }

@@ -23,10 +23,12 @@ import {
   Redo2,
   Search,
   Share2,
+  Sparkles,
   Star,
   Table,
   Type,
   Undo2,
+  Wand2,
   Workflow,
 } from 'lucide-react';
 import { NoteSelection, NoteUpdateMeta } from '../hooks/useNoteHistory';
@@ -39,10 +41,18 @@ import {
 } from '../utils/markdown';
 import { importSingleFile } from '../utils/fileImporter';
 import { isImageFile, saveImageFile } from '../utils/imageStore';
+import { AiProofreadModal } from './AiProofreadModal';
+import { AiWriteDocumentModal } from './AiWriteDocumentModal';
 import { DiagramBuilderModal } from './DiagramBuilderModal';
 import { ImageInsertModal } from './ImageInsertModal';
 import { LiveDocumentEditor, LiveDocumentEditorHandle } from './LiveDocumentEditor';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import {
+  BlockStyleOption,
+  SelectionAnchorRect,
+  SelectionFormatState,
+  TextSelectionPopover,
+} from './TextSelectionPopover';
 
 interface DocumentWorkspaceProps {
   note: NoteDocument | null;
@@ -148,6 +158,20 @@ export function DocumentWorkspace({
     return 'kantumruy';
   });
 
+  const textareaPopoverRef = useRef<HTMLDivElement>(null);
+  const [textareaPopover, setTextareaPopover] = useState<{
+    anchorRect: SelectionAnchorRect;
+    start: number;
+    end: number;
+  } | null>(null);
+  const [textareaLinkOpen, setTextareaLinkOpen] = useState(false);
+  const [textareaAiOpen, setTextareaAiOpen] = useState(false);
+  const [aiModalState, setAiModalState] = useState<{
+    open: boolean;
+    selectedText: string;
+  }>({ open: false, selectedText: '' });
+  const [aiWriteModalOpen, setAiWriteModalOpen] = useState(false);
+
   useEffect(() => {
     try {
       localStorage.setItem(EDITOR_FONT_STORAGE_KEY, editorFont);
@@ -155,6 +179,46 @@ export function DocumentWorkspace({
       // ignore storage errors
     }
   }, [editorFont]);
+
+  useEffect(() => {
+    setTextareaPopover(null);
+    setTextareaLinkOpen(false);
+  }, [note?.id, viewMode]);
+
+  useEffect(() => {
+    if (!textareaPopover) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (textareaPopoverRef.current && textareaPopoverRef.current.contains(target)) {
+        return;
+      }
+      if (textareaRef.current && textareaRef.current.contains(target)) {
+        return;
+      }
+      setTextareaLinkOpen(false);
+      setTextareaPopover(null);
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setTextareaLinkOpen(false);
+        setTextareaAiOpen(false);
+        setTextareaPopover(null);
+      }
+    };
+    const handleScroll = () => {
+      if (!textareaLinkOpen && !textareaAiOpen) {
+        setTextareaPopover(null);
+      }
+    };
+    window.addEventListener('pointerdown', handlePointerDown);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('scroll', handleScroll, true);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('scroll', handleScroll, true);
+    };
+  }, [textareaPopover, textareaLinkOpen, textareaAiOpen]);
 
   const syncTextareaSelection = (el: HTMLTextAreaElement) => {
     const start = el.selectionStart ?? 0;
@@ -345,6 +409,165 @@ export function DocumentWorkspace({
       textarea.setSelectionRange(nextSelStart, nextSelEnd);
       setHasSelection(nextSelEnd > nextSelStart);
     });
+  };
+
+  const maybeOpenTextareaPopover = (
+    el: HTMLTextAreaElement,
+    clientX: number,
+    clientY: number
+  ) => {
+    if (isReadOnly || viewMode === 'read') return;
+    window.requestAnimationFrame(() => {
+      const start = el.selectionStart ?? 0;
+      const end = el.selectionEnd ?? start;
+      if (end > start && el.value.slice(start, end).trim().length > 0) {
+        setTextareaPopover({
+          anchorRect: {
+            top: clientY - 8,
+            bottom: clientY + 12,
+            left: clientX,
+            width: 1,
+          },
+          start,
+          end,
+        });
+      } else if (!textareaLinkOpen) {
+        setTextareaPopover(null);
+      }
+    });
+  };
+
+  const textareaActiveFormats: SelectionFormatState = useMemo(() => {
+    if (!note || !textareaPopover) {
+      return { bold: false, italic: false, strike: false, code: false, linkHref: null };
+    }
+    const selText = note.content.slice(textareaPopover.start, textareaPopover.end);
+    const linkMatch = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(selText.trim());
+    return {
+      bold: selText.startsWith('**') && selText.endsWith('**') && selText.length > 4,
+      italic:
+        selText.startsWith('*') &&
+        selText.endsWith('*') &&
+        !selText.startsWith('**') &&
+        selText.length > 2,
+      strike: selText.startsWith('~~') && selText.endsWith('~~') && selText.length > 4,
+      code: selText.startsWith('`') && selText.endsWith('`') && selText.length > 2,
+      linkHref: linkMatch ? linkMatch[2] : null,
+    };
+  }, [note, textareaPopover]);
+
+  const applyTextareaReplace = (
+    start: number,
+    end: number,
+    replacement: string,
+    selectInserted = true
+  ) => {
+    if (!note) return;
+    const textarea = textareaRef.current;
+    const scrollTop = textarea?.scrollTop ?? 0;
+    const nextContent = note.content.slice(0, start) + replacement + note.content.slice(end);
+    const nextStart = selectInserted ? start : start + replacement.length;
+    const nextEnd = start + replacement.length;
+    lastTextareaSelectionRef.current = { start: nextStart, end: nextEnd };
+    onUpdateNote(
+      note.id,
+      { content: nextContent },
+      {
+        source: 'discrete',
+        field: 'content',
+        prevSelection: { target: 'content', start, end },
+        nextSelection: { target: 'content', start: nextStart, end: nextEnd },
+      }
+    );
+    window.requestAnimationFrame(() => {
+      if (!textarea) return;
+      textarea.focus();
+      textarea.scrollTop = scrollTop;
+      textarea.setSelectionRange(nextStart, nextEnd);
+      setHasSelection(nextEnd > nextStart);
+      if (nextEnd > nextStart) {
+        setTextareaPopover((prev) =>
+          prev ? { ...prev, start: nextStart, end: nextEnd } : null
+        );
+      } else {
+        setTextareaPopover(null);
+      }
+    });
+  };
+
+  const handleTextareaToggleFormat = (format: 'bold' | 'italic' | 'strike' | 'code') => {
+    if (!note || !textareaPopover) return;
+    const { start, end } = textareaPopover;
+    const selected = note.content.slice(start, end);
+    const marker =
+      format === 'bold' ? '**' : format === 'italic' ? '*' : format === 'strike' ? '~~' : '`';
+
+    const alreadyWrapped =
+      selected.startsWith(marker) &&
+      selected.endsWith(marker) &&
+      selected.length > marker.length * 2 &&
+      !(marker === '*' && selected.startsWith('**'));
+
+    const replacement = alreadyWrapped
+      ? selected.slice(marker.length, -marker.length)
+      : `${marker}${selected}${marker}`;
+    applyTextareaReplace(start, end, replacement);
+  };
+
+  const handleTextareaClearFormatting = () => {
+    if (!note || !textareaPopover) return;
+    const { start, end } = textareaPopover;
+    const selected = note.content.slice(start, end);
+    const cleaned = selected
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/~~([^~]+)~~/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1');
+    applyTextareaReplace(start, end, cleaned);
+  };
+
+  const handleTextareaApplyLink = (rawUrl: string) => {
+    setTextareaLinkOpen(false);
+    if (!note || !textareaPopover) return;
+    const { start, end } = textareaPopover;
+    const selected = note.content.slice(start, end);
+    const trimmed = rawUrl.trim();
+    const url = /^(https?:|mailto:|\/|#)/i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    const existing = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(selected.trim());
+    const label = existing ? existing[1] : selected;
+    applyTextareaReplace(start, end, `[${label}](${url})`);
+  };
+
+  const handleTextareaRemoveLink = () => {
+    setTextareaLinkOpen(false);
+    if (!note || !textareaPopover) return;
+    const { start, end } = textareaPopover;
+    const selected = note.content.slice(start, end);
+    const unwrapped = selected.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
+    applyTextareaReplace(start, end, unwrapped);
+  };
+
+  const handleTextareaChangeBlockStyle = (kind: BlockStyleOption) => {
+    if (!note || !textareaPopover) return;
+    const { start, end } = textareaPopover;
+    const lineStart = note.content.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+    const rawLineEnd = note.content.indexOf('\n', end);
+    const lineEnd = rawLineEnd === -1 ? note.content.length : rawLineEnd;
+    const lineText = note.content.slice(lineStart, lineEnd);
+    const stripped = lineText.replace(/^(?:#{1,4}\s+|>\s+|-\s+\[[ xX]\]\s+|[-*+]\s+|\d+\.\s+)/, '');
+    const prefixMap: Record<BlockStyleOption, string> = {
+      paragraph: '',
+      h1: '# ',
+      h2: '## ',
+      h3: '### ',
+      blockquote: '> ',
+      'bullet-item': '- ',
+      'ordered-item': '1. ',
+      'task-item': '- [ ] ',
+    };
+    applyTextareaReplace(lineStart, lineEnd, `${prefixMap[kind]}${stripped}`, false);
   };
 
   const handleInsertSnippet = (snippet: Snippet) => {
@@ -1002,6 +1225,37 @@ export function DocumentWorkspace({
               <>
             <button
               type="button"
+              onClick={() => setAiWriteModalOpen(true)}
+              title="Write a whole document with Groq AI"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Wand2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+              <span>AI Write</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                const selected =
+                  viewMode === 'read'
+                    ? liveEditorRef.current?.getSelectedText() || ''
+                    : textareaRef.current
+                    ? note.content.slice(
+                        textareaRef.current.selectionStart,
+                        textareaRef.current.selectionEnd
+                      )
+                    : '';
+                setAiModalState({ open: true, selectedText: selected });
+              }}
+              title="Improve spelling and grammar with Groq AI"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+              <span>AI Proofread</span>
+            </button>
+
+            <button
+              type="button"
               onClick={handleSaveSelectionAsSnippet}
               className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer whitespace-nowrap"
             >
@@ -1142,11 +1396,15 @@ export function DocumentWorkspace({
                 readOnly={isReadOnly}
                 value={note.content}
                 onFocus={(e) => syncTextareaSelection(e.currentTarget)}
-                onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onMouseUp={(e) => {
+                  syncTextareaSelection(e.currentTarget);
+                  maybeOpenTextareaPopover(e.currentTarget, e.clientX, e.clientY);
+                }}
                 onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onCut={(e) => syncTextareaSelection(e.currentTarget)}
                 onChange={(e) => {
                   if (isReadOnly) return;
+                  setTextareaPopover(null);
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTextareaSelectionRef.current;
@@ -1288,11 +1546,15 @@ export function DocumentWorkspace({
                 readOnly={isReadOnly}
                 value={note.content}
                 onFocus={(e) => syncTextareaSelection(e.currentTarget)}
-                onMouseUp={(e) => syncTextareaSelection(e.currentTarget)}
+                onMouseUp={(e) => {
+                  syncTextareaSelection(e.currentTarget);
+                  maybeOpenTextareaPopover(e.currentTarget, e.clientX, e.clientY);
+                }}
                 onKeyUp={(e) => syncTextareaSelection(e.currentTarget)}
                 onCut={(e) => syncTextareaSelection(e.currentTarget)}
                 onChange={(e) => {
                   if (isReadOnly) return;
+                  setTextareaPopover(null);
                   const nextStart = e.target.selectionStart ?? e.target.value.length;
                   const nextEnd = e.target.selectionEnd ?? nextStart;
                   const prevSel = lastTextareaSelectionRef.current;
@@ -1515,6 +1777,87 @@ export function DocumentWorkspace({
         isOpen={imageModalOpen}
         onClose={() => setImageModalOpen(false)}
         onInsert={handleInsertImageMarkdown}
+      />
+
+      <TextSelectionPopover
+        open={Boolean(textareaPopover) && !isReadOnly && viewMode !== 'read'}
+        anchorRect={textareaPopover?.anchorRect ?? null}
+        canChangeBlockType={true}
+        activeFormats={textareaActiveFormats}
+        linkEditorOpen={textareaLinkOpen}
+        popoverRef={textareaPopoverRef}
+        onToggleFormat={handleTextareaToggleFormat}
+        onClearFormatting={handleTextareaClearFormatting}
+        onChangeBlockType={handleTextareaChangeBlockStyle}
+        onOpenLinkEditor={() => setTextareaLinkOpen(true)}
+        onCloseLinkEditor={() => setTextareaLinkOpen(false)}
+        onApplyLink={handleTextareaApplyLink}
+        onRemoveLink={handleTextareaRemoveLink}
+        onGetSelectedText={() =>
+          note && textareaPopover
+            ? note.content.slice(textareaPopover.start, textareaPopover.end)
+            : ''
+        }
+        onApplyAiText={(correctedText) => {
+          if (!textareaPopover) return;
+          applyTextareaReplace(
+            textareaPopover.start,
+            textareaPopover.end,
+            correctedText
+          );
+        }}
+        onAiPanelOpenChange={setTextareaAiOpen}
+      />
+
+      <AiProofreadModal
+        isOpen={aiModalState.open}
+        documentTitle={note.title}
+        fullText={note.content}
+        selectedText={aiModalState.selectedText}
+        onClose={() => setAiModalState({ open: false, selectedText: '' })}
+        onApply={(correctedText, scope) => {
+          if (scope === 'selection') {
+            if (viewMode === 'read' && liveEditorRef.current?.replaceSelectedText(correctedText)) {
+              return;
+            }
+            if (viewMode !== 'read' && textareaRef.current) {
+              const start = textareaRef.current.selectionStart;
+              const end = textareaRef.current.selectionEnd;
+              if (end > start) {
+                applyTextareaReplace(start, end, correctedText);
+                return;
+              }
+            }
+          }
+          onUpdateNote(
+            note.id,
+            { content: correctedText },
+            { source: 'discrete', field: 'content' }
+          );
+        }}
+      />
+
+      <AiWriteDocumentModal
+        isOpen={aiWriteModalOpen}
+        currentTitle={note.title}
+        currentContent={note.content}
+        onClose={() => setAiWriteModalOpen(false)}
+        onApply={({ title, content, mode }) => {
+          const nextContent =
+            mode === 'append' && note.content.trim()
+              ? `${note.content.trimEnd()}\n\n${content}`
+              : content;
+          const patch: Partial<Pick<NoteDocument, 'title' | 'content'>> = {
+            content: nextContent,
+          };
+          if (title && title.trim()) {
+            patch.title = title.trim();
+          }
+          onUpdateNote(note.id, patch, {
+            source: 'discrete',
+            field: 'content',
+          });
+        }}
       />
 
       <DiagramBuilderModal

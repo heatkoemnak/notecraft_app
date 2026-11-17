@@ -15,6 +15,16 @@ import {
   verifyPassword,
 } from './server/auth.ts';
 import { ensureSchema, getPool, seedUserWorkspace } from './server/db.ts';
+import {
+  GroqProofreadError,
+  ProofreadMode,
+  proofreadWithGroq,
+} from './server/groqProofread.ts';
+import {
+  GenerateDocLength,
+  GenerateDocType,
+  generateDocumentWithGroq,
+} from './server/groqGenerate.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -905,6 +915,103 @@ async function startServer() {
     } catch (err) {
       console.error('Failed to fetch file from PostgreSQL:', err);
       return res.status(500).json({ error: 'Failed to fetch file' });
+    }
+  });
+
+  // AI: improve spelling & grammar using Groq AI
+  app.post('/api/ai/proofread', async (req, res) => {
+    try {
+      const { text, mode } = (req.body || {}) as { text?: unknown; mode?: unknown };
+      if (typeof text !== 'string' || !text.trim()) {
+        return res.status(400).json({ error: 'Text to proofread is required' });
+      }
+      if (text.length > 30000) {
+        return res.status(400).json({
+          error: 'Text exceeds the 30,000 character limit. Try proofreading a smaller section.',
+        });
+      }
+
+      const validMode: ProofreadMode =
+        mode === 'spelling' || mode === 'clarity' || mode === 'proofread'
+          ? mode
+          : 'proofread';
+
+      const result = await proofreadWithGroq({ text, mode: validMode });
+      return res.json(result);
+    } catch (err) {
+      if (err instanceof GroqProofreadError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('Groq AI proofread failed:', err);
+      return res.status(500).json({ error: 'Failed to proofread text with Groq AI' });
+    }
+  });
+
+  // AI: write a whole document using Groq AI
+  app.post('/api/ai/generate-document', async (req, res) => {
+    try {
+      const {
+        prompt,
+        docType,
+        length,
+        includeTables,
+        includeDiagrams,
+        includeCode,
+        existingTitle,
+        existingContent,
+      } = (req.body || {}) as {
+        prompt?: unknown;
+        docType?: unknown;
+        length?: unknown;
+        includeTables?: unknown;
+        includeDiagrams?: unknown;
+        includeCode?: unknown;
+        existingTitle?: unknown;
+        existingContent?: unknown;
+      };
+
+      if (typeof prompt !== 'string' || !prompt.trim()) {
+        return res.status(400).json({ error: 'Describe what document you need first' });
+      }
+      if (prompt.length > 8000) {
+        return res.status(400).json({
+          error: 'Prompt exceeds the 8,000 character limit.',
+        });
+      }
+
+      const validDocType: GenerateDocType =
+        docType === 'spec' ||
+        docType === 'runbook' ||
+        docType === 'api' ||
+        docType === 'meeting' ||
+        docType === 'guide' ||
+        docType === 'general'
+          ? docType
+          : 'general';
+
+      const validLength: GenerateDocLength =
+        length === 'concise' || length === 'standard' || length === 'detailed'
+          ? length
+          : 'standard';
+
+      const result = await generateDocumentWithGroq({
+        prompt,
+        docType: validDocType,
+        length: validLength,
+        includeTables: Boolean(includeTables),
+        includeDiagrams: Boolean(includeDiagrams),
+        includeCode: Boolean(includeCode),
+        existingTitle: typeof existingTitle === 'string' ? existingTitle : undefined,
+        existingContent:
+          typeof existingContent === 'string' ? existingContent.slice(0, 15000) : undefined,
+      });
+      return res.json(result);
+    } catch (err) {
+      if (err instanceof GroqProofreadError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('Groq AI document generation failed:', err);
+      return res.status(500).json({ error: 'Failed to generate document with Groq AI' });
     }
   });
 

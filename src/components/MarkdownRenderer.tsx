@@ -13,6 +13,7 @@ import { isDiagramLanguage } from '../utils/mermaidRenderer';
 import { DiagramBlock } from './DiagramBlock';
 import { FileAttachmentCard } from './FileAttachmentCard';
 import { ImageLightbox, LightboxImageItem } from './ImageLightbox';
+import { getTableTheme, TableThemeConfig } from '../utils/tableThemes';
 
 interface MarkdownRendererProps {
   content: string;
@@ -21,6 +22,8 @@ interface MarkdownRendererProps {
 
 const GalleryContext = createContext(false);
 const LightboxTriggerContext = createContext<((src: string, alt: string) => void) | null>(null);
+const TableThemeContext = createContext<TableThemeConfig>(getTableTheme('default'));
+const InTheadContext = createContext(false);
 
 interface SimpleMdastNode {
   type: string;
@@ -97,28 +100,64 @@ function remarkGroupImages() {
   };
 }
 
-function remarkTableWidths() {
+function remarkTableMetadata() {
+  const widthRegex = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/;
+  const themeRegex = /^\s*<!--\s*table-theme:\s*([a-zA-Z0-9_-]+)\s*-->\s*$/;
+
   return (tree: SimpleMdastNode) => {
     if (!tree.children || !Array.isArray(tree.children)) return;
     const nextChildren: SimpleMdastNode[] = [];
-    for (let i = 0; i < tree.children.length; i += 1) {
+    let i = 0;
+
+    while (i < tree.children.length) {
       const current = tree.children[i];
-      if (current.type === 'html' && typeof current.value === 'string') {
-        const match = /^\s*<!--\s*table-widths:\s*([0-9,\s]+)\s*-->\s*$/.exec(current.value);
-        const nextNode = tree.children[i + 1];
-        if (match && nextNode && nextNode.type === 'table') {
+      if (
+        current.type === 'html' &&
+        typeof current.value === 'string' &&
+        (widthRegex.test(current.value) || themeRegex.test(current.value))
+      ) {
+        let scanIdx = i;
+        let colWidths: string | null = null;
+        let tableTheme: string | null = null;
+
+        while (scanIdx < tree.children.length) {
+          const candidate = tree.children[scanIdx];
+          if (candidate.type !== 'html' || typeof candidate.value !== 'string') break;
+          const wm = widthRegex.exec(candidate.value);
+          if (wm) {
+            colWidths = wm[1].replace(/\s+/g, '');
+            scanIdx += 1;
+            continue;
+          }
+          const tm = themeRegex.exec(candidate.value);
+          if (tm) {
+            tableTheme = tm[1].trim().toLowerCase();
+            scanIdx += 1;
+            continue;
+          }
+          break;
+        }
+
+        const nextNode = tree.children[scanIdx];
+        if (nextNode && nextNode.type === 'table') {
           nextNode.data = {
             ...(nextNode.data || {}),
             hProperties: {
               ...((nextNode.data?.hProperties as Record<string, unknown>) || {}),
-              'data-col-widths': match[1].replace(/\s+/g, ''),
+              ...(colWidths ? { 'data-col-widths': colWidths } : {}),
+              ...(tableTheme ? { 'data-table-theme': tableTheme } : {}),
             },
           };
+          nextChildren.push(nextNode);
+          i = scanIdx + 1;
           continue;
         }
       }
+
       nextChildren.push(current);
+      i += 1;
     }
+
     tree.children = nextChildren;
   };
 }
@@ -357,7 +396,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
     <LightboxTriggerContext.Provider value={handleOpenLightbox}>
       <div className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words">
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkGroupImages, remarkTableWidths]}
+          remarkPlugins={[remarkGfm, remarkGroupImages, remarkTableMetadata]}
           urlTransform={(url) => {
             if (
               url.startsWith(IMAGE_REF_PREFIX) ||
@@ -449,6 +488,9 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
             <strong className="font-semibold text-neutral-950 dark:text-white">{children}</strong>
           ),
           em: ({ children }) => <em className="italic text-neutral-700 dark:text-neutral-300">{children}</em>,
+          del: ({ children }) => (
+            <del className="line-through text-neutral-500 dark:text-neutral-400">{children}</del>
+          ),
           a: ({ href, children }) => {
             if (href && href.startsWith(FILE_REF_PREFIX)) {
               return <FileAttachmentCard src={href} label={getNodeText(children)} />;
@@ -512,6 +554,10 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
           hr: () => <hr className="my-7 border-neutral-200 dark:border-white/[0.08]" />,
           table: ({ children, ...props }) => {
             const rawWidths = (props as Record<string, unknown>)['data-col-widths'];
+            const rawTheme = (props as Record<string, unknown>)['data-table-theme'];
+            const theme = getTableTheme(
+              typeof rawTheme === 'string' ? rawTheme : 'default'
+            );
             const colWidths =
               typeof rawWidths === 'string' && rawWidths.trim()
                 ? rawWidths
@@ -520,44 +566,62 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
                 : null;
             const totalWidth = colWidths ? colWidths.reduce((sum, w) => sum + w, 0) : null;
             return (
-              <div className="my-5 overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
-                <table
-                  style={
-                    totalWidth
-                      ? { width: `${totalWidth}px`, minWidth: '100%' }
-                      : undefined
-                  }
-                  className={`${
-                    colWidths ? 'table-fixed' : 'w-full'
-                  } border-collapse text-left text-[14px] tabular-nums`}
-                >
-                  {colWidths && (
-                    <colgroup>
-                      {colWidths.map((w, idx) => (
-                        <col key={idx} style={{ width: `${w}px` }} />
-                      ))}
-                    </colgroup>
-                  )}
-                  {children}
-                </table>
-              </div>
+              <TableThemeContext.Provider value={theme}>
+                <div className={`my-5 overflow-x-auto ${theme.wrapperClass}`}>
+                  <table
+                    style={
+                      totalWidth
+                        ? { width: `${totalWidth}px`, minWidth: '100%' }
+                        : undefined
+                    }
+                    className={`${
+                      colWidths ? 'table-fixed' : 'w-full'
+                    } border-collapse text-left text-[14px] tabular-nums ${theme.cellDividersClass}`}
+                  >
+                    {colWidths && (
+                      <colgroup>
+                        {colWidths.map((w, idx) => (
+                          <col key={idx} style={{ width: `${w}px` }} />
+                        ))}
+                      </colgroup>
+                    )}
+                    {children}
+                  </table>
+                </div>
+              </TableThemeContext.Provider>
             );
           },
-          thead: ({ children }) => (
-            <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
-              {children}
-            </thead>
-          ),
-          th: ({ children }) => (
-            <th className="px-4 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200 whitespace-nowrap">
-              {children}
-            </th>
-          ),
-          td: ({ children }) => (
-            <td className="px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top">
-              {children}
-            </td>
-          ),
+          thead: ({ children }) => {
+            const theme = useContext(TableThemeContext);
+            return (
+              <InTheadContext.Provider value={true}>
+                <thead className={theme.theadClass}>{children}</thead>
+              </InTheadContext.Provider>
+            );
+          },
+          tr: ({ children }) => {
+            const theme = useContext(TableThemeContext);
+            const inThead = useContext(InTheadContext);
+            return <tr className={inThead ? undefined : theme.trClass}>{children}</tr>;
+          },
+          th: ({ children }) => {
+            const theme = useContext(TableThemeContext);
+            return (
+              <th
+                className={`px-4 py-2.5 text-[12.5px] font-semibold whitespace-nowrap ${theme.thClass}`}
+              >
+                {children}
+              </th>
+            );
+          },
+          td: ({ children }) => {
+            const theme = useContext(TableThemeContext);
+            return (
+              <td className={`px-4 py-2.5 align-top ${theme.tdClass}`}>
+                {children}
+              </td>
+            );
+          },
           pre: ({ children }) => <>{children}</>,
           code: ({ className, children }) => {
             const match = /language-([a-zA-Z0-9_-]+)/.exec(className || '');

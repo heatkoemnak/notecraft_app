@@ -33,6 +33,8 @@ services:
       PGPASSWORD: ${PGPASSWORD:-notecraft_secret_password}
       PGDATABASE: ${PGDATABASE:-notecraft}
       PGSSL: "false"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
     ports:
       - "8080:3000"
 

@@ -39,11 +39,22 @@ import {
   parseMarkdownToBlocks,
   serializeBlocksToMarkdown,
 } from '../utils/markdownBlocks';
+import {
+  getTableTheme,
+  TABLE_THEMES,
+  TableThemeId,
+} from '../utils/tableThemes';
+import {
+  BlockStyleOption,
+  SelectionAnchorRect,
+  SelectionFormatState,
+  TextSelectionPopover,
+} from './TextSelectionPopover';
 
 export interface LiveDocumentEditorHandle {
-  applyInlineFormat: (format: 'bold' | 'italic' | 'code') => void;
+  applyInlineFormat: (format: 'bold' | 'italic' | 'strike' | 'code') => void;
   toggleOrInsertBlock: (
-    kind: 'h2' | 'h3' | 'paragraph' | 'blockquote' | 'task-item' | 'bullet-item' | 'ordered-item'
+    kind: 'h1' | 'h2' | 'h3' | 'paragraph' | 'blockquote' | 'task-item' | 'bullet-item' | 'ordered-item'
   ) => void;
   insertCodeBlock: (language?: string, code?: string) => void;
   updateCodeBlock: (blockId: string, nextCode: string) => void;
@@ -51,6 +62,7 @@ export interface LiveDocumentEditorHandle {
   insertDividerBlock: () => void;
   insertMarkdownContent: (markdown: string) => void;
   getSelectedText: () => string;
+  replaceSelectedText: (correctedMarkdown: string) => boolean;
 }
 
 interface LiveDocumentEditorProps {
@@ -175,6 +187,213 @@ function toggleInlineCodeSelection(el: HTMLElement): boolean {
   sel.removeAllRanges();
   sel.addRange(nextRange);
   return true;
+}
+
+function findAncestorElement(
+  node: Node | null,
+  tagNames: string[],
+  boundary: HTMLElement
+): HTMLElement | null {
+  let curr: Node | null = node;
+  while (curr && curr !== boundary) {
+    if (curr.nodeType === Node.ELEMENT_NODE) {
+      const el = curr as HTMLElement;
+      if (tagNames.includes(el.tagName.toUpperCase())) {
+        return el;
+      }
+    }
+    curr = curr.parentNode;
+  }
+  return null;
+}
+
+function inspectSelectionFormats(range: Range, richEl: HTMLElement): SelectionFormatState {
+  let bold = false;
+  let italic = false;
+  let strike = false;
+  try {
+    bold = document.queryCommandState('bold');
+    italic = document.queryCommandState('italic');
+    strike = document.queryCommandState('strikeThrough');
+  } catch {
+    // ignore browser queryCommandState errors
+  }
+
+  bold = bold || Boolean(findAncestorElement(range.startContainer, ['STRONG', 'B'], richEl));
+  italic = italic || Boolean(findAncestorElement(range.startContainer, ['EM', 'I'], richEl));
+  strike =
+    strike || Boolean(findAncestorElement(range.startContainer, ['DEL', 'S', 'STRIKE'], richEl));
+
+  const code = Boolean(
+    findAncestorElement(range.startContainer, ['CODE'], richEl) ||
+      findAncestorElement(range.endContainer, ['CODE'], richEl)
+  );
+
+  const linkEl =
+    findAncestorElement(range.startContainer, ['A'], richEl) ||
+    findAncestorElement(range.endContainer, ['A'], richEl) ||
+    findAncestorElement(range.commonAncestorContainer, ['A'], richEl);
+
+  return {
+    bold,
+    italic,
+    strike,
+    code,
+    linkHref: linkEl?.getAttribute('href') || null,
+  };
+}
+
+function normalizeLinkUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (/^(https?:|mailto:|\/|#)/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `https://${trimmed}`;
+}
+
+function unwrapElementPreservingChildren(el: HTMLElement): Node | null {
+  const parent = el.parentNode;
+  if (!parent) return null;
+  const firstChild = el.firstChild;
+  while (el.firstChild) {
+    parent.insertBefore(el.firstChild, el);
+  }
+  parent.removeChild(el);
+  return firstChild;
+}
+
+function applyLinkToRange(richEl: HTMLElement, range: Range, rawUrl: string): boolean {
+  const url = normalizeLinkUrl(rawUrl);
+  const sel = window.getSelection();
+  if (!sel) return false;
+
+  const existingAnchor =
+    findAncestorElement(range.startContainer, ['A'], richEl) ||
+    findAncestorElement(range.commonAncestorContainer, ['A'], richEl);
+
+  if (existingAnchor) {
+    existingAnchor.setAttribute('href', url);
+    existingAnchor.setAttribute('target', '_blank');
+    existingAnchor.setAttribute('rel', 'noopener noreferrer');
+    const nextRange = document.createRange();
+    nextRange.selectNodeContents(existingAnchor);
+    sel.removeAllRanges();
+    sel.addRange(nextRange);
+    return true;
+  }
+
+  if (range.collapsed) return false;
+
+  const fragment = range.extractContents();
+  const temp = document.createElement('div');
+  temp.appendChild(fragment);
+  temp.querySelectorAll('a').forEach((nested) => {
+    unwrapElementPreservingChildren(nested);
+  });
+
+  if (!temp.textContent?.trim()) return false;
+
+  const anchor = document.createElement('a');
+  anchor.setAttribute('href', url);
+  anchor.setAttribute('target', '_blank');
+  anchor.setAttribute('rel', 'noopener noreferrer');
+  while (temp.firstChild) {
+    anchor.appendChild(temp.firstChild);
+  }
+
+  range.insertNode(anchor);
+  const nextRange = document.createRange();
+  nextRange.selectNodeContents(anchor);
+  sel.removeAllRanges();
+  sel.addRange(nextRange);
+  return true;
+}
+
+function removeLinkFromRange(richEl: HTMLElement, range: Range): boolean {
+  const sel = window.getSelection();
+  if (!sel) return false;
+
+  const ancestorAnchor =
+    findAncestorElement(range.startContainer, ['A'], richEl) ||
+    findAncestorElement(range.endContainer, ['A'], richEl) ||
+    findAncestorElement(range.commonAncestorContainer, ['A'], richEl);
+
+  if (ancestorAnchor) {
+    const first = ancestorAnchor.firstChild;
+    const last = ancestorAnchor.lastChild;
+    unwrapElementPreservingChildren(ancestorAnchor);
+    if (first && last) {
+      const nextRange = document.createRange();
+      nextRange.setStartBefore(first);
+      nextRange.setEndAfter(last);
+      sel.removeAllRanges();
+      sel.addRange(nextRange);
+    }
+    return true;
+  }
+
+  const anchors = Array.from(richEl.querySelectorAll('a')).filter((a) => {
+    try {
+      return range.intersectsNode(a);
+    } catch {
+      return false;
+    }
+  });
+
+  if (anchors.length === 0) return false;
+  for (const a of anchors) {
+    unwrapElementPreservingChildren(a);
+  }
+  return true;
+}
+
+function clearFormattingInSelection(richEl: HTMLElement, range: Range): void {
+  const sel = window.getSelection();
+  if (!sel) return;
+
+  sel.removeAllRanges();
+  sel.addRange(range);
+  try {
+    document.execCommand('removeFormat');
+  } catch {
+    // ignore
+  }
+
+  if (sel.rangeCount === 0) return;
+  const activeRange = sel.getRangeAt(0);
+  const tagsToStrip = ['CODE', 'A', 'STRONG', 'B', 'EM', 'I', 'DEL', 'S', 'STRIKE'];
+
+  // Unwrap any ancestor inline tags enclosing the selection
+  for (const tag of ['CODE', 'A', 'DEL', 'S', 'STRIKE', 'STRONG', 'B', 'EM', 'I']) {
+    const anc = findAncestorElement(activeRange.commonAncestorContainer, [tag], richEl);
+    if (anc) {
+      const first = anc.firstChild;
+      const last = anc.lastChild;
+      unwrapElementPreservingChildren(anc);
+      if (first && last) {
+        const nextRange = document.createRange();
+        nextRange.setStartBefore(first);
+        nextRange.setEndAfter(last);
+        sel.removeAllRanges();
+        sel.addRange(nextRange);
+      }
+    }
+  }
+
+  // Unwrap any inline elements intersecting the selection
+  if (sel.rangeCount > 0) {
+    const current = sel.getRangeAt(0);
+    const elements = Array.from(richEl.querySelectorAll(tagsToStrip.join(',')));
+    for (const el of elements) {
+      try {
+        if (current.intersectsNode(el)) {
+          unwrapElementPreservingChildren(el as HTMLElement);
+        }
+      } catch {
+        // ignore detached node errors
+      }
+    }
+  }
 }
 
 function findInlineBacktickMatches(
@@ -359,6 +578,7 @@ interface RichInlineFieldProps {
   className: string;
   placeholder?: string;
   headingId?: string;
+  dataBlockId?: string;
   ariaLabel: string;
   registerRef?: (el: HTMLElement | null) => void;
   onFocusBlock: () => void;
@@ -373,6 +593,7 @@ function RichInlineField({
   className,
   placeholder,
   headingId,
+  dataBlockId,
   ariaLabel,
   registerRef,
   onFocusBlock,
@@ -416,10 +637,25 @@ function RichInlineField({
     }
   };
 
+  const emitFromDomRef = useRef(emitFromDom);
+  emitFromDomRef.current = emitFromDom;
+
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const handleSyncFromDom = () => {
+      emitFromDomRef.current(true);
+    };
+    el.addEventListener('notecraft:sync-dom', handleSyncFromDom);
+    return () => el.removeEventListener('notecraft:sync-dom', handleSyncFromDom);
+  }, []);
+
   return (
     <div
       ref={elRef}
       id={headingId}
+      data-rich-inline="true"
+      data-block-id={dataBlockId}
       contentEditable
       suppressContentEditableWarning
       role="textbox"
@@ -545,7 +781,7 @@ function RichInlineField({
           emitFromDom();
         }
       }}
-      className={`live-editable outline-none break-words [&_strong]:font-semibold [&_strong]:text-neutral-950 dark:[&_strong]:text-white [&_em]:italic [&_code]:font-mono-code [&_code]:text-[13px] [&_code]:px-1.5 [&_code]:py-[1px] [&_code]:rounded-md [&_code]:bg-neutral-100 dark:[&_code]:bg-white/[0.09] [&_code]:text-neutral-900 dark:[&_code]:text-neutral-100 [&_code]:border [&_code]:border-neutral-200/80 dark:[&_code]:border-white/[0.09] [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_a]:underline-offset-2 ${className}`}
+      className={`live-editable outline-none break-words [&_strong]:font-semibold [&_strong]:text-neutral-950 dark:[&_strong]:text-white [&_em]:italic [&_del]:line-through [&_del]:text-neutral-500 dark:[&_del]:text-neutral-400 [&_s]:line-through [&_strike]:line-through [&_code]:font-mono-code [&_code]:text-[13px] [&_code]:px-1.5 [&_code]:py-[1px] [&_code]:rounded-md [&_code]:bg-neutral-100 dark:[&_code]:bg-white/[0.09] [&_code]:text-neutral-900 dark:[&_code]:text-neutral-100 [&_code]:border [&_code]:border-neutral-200/80 dark:[&_code]:border-white/[0.09] [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_a]:underline-offset-2 ${className}`}
     />
   );
 }
@@ -839,6 +1075,7 @@ function EditableTableBlock({
   onInsertColumnAt,
   onDeleteColumn,
   onChangeColWidths,
+  onChangeTheme,
   onDeleteTable,
 }: {
   block: Extract<DocBlock, { type: 'table' }>;
@@ -852,6 +1089,7 @@ function EditableTableBlock({
   onInsertColumnAt: (insertIdx: number) => void;
   onDeleteColumn: (colIdx: number) => void;
   onChangeColWidths: (colWidths: number[] | undefined) => void;
+  onChangeTheme: (theme: TableThemeId) => void;
   onDeleteTable: () => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -1005,8 +1243,8 @@ function EditableTableBlock({
     e.preventDefault();
     e.stopPropagation();
 
-    const menuWidth = 216;
-    const menuHeight = 290;
+    const menuWidth = 228;
+    const menuHeight = 405;
     const clampedX = Math.max(
       8,
       Math.min(e.clientX, window.innerWidth - menuWidth - 8)
@@ -1052,6 +1290,7 @@ function EditableTableBlock({
 
   const syncSeq = externalSyncSeq + localSyncSeq;
   const canDeleteCol = block.headers.length > 1;
+  const activeTheme = getTableTheme(block.theme);
   const highlightedCell = contextMenu
     ? { rowIdx: contextMenu.rowIdx, colIdx: contextMenu.colIdx }
     : activeCell;
@@ -1072,7 +1311,7 @@ function EditableTableBlock({
 
   return (
     <div ref={wrapperRef} className="my-5">
-      <div className="overflow-x-auto rounded-xl border border-neutral-200 dark:border-white/[0.08]">
+      <div className={`overflow-x-auto ${activeTheme.wrapperClass}`}>
         <table
           ref={tableRef}
           onContextMenu={handleTableContextMenu}
@@ -1088,7 +1327,7 @@ function EditableTableBlock({
               ))}
             </colgroup>
           )}
-          <thead className="bg-neutral-100/80 dark:bg-white/[0.03] border-b border-neutral-200 dark:border-white/[0.08]">
+          <thead className={activeTheme.theadClass}>
             <tr>
               {block.headers.map((header, colIdx) => {
                 const isExactTarget =
@@ -1102,15 +1341,15 @@ function EditableTableBlock({
                     data-cell-col={colIdx}
                     onClick={(e) => focusCellPadding(e, -1, colIdx)}
                     onContextMenu={(e) => openContextMenuForCell(e, -1, colIdx)}
-                    className={`relative px-4 py-2.5 text-[12.5px] font-semibold text-neutral-700 dark:text-neutral-200 align-top transition-colors ${
-                      colIdx > 0 ? 'border-l border-neutral-200/70 dark:border-white/[0.06]' : ''
-                    } ${
+                    className={`relative px-4 py-2.5 text-[12.5px] font-semibold align-top transition-colors ${
+                      activeTheme.thClass
+                    } ${colIdx > 0 ? activeTheme.thDividerClass : ''} ${
                       resizingColIdx === colIdx
-                        ? 'bg-blue-500/[0.08]'
+                        ? 'bg-blue-500/[0.1]'
                         : isExactTarget
-                        ? 'bg-blue-500/[0.07] ring-1 ring-inset ring-blue-500/45'
+                        ? 'bg-blue-500/[0.08] ring-1 ring-inset ring-blue-500/45'
                         : isActiveCol
-                        ? 'bg-blue-500/[0.03]'
+                        ? 'bg-blue-500/[0.04]'
                         : ''
                     }`}
                   >
@@ -1165,10 +1404,7 @@ function EditableTableBlock({
             {block.rows.map((row, rowIdx) => {
               const isActiveRow = highlightedCell?.rowIdx === rowIdx;
               return (
-                <tr
-                  key={rowIdx}
-                  className="hover:bg-neutral-50/70 dark:hover:bg-white/[0.015] transition-colors"
-                >
+                <tr key={rowIdx} className={activeTheme.trClass}>
                   {block.headers.map((_, colIdx) => {
                     const isExactTarget =
                       isActiveRow && highlightedCell?.colIdx === colIdx;
@@ -1180,11 +1416,9 @@ function EditableTableBlock({
                         data-cell-col={colIdx}
                         onClick={(e) => focusCellPadding(e, rowIdx, colIdx)}
                         onContextMenu={(e) => openContextMenuForCell(e, rowIdx, colIdx)}
-                        className={`px-4 py-2.5 text-neutral-700 dark:text-neutral-300 border-t border-neutral-200/70 dark:border-white/[0.06] align-top transition-colors ${
-                          colIdx > 0
-                            ? 'border-l border-neutral-200/50 dark:border-white/[0.04]'
-                            : ''
-                        } ${
+                        className={`px-4 py-2.5 align-top transition-colors ${
+                          activeTheme.tdClass
+                        } ${colIdx > 0 ? activeTheme.tdDividerClass : ''} ${
                           resizingColIdx === colIdx
                             ? 'bg-blue-500/[0.04]'
                             : isExactTarget
@@ -1223,9 +1457,9 @@ function EditableTableBlock({
           <div
             ref={menuRef}
             role="menu"
-            aria-label="Table row and column actions"
+            aria-label="Table actions and themes"
             style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
-            className="fixed z-50 w-52 rounded-xl border border-neutral-200 dark:border-white/12 bg-white dark:bg-[#1a1a20] shadow-xl py-1.5 text-[12.5px] text-neutral-800 dark:text-neutral-200 select-none"
+            className="fixed z-50 w-[228px] rounded-xl border border-neutral-200 dark:border-white/12 bg-white dark:bg-[#1a1a20] shadow-xl py-1.5 text-[12.5px] text-neutral-800 dark:text-neutral-200 select-none"
             onContextMenu={(e) => e.preventDefault()}
           >
             {contextMenu.rowIdx >= 0 && (
@@ -1299,6 +1533,47 @@ function EditableTableBlock({
               <ArrowRight className="w-3.5 h-3.5 text-neutral-500 dark:text-neutral-400 shrink-0" />
               <span>Add column right</span>
             </button>
+
+            <div className="my-1.5 border-t border-neutral-200/80 dark:border-white/[0.08]" />
+
+            <div className="px-3 pt-0.5 pb-1.5">
+              <div className="mb-1.5 text-[11px] font-medium text-neutral-500 dark:text-neutral-400">
+                Table theme
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {TABLE_THEMES.map((tpl) => {
+                  const isSelected = activeTheme.id === tpl.id;
+                  return (
+                    <button
+                      key={tpl.id}
+                      type="button"
+                      onClick={() => onChangeTheme(tpl.id)}
+                      className={`flex flex-col items-center gap-1 rounded-lg border px-1.5 py-1.5 text-[10.5px] font-medium transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400'
+                          : 'border-neutral-200 dark:border-white/10 hover:bg-neutral-100 dark:hover:bg-white/[0.06] text-neutral-700 dark:text-neutral-300'
+                      }`}
+                    >
+                      <span
+                        className="w-full h-3.5 rounded-[3px] overflow-hidden flex flex-col border"
+                        style={{ borderColor: tpl.preview.border }}
+                        aria-hidden="true"
+                      >
+                        <span
+                          className="h-1.5 w-full block"
+                          style={{ backgroundColor: tpl.preview.headerBg }}
+                        />
+                        <span
+                          className="flex-1 w-full block"
+                          style={{ backgroundColor: tpl.preview.rowEvenBg }}
+                        />
+                      </span>
+                      <span className="truncate w-full text-center">{tpl.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
 
             <div className="my-1 border-t border-neutral-200/80 dark:border-white/[0.08]" />
 
@@ -1381,6 +1656,13 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
     const [externalSyncSeq, setExternalSyncSeq] = useState(0);
     const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
     const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+    const [selectionPopover, setSelectionPopover] = useState<{
+      anchorRect: SelectionAnchorRect;
+      richEl: HTMLElement;
+      blockId: string | null;
+      activeFormats: SelectionFormatState;
+    } | null>(null);
+    const [linkEditorOpen, setLinkEditorOpen] = useState(false);
 
     const blocksRef = useRef<DocBlock[]>(blocks);
     blocksRef.current = blocks;
@@ -1389,6 +1671,13 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
     const lastEmittedMarkdownRef = useRef<string>(content);
     const lastNoteIdRef = useRef<string>(noteId);
     const blockElRefs = useRef<Map<string, HTMLElement>>(new Map());
+    const editorContainerRef = useRef<HTMLDivElement>(null);
+    const popoverRef = useRef<HTMLDivElement>(null);
+    const isPointerDownRef = useRef(false);
+    const linkEditorOpenRef = useRef(false);
+    linkEditorOpenRef.current = linkEditorOpen;
+    const aiPanelOpenRef = useRef(false);
+    const savedRangeRef = useRef<{ range: Range; richEl: HTMLElement } | null>(null);
 
     const registerBlockRef = useCallback((blockId: string, el: HTMLElement | null) => {
       if (el) {
@@ -1398,23 +1687,152 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
       }
     }, []);
 
-    // Track selection changes inside live editor for "Save selection as snippet"
+    const syncSelectionPopover = useCallback(() => {
+      if (linkEditorOpenRef.current || aiPanelOpenRef.current) return;
+
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        onSelectionStateChange?.(false);
+        setSelectionPopover(null);
+        return;
+      }
+
+      const cleanText = sel.toString().replace(/\u200B/g, '');
+      if (!cleanText.trim()) {
+        onSelectionStateChange?.(false);
+        setSelectionPopover(null);
+        return;
+      }
+
+      const range = sel.getRangeAt(0);
+      const container = editorContainerRef.current;
+      if (
+        !container ||
+        !container.contains(range.startContainer) ||
+        !container.contains(range.endContainer)
+      ) {
+        onSelectionStateChange?.(false);
+        setSelectionPopover(null);
+        return;
+      }
+
+      const findRichInline = (node: Node): HTMLElement | null => {
+        const el =
+          node.nodeType === Node.ELEMENT_NODE
+            ? (node as HTMLElement)
+            : node.parentElement;
+        return el?.closest<HTMLElement>('[data-rich-inline="true"]') || null;
+      };
+
+      const startRich = findRichInline(range.startContainer);
+      const endRich = findRichInline(range.endContainer);
+
+      if (!startRich || startRich !== endRich) {
+        const anyInside = Boolean(startRich || endRich);
+        onSelectionStateChange?.(anyInside);
+        setSelectionPopover(null);
+        return;
+      }
+
+      let rect = range.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        const firstRect = range.getClientRects()[0];
+        if (firstRect) rect = firstRect;
+      }
+
+      if (
+        (rect.width === 0 && rect.height === 0) ||
+        rect.bottom < 0 ||
+        rect.top > window.innerHeight
+      ) {
+        onSelectionStateChange?.(true);
+        setSelectionPopover(null);
+        return;
+      }
+
+      onSelectionStateChange?.(true);
+      savedRangeRef.current = { range: range.cloneRange(), richEl: startRich };
+      setSelectionPopover({
+        anchorRect: {
+          top: rect.top,
+          bottom: rect.bottom,
+          left: rect.left,
+          width: rect.width,
+        },
+        richEl: startRich,
+        blockId: startRich.getAttribute('data-block-id'),
+        activeFormats: inspectSelectionFormats(range, startRich),
+      });
+    }, [onSelectionStateChange]);
+
+    // Track selection changes inside live editor for floating text properties & snippet saving
     useEffect(() => {
       const handleSelChange = () => {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed) {
-          onSelectionStateChange?.(false);
+        if (isPointerDownRef.current || linkEditorOpenRef.current || aiPanelOpenRef.current) {
           return;
         }
-        const anchor = sel.anchorNode;
-        const insideLive = Array.from(blockElRefs.current.values()).some((el) =>
-          anchor ? el.contains(anchor) : false
-        );
-        onSelectionStateChange?.(insideLive && sel.toString().trim().length > 0);
+        syncSelectionPopover();
       };
+
+      const handleMouseUp = () => {
+        if (!isPointerDownRef.current) return;
+        isPointerDownRef.current = false;
+        window.requestAnimationFrame(() => {
+          syncSelectionPopover();
+        });
+      };
+
+      const handlePointerDown = (e: PointerEvent) => {
+        const target = e.target as Node;
+        if (popoverRef.current && popoverRef.current.contains(target)) {
+          return;
+        }
+        if (editorContainerRef.current && editorContainerRef.current.contains(target)) {
+          if (linkEditorOpenRef.current) {
+            setLinkEditorOpen(false);
+          }
+          if (aiPanelOpenRef.current) {
+            aiPanelOpenRef.current = false;
+          }
+          return;
+        }
+        setLinkEditorOpen(false);
+        aiPanelOpenRef.current = false;
+        setSelectionPopover(null);
+      };
+
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (
+          e.key === 'Escape' &&
+          (linkEditorOpenRef.current || aiPanelOpenRef.current || savedRangeRef.current)
+        ) {
+          setLinkEditorOpen(false);
+          aiPanelOpenRef.current = false;
+          setSelectionPopover(null);
+        }
+      };
+
+      const handleScrollOrResize = () => {
+        if (!linkEditorOpenRef.current && !aiPanelOpenRef.current) {
+          syncSelectionPopover();
+        }
+      };
+
       document.addEventListener('selectionchange', handleSelChange);
-      return () => document.removeEventListener('selectionchange', handleSelChange);
-    }, [onSelectionStateChange]);
+      window.addEventListener('mouseup', handleMouseUp);
+      window.addEventListener('pointerdown', handlePointerDown);
+      window.addEventListener('keydown', handleKeyDown);
+      window.addEventListener('scroll', handleScrollOrResize, true);
+      window.addEventListener('resize', handleScrollOrResize);
+      return () => {
+        document.removeEventListener('selectionchange', handleSelChange);
+        window.removeEventListener('mouseup', handleMouseUp);
+        window.removeEventListener('pointerdown', handlePointerDown);
+        window.removeEventListener('keydown', handleKeyDown);
+        window.removeEventListener('scroll', handleScrollOrResize, true);
+        window.removeEventListener('resize', handleScrollOrResize);
+      };
+    }, [syncSelectionPopover]);
 
     // Sync external content changes (note switch, Undo/Redo, snippet insert, Split/Write edits)
     useEffect(() => {
@@ -1433,6 +1851,8 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
 
       if (noteSwitched) {
         setFocusedBlockId(null);
+        setLinkEditorOpen(false);
+        setSelectionPopover(null);
       } else if (prevFocusIdx >= 0 && parsed.length > 0) {
         const targetBlock = parsed[Math.min(prevFocusIdx, parsed.length - 1)];
         window.requestAnimationFrame(() => {
@@ -1491,25 +1911,27 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
       ref,
       () => ({
         applyInlineFormat(format) {
-          const targetId = focusedBlockIdRef.current;
-          if (!targetId) return;
-          const el = blockElRefs.current.get(targetId);
-          if (!el || !el.isContentEditable) return;
+          const activeRich =
+            selectionPopover?.richEl && document.contains(selectionPopover.richEl)
+              ? selectionPopover.richEl
+              : focusedBlockIdRef.current
+              ? blockElRefs.current.get(focusedBlockIdRef.current)
+              : null;
+          if (!activeRich || !activeRich.isContentEditable) return;
 
-          el.focus();
+          activeRich.focus();
           if (format === 'bold') {
             document.execCommand('bold');
           } else if (format === 'italic') {
             document.execCommand('italic');
+          } else if (format === 'strike') {
+            document.execCommand('strikeThrough');
           } else {
-            toggleInlineCodeSelection(el);
+            toggleInlineCodeSelection(activeRich);
           }
 
-          const nextText = htmlToInlineMarkdown(el);
-          const nextBlocks = blocksRef.current.map((b) =>
-            b.id === targetId && 'text' in b ? { ...b, text: nextText } : b
-          );
-          commitBlocks(nextBlocks, 'discrete');
+          activeRich.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+          window.requestAnimationFrame(() => syncSelectionPopover());
         },
 
         toggleOrInsertBlock(kind) {
@@ -1519,6 +1941,8 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           const makeBlock = (text = ''): DocBlock => {
             const id = createBlockId();
             switch (kind) {
+              case 'h1':
+                return { id, type: 'heading', level: 1, text };
               case 'h2':
                 return { id, type: 'heading', level: 2, text };
               case 'h3':
@@ -1634,10 +2058,55 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
         },
 
         getSelectedText() {
-          return window.getSelection()?.toString().trim() || '';
+          const saved = savedRangeRef.current;
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+            const range = sel.getRangeAt(0);
+            if (editorContainerRef.current?.contains(range.commonAncestorContainer)) {
+              const temp = document.createElement('div');
+              temp.appendChild(range.cloneContents());
+              return htmlToInlineMarkdown(temp).trim() || sel.toString().trim();
+            }
+          }
+          if (saved && document.contains(saved.richEl)) {
+            const temp = document.createElement('div');
+            temp.appendChild(saved.range.cloneContents());
+            return htmlToInlineMarkdown(temp).trim() || saved.range.toString().trim();
+          }
+          return '';
+        },
+
+        replaceSelectedText(correctedMarkdown: string) {
+          const saved = savedRangeRef.current;
+          if (!saved || !document.contains(saved.richEl)) return false;
+          saved.richEl.focus();
+          const sel = window.getSelection();
+          if (!sel) return false;
+          sel.removeAllRanges();
+          sel.addRange(saved.range);
+          const temp = document.createElement('div');
+          temp.innerHTML = inlineMarkdownToHtml(correctedMarkdown);
+          saved.range.deleteContents();
+          const nodes = Array.from(temp.childNodes);
+          if (nodes.length > 0) {
+            const frag = document.createDocumentFragment();
+            nodes.forEach((n) => frag.appendChild(n));
+            const first = nodes[0];
+            const last = nodes[nodes.length - 1];
+            saved.range.insertNode(frag);
+            const nextRange = document.createRange();
+            nextRange.setStartBefore(first);
+            nextRange.setEndAfter(last);
+            sel.removeAllRanges();
+            sel.addRange(nextRange);
+            savedRangeRef.current = { range: nextRange.cloneRange(), richEl: saved.richEl };
+          }
+          saved.richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+          window.requestAnimationFrame(() => syncSelectionPopover());
+          return true;
         },
       }),
-      [commitBlocks]
+      [commitBlocks, selectionPopover?.richEl, syncSelectionPopover]
     );
 
     const handleInlineChange = (blockId: string, nextText: string) => {
@@ -1964,9 +2433,222 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
       return entries;
     }, [blocks]);
 
+    const currentPopoverBlockType: BlockStyleOption = useMemo(() => {
+      if (!selectionPopover?.blockId) return 'paragraph';
+      const blk = blocks.find((b) => b.id === selectionPopover.blockId);
+      if (!blk) return 'paragraph';
+      if (blk.type === 'heading') {
+        if (blk.level === 1) return 'h1';
+        if (blk.level === 2) return 'h2';
+        return 'h3';
+      }
+      if (
+        blk.type === 'blockquote' ||
+        blk.type === 'bullet-item' ||
+        blk.type === 'ordered-item' ||
+        blk.type === 'task-item'
+      ) {
+        return blk.type;
+      }
+      return 'paragraph';
+    }, [blocks, selectionPopover?.blockId]);
+
+    const handlePopoverToggleFormat = (format: 'bold' | 'italic' | 'strike' | 'code') => {
+      if (!selectionPopover) return;
+      const { richEl } = selectionPopover;
+      if (!document.contains(richEl)) return;
+
+      richEl.focus();
+      const sel = window.getSelection();
+      if ((!sel || sel.rangeCount === 0 || sel.isCollapsed) && savedRangeRef.current) {
+        const nextSel = window.getSelection();
+        nextSel?.removeAllRanges();
+        nextSel?.addRange(savedRangeRef.current.range);
+      }
+
+      if (format === 'bold') {
+        document.execCommand('bold');
+      } else if (format === 'italic') {
+        document.execCommand('italic');
+      } else if (format === 'strike') {
+        document.execCommand('strikeThrough');
+      } else {
+        toggleInlineCodeSelection(richEl);
+      }
+
+      richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+      window.requestAnimationFrame(() => syncSelectionPopover());
+    };
+
+    const handlePopoverClearFormatting = () => {
+      if (!selectionPopover) return;
+      const { richEl } = selectionPopover;
+      if (!document.contains(richEl)) return;
+
+      richEl.focus();
+      const sel = window.getSelection();
+      const range =
+        sel && sel.rangeCount > 0 && richEl.contains(sel.getRangeAt(0).commonAncestorContainer)
+          ? sel.getRangeAt(0)
+          : savedRangeRef.current?.range;
+      if (!range) return;
+
+      clearFormattingInSelection(richEl, range);
+      richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+      window.requestAnimationFrame(() => syncSelectionPopover());
+    };
+
+    const handlePopoverChangeBlockType = (kind: BlockStyleOption) => {
+      if (!selectionPopover?.blockId) return;
+      const targetBlockId = selectionPopover.blockId;
+      const list = blocksRef.current;
+      const idx = list.findIndex((b) => b.id === targetBlockId);
+      if (idx < 0) return;
+      const current = list[idx];
+      if (!('text' in current)) return;
+
+      const id = createBlockId();
+      let converted: DocBlock;
+      switch (kind) {
+        case 'h1':
+          converted = { id, type: 'heading', level: 1, text: current.text };
+          break;
+        case 'h2':
+          converted = { id, type: 'heading', level: 2, text: current.text };
+          break;
+        case 'h3':
+          converted = { id, type: 'heading', level: 3, text: current.text };
+          break;
+        case 'blockquote':
+          converted = { id, type: 'blockquote', text: current.text };
+          break;
+        case 'bullet-item':
+          converted = { id, type: 'bullet-item', text: current.text };
+          break;
+        case 'ordered-item':
+          converted = { id, type: 'ordered-item', text: current.text };
+          break;
+        case 'task-item':
+          converted = { id, type: 'task-item', checked: false, text: current.text };
+          break;
+        default:
+          converted = { id, type: 'paragraph', text: current.text };
+          break;
+      }
+
+      setSelectionPopover(null);
+      setLinkEditorOpen(false);
+      const nextBlocks = list.map((b, i) => (i === idx ? converted : b));
+      commitBlocks(nextBlocks, 'discrete', { id: converted.id, position: 'end' });
+    };
+
+    const handlePopoverOpenLinkEditor = () => {
+      if (!selectionPopover) return;
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && selectionPopover.richEl.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        savedRangeRef.current = {
+          range: sel.getRangeAt(0).cloneRange(),
+          richEl: selectionPopover.richEl,
+        };
+      }
+      setLinkEditorOpen(true);
+    };
+
+    const handlePopoverCloseLinkEditor = () => {
+      setLinkEditorOpen(false);
+      const saved = savedRangeRef.current;
+      if (saved && document.contains(saved.richEl)) {
+        window.requestAnimationFrame(() => {
+          saved.richEl.focus();
+          const sel = window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(saved.range);
+          syncSelectionPopover();
+        });
+      }
+    };
+
+    const handlePopoverApplyLink = (url: string) => {
+      const saved = savedRangeRef.current;
+      linkEditorOpenRef.current = false;
+      setLinkEditorOpen(false);
+      if (!saved || !document.contains(saved.richEl)) return;
+
+      saved.richEl.focus();
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(saved.range);
+      if (applyLinkToRange(saved.richEl, saved.range, url)) {
+        saved.richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+      }
+      window.requestAnimationFrame(() => syncSelectionPopover());
+    };
+
+    const handlePopoverRemoveLink = () => {
+      const saved = savedRangeRef.current;
+      linkEditorOpenRef.current = false;
+      setLinkEditorOpen(false);
+      if (!saved || !document.contains(saved.richEl)) return;
+
+      saved.richEl.focus();
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(saved.range);
+      if (removeLinkFromRange(saved.richEl, saved.range)) {
+        saved.richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+      }
+      window.requestAnimationFrame(() => syncSelectionPopover());
+    };
+
+    const handlePopoverGetSelectedText = () => {
+      const saved = savedRangeRef.current;
+      if (!saved || !document.contains(saved.richEl)) return '';
+      const temp = document.createElement('div');
+      temp.appendChild(saved.range.cloneContents());
+      return htmlToInlineMarkdown(temp).trim() || saved.range.toString().trim();
+    };
+
+    const handlePopoverApplyAiText = (correctedMarkdown: string) => {
+      aiPanelOpenRef.current = false;
+      const saved = savedRangeRef.current;
+      if (!saved || !document.contains(saved.richEl)) return;
+
+      saved.richEl.focus();
+      const sel = window.getSelection();
+      if (!sel) return;
+      sel.removeAllRanges();
+      sel.addRange(saved.range);
+
+      const temp = document.createElement('div');
+      temp.innerHTML = inlineMarkdownToHtml(correctedMarkdown);
+      saved.range.deleteContents();
+      const nodes = Array.from(temp.childNodes);
+      if (nodes.length > 0) {
+        const frag = document.createDocumentFragment();
+        nodes.forEach((n) => frag.appendChild(n));
+        const first = nodes[0];
+        const last = nodes[nodes.length - 1];
+        saved.range.insertNode(frag);
+
+        const nextRange = document.createRange();
+        nextRange.setStartBefore(first);
+        nextRange.setEndAfter(last);
+        sel.removeAllRanges();
+        sel.addRange(nextRange);
+        savedRangeRef.current = { range: nextRange.cloneRange(), richEl: saved.richEl };
+      }
+
+      saved.richEl.dispatchEvent(new CustomEvent('notecraft:sync-dom'));
+      window.requestAnimationFrame(() => syncSelectionPopover());
+    };
+
     return (
       <div
+        ref={editorContainerRef}
         data-live-editor="true"
+        onMouseDown={() => {
+          isPointerDownRef.current = true;
+        }}
         className="editor-prose-font text-[15.5px] leading-[1.82] text-neutral-800 dark:text-[#e4e4ea] break-words"
       >
         {groupedEntries.map((entry) => {
@@ -2024,6 +2706,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
               <RichInlineField
                 key={block.id}
                 headingId={headingIds.get(block.id)}
+                dataBlockId={block.id}
                 markdown={block.text}
                 externalSyncSeq={externalSyncSeq}
                 placeholder={`Heading ${block.level}`}
@@ -2045,6 +2728,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                 className="my-5 rounded-xl border border-neutral-200 dark:border-white/[0.09] bg-neutral-50/80 dark:bg-white/[0.03] px-4 py-3 text-[14.5px] text-neutral-700 dark:text-neutral-300"
               >
                 <RichInlineField
+                  dataBlockId={block.id}
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="Write a note or callout..."
@@ -2083,6 +2767,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   className="mt-2 h-4 w-4 rounded border-neutral-300 dark:border-white/25 bg-white dark:bg-neutral-900 accent-blue-600 cursor-pointer shrink-0"
                 />
                 <RichInlineField
+                  dataBlockId={block.id}
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="Task item..."
@@ -2115,6 +2800,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   className="mt-[0.68em] h-1.5 w-1.5 rounded-full bg-neutral-400 dark:bg-neutral-500 shrink-0"
                 />
                 <RichInlineField
+                  dataBlockId={block.id}
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="List item..."
@@ -2146,6 +2832,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   {itemNum}.
                 </span>
                 <RichInlineField
+                  dataBlockId={block.id}
                   markdown={block.text}
                   externalSyncSeq={externalSyncSeq}
                   placeholder="List item..."
@@ -2327,6 +3014,17 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
                   });
                   commitBlocks(nextBlocks, 'discrete');
                 }}
+                onChangeTheme={(theme) => {
+                  const nextBlocks = blocksRef.current.map((b) => {
+                    if (b.id !== block.id || b.type !== 'table') return b;
+                    if (theme === 'default') {
+                      const { theme: _removed, ...rest } = b;
+                      return rest;
+                    }
+                    return { ...b, theme };
+                  });
+                  commitBlocks(nextBlocks, 'discrete');
+                }}
                 onDeleteTable={() => {
                   const nextBlocks = blocksRef.current.filter((b) => b.id !== block.id);
                   commitBlocks(nextBlocks, 'discrete');
@@ -2396,6 +3094,7 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           return (
             <RichInlineField
               key={block.id}
+              dataBlockId={block.id}
               markdown={block.text}
               externalSyncSeq={externalSyncSeq}
               placeholder={
@@ -2419,6 +3118,36 @@ export const LiveDocumentEditor = forwardRef<LiveDocumentEditorHandle, LiveDocum
           onClick={focusOrAppendBottomParagraph}
           className="min-h-[160px] cursor-text"
           aria-hidden="true"
+        />
+
+        <TextSelectionPopover
+          open={Boolean(selectionPopover)}
+          anchorRect={selectionPopover?.anchorRect ?? null}
+          canChangeBlockType={Boolean(selectionPopover?.blockId)}
+          currentBlockType={currentPopoverBlockType}
+          activeFormats={
+            selectionPopover?.activeFormats ?? {
+              bold: false,
+              italic: false,
+              strike: false,
+              code: false,
+              linkHref: null,
+            }
+          }
+          linkEditorOpen={linkEditorOpen}
+          popoverRef={popoverRef}
+          onToggleFormat={handlePopoverToggleFormat}
+          onClearFormatting={handlePopoverClearFormatting}
+          onChangeBlockType={handlePopoverChangeBlockType}
+          onOpenLinkEditor={handlePopoverOpenLinkEditor}
+          onCloseLinkEditor={handlePopoverCloseLinkEditor}
+          onApplyLink={handlePopoverApplyLink}
+          onRemoveLink={handlePopoverRemoveLink}
+          onGetSelectedText={handlePopoverGetSelectedText}
+          onApplyAiText={handlePopoverApplyAiText}
+          onAiPanelOpenChange={(isOpen) => {
+            aiPanelOpenRef.current = isOpen;
+          }}
         />
 
         {lightboxIndex !== null && documentImages.length > 0 && (
