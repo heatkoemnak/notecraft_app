@@ -25,6 +25,7 @@ import {
   type GenerateDocType,
   generateDocumentWithGroq,
 } from './server/groqGenerate.ts';
+import { registerOAuthRoutes } from './server/oauth.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -282,6 +283,9 @@ async function startServer() {
     res.setHeader('Set-Cookie', buildClearSessionCookie(req));
     return res.json({ ok: true });
   });
+
+  // Mount Google and GitHub OAuth routes
+  registerOAuthRoutes(app, getPool);
 
   // Load authenticated user's workspace (including shares & notes shared with user)
   app.get('/api/workspace', async (req, res) => {

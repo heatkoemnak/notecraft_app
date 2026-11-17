@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Eye, EyeOff, FileText, Lock, Mail, Moon, Sun, User } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Eye, EyeOff, FileText, Loader2, Lock, Mail, Moon, Sun, User } from 'lucide-react';
 import { AuthUser } from '../types/notes';
 import { loginAccount, registerAccount, StorageBackendMode } from '../utils/authClient';
 import { GoogleAccountSelectorModal } from './GoogleAccountSelectorModal';
@@ -25,6 +25,58 @@ export function AuthScreen({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [oauthProviderModal, setOauthProviderModal] = useState<'google' | 'github' | null>(null);
+  const [oauthLoading, setOauthLoading] = useState<'google' | 'github' | null>(null);
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS' && event.data.user) {
+        setOauthProviderModal(null);
+        onAuthenticated(event.data.user);
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [onAuthenticated]);
+
+  const handleOAuthClick = async (provider: 'google' | 'github') => {
+    setError(null);
+    setOauthLoading(provider);
+
+    try {
+      const res = await fetch(`/api/auth/${provider}/url`);
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.url) {
+        const width = 560;
+        const height = 680;
+        const left = window.screenX + (window.outerWidth - width) / 2;
+        const top = window.screenY + (window.outerHeight - height) / 2;
+        const popup = window.open(
+          data.url,
+          `${provider}_oauth_popup`,
+          `width=${width},height=${height},left=${left},top=${top},status=no,toolbar=no,menubar=no`
+        );
+
+        if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+          // If popup was blocked, fallback to redirect
+          window.location.href = data.url;
+          return;
+        }
+        setOauthLoading(null);
+        return;
+      }
+
+      // If credentials are unconfigured or failed, show modal with guide
+      setOauthProviderModal(provider);
+      if (data.error) {
+        setError(data.error);
+      }
+    } catch {
+      setOauthProviderModal(provider);
+    } finally {
+      setOauthLoading(null);
+    }
+  };
 
   const handleModeChange = (nextMode: 'login' | 'register') => {
     setMode(nextMode);
@@ -245,23 +297,33 @@ export function AuthScreen({
           <div className="grid grid-cols-2 gap-2.5">
             <button
               type="button"
-              onClick={() => setOauthProviderModal('google')}
-              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+              disabled={oauthLoading !== null}
+              onClick={() => handleOAuthClick('google')}
+              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs disabled:opacity-60"
             >
-              <span className="w-4 h-4 rounded-full bg-red-500 text-white font-bold text-[10px] flex items-center justify-center">
-                G
-              </span>
+              {oauthLoading === 'google' ? (
+                <Loader2 className="w-4 h-4 animate-spin text-red-500" />
+              ) : (
+                <span className="w-4 h-4 rounded-full bg-red-500 text-white font-bold text-[10px] flex items-center justify-center">
+                  G
+                </span>
+              )}
               <span>Google</span>
             </button>
 
             <button
               type="button"
-              onClick={() => setOauthProviderModal('github')}
-              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+              disabled={oauthLoading !== null}
+              onClick={() => handleOAuthClick('github')}
+              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs disabled:opacity-60"
             >
-              <span className="w-4 h-4 rounded-full bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 font-bold text-[10px] flex items-center justify-center">
-                GH
-              </span>
+              {oauthLoading === 'github' ? (
+                <Loader2 className="w-4 h-4 animate-spin text-neutral-800 dark:text-white" />
+              ) : (
+                <span className="w-4 h-4 rounded-full bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 font-bold text-[10px] flex items-center justify-center">
+                  GH
+                </span>
+              )}
               <span>GitHub</span>
             </button>
           </div>

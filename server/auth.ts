@@ -63,28 +63,30 @@ function isHttpsRequest(req: Request): boolean {
 
 export function buildSessionCookie(token: string, req: Request): string {
   const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const isHttps = isHttpsRequest(req);
   const parts = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Lax',
+    isHttps ? 'SameSite=None' : 'SameSite=Lax',
     `Max-Age=${maxAgeSec}`,
   ];
-  if (isHttpsRequest(req)) {
+  if (isHttps) {
     parts.push('Secure');
   }
   return parts.join('; ');
 }
 
 export function buildClearSessionCookie(req: Request): string {
+  const isHttps = isHttpsRequest(req);
   const parts = [
     `${SESSION_COOKIE_NAME}=`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Lax',
+    isHttps ? 'SameSite=None' : 'SameSite=Lax',
     'Max-Age=0',
   ];
-  if (isHttpsRequest(req)) {
+  if (isHttps) {
     parts.push('Secure');
   }
   return parts.join('; ');
