@@ -1,4 +1,11 @@
-import { AuthUser, NoteDocument, NoteShareEntry, SharePermission } from '../types/notes';
+import {
+  AuthUser,
+  LinkAccess,
+  NoteDocument,
+  NoteShareEntry,
+  SharedLinkNote,
+  SharePermission,
+} from '../types/notes';
 import { getUserStorageKeys, listLocalUsersPublic, StorageBackendMode } from './authClient';
 
 interface LocalShareRecord {
@@ -13,6 +20,17 @@ interface LocalShareRecord {
 }
 
 const LOCAL_SHARES_KEY = 'notecraft.shares.v1';
+const LOCAL_PUBLIC_LINKS_KEY = 'notecraft.publicLinks.v1';
+
+interface LocalPublicLinkRecord {
+  token: string;
+  noteId: string;
+  ownerUserId: string;
+  ownerName: string;
+  ownerEmail: string;
+  linkAccess: LinkAccess;
+  updatedAt: number;
+}
 
 function readLocalShares(): LocalShareRecord[] {
   try {
@@ -31,6 +49,34 @@ function writeLocalShares(shares: LocalShareRecord[]) {
   } catch {
     // Ignore storage quota errors
   }
+}
+
+function readLocalPublicLinks(): LocalPublicLinkRecord[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_PUBLIC_LINKS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as LocalPublicLinkRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalPublicLinks(links: LocalPublicLinkRecord[]) {
+  try {
+    localStorage.setItem(LOCAL_PUBLIC_LINKS_KEY, JSON.stringify(links));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function generateLocalShareToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function readLocalNotesForUser(userId: string): NoteDocument[] {
@@ -80,10 +126,22 @@ export function hydrateLocalSharing(
     ownerSharesByNote.set(s.noteId, list);
   }
 
-  const notesWithShares = ownNotes.map((note) => ({
-    ...note,
-    shares: ownerSharesByNote.get(note.id) ?? [],
-  }));
+  const publicLinkByNoteId = new Map<string, LocalPublicLinkRecord>();
+  for (const link of readLocalPublicLinks()) {
+    if (link.ownerUserId === currentUser.id) {
+      publicLinkByNoteId.set(link.noteId, link);
+    }
+  }
+
+  const notesWithShares = ownNotes.map((note) => {
+    const linkRecord = publicLinkByNoteId.get(note.id);
+    return {
+      ...note,
+      shareToken: note.shareToken ?? linkRecord?.token ?? null,
+      linkAccess: note.linkAccess ?? linkRecord?.linkAccess ?? 'off',
+      shares: ownerSharesByNote.get(note.id) ?? [],
+    };
+  });
 
   const normalizedEmail = currentUser.email.toLowerCase();
   const incomingShares = allShares.filter(
@@ -231,6 +289,11 @@ export function deleteSharesForNoteLocal(noteId: string, ownerUserId: string) {
     (s) => !(s.noteId === noteId && s.ownerUserId === ownerUserId)
   );
   writeLocalShares(next);
+
+  const nextLinks = readLocalPublicLinks().filter(
+    (l) => !(l.noteId === noteId && l.ownerUserId === ownerUserId)
+  );
+  writeLocalPublicLinks(nextLinks);
 }
 
 export function updateSharedNoteLocal(
@@ -254,4 +317,187 @@ export function updateSharedNoteLocal(
     updatedAt,
   };
   writeLocalNotesForUser(owner.id, ownerNotes);
+}
+
+export function buildShareUrl(token: string): string {
+  if (typeof window === 'undefined') return `/?share=${encodeURIComponent(token)}`;
+  return `${window.location.origin}/?share=${encodeURIComponent(token)}`;
+}
+
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback to textarea selection below (e.g., restricted iframe contexts)
+  }
+
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function updateNoteShareLink(
+  storage: StorageBackendMode,
+  currentUser: AuthUser,
+  note: NoteDocument,
+  linkAccess: LinkAccess,
+  regenerate = false
+): Promise<{ shareToken: string; linkAccess: LinkAccess }> {
+  if (storage === 'postgres') {
+    const res = await fetch(`/api/notes/${encodeURIComponent(note.id)}/share-link`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ linkAccess, regenerate }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      shareToken?: string;
+      linkAccess?: LinkAccess;
+      error?: string;
+    };
+    if (!res.ok || !data.shareToken || !data.linkAccess) {
+      throw new Error(data.error || 'Could not update share link.');
+    }
+    return { shareToken: data.shareToken, linkAccess: data.linkAccess };
+  }
+
+  const links = readLocalPublicLinks();
+  const existingIdx = links.findIndex(
+    (l) => l.noteId === note.id && l.ownerUserId === currentUser.id
+  );
+  const existingToken = existingIdx >= 0 ? links[existingIdx].token : note.shareToken;
+  const nextToken = !existingToken || regenerate ? generateLocalShareToken() : existingToken;
+  const now = Date.now();
+
+  const record: LocalPublicLinkRecord = {
+    token: nextToken,
+    noteId: note.id,
+    ownerUserId: currentUser.id,
+    ownerName: currentUser.name,
+    ownerEmail: currentUser.email,
+    linkAccess,
+    updatedAt: now,
+  };
+
+  if (existingIdx >= 0) {
+    links[existingIdx] = record;
+  } else {
+    links.unshift(record);
+  }
+  writeLocalPublicLinks(links);
+
+  const ownerNotes = readLocalNotesForUser(currentUser.id);
+  const updatedOwnerNotes = ownerNotes.map((n) =>
+    n.id === note.id ? { ...n, shareToken: nextToken, linkAccess } : n
+  );
+  writeLocalNotesForUser(currentUser.id, updatedOwnerNotes);
+
+  return { shareToken: nextToken, linkAccess };
+}
+
+export async function fetchNoteByShareToken(
+  storage: StorageBackendMode,
+  token: string
+): Promise<SharedLinkNote> {
+  const cleanToken = token.trim();
+  if (!cleanToken) {
+    throw new Error('Invalid share link.');
+  }
+
+  if (storage === 'postgres') {
+    const res = await fetch(`/api/shared-link/${encodeURIComponent(cleanToken)}`, {
+      credentials: 'same-origin',
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      note?: SharedLinkNote;
+      error?: string;
+    };
+    if (!res.ok || !data.note) {
+      throw new Error(
+        data.error || 'This share link is invalid or has been disabled by the owner.'
+      );
+    }
+    return data.note;
+  }
+
+  const link = readLocalPublicLinks().find((l) => l.token === cleanToken);
+  if (!link || link.linkAccess === 'off') {
+    throw new Error('This share link is invalid or has been disabled by the owner.');
+  }
+
+  const ownerNotes = readLocalNotesForUser(link.ownerUserId);
+  const target = ownerNotes.find((n) => n.id === link.noteId);
+  if (!target) {
+    throw new Error('The shared document could not be found.');
+  }
+
+  const ownerUser = listLocalUsersPublic().find((u) => u.id === link.ownerUserId);
+  return {
+    id: target.id,
+    title: target.title,
+    content: target.content,
+    createdAt: target.createdAt,
+    updatedAt: target.updatedAt,
+    shareToken: cleanToken,
+    linkAccess: link.linkAccess === 'edit' ? 'edit' : 'view',
+    ownerName: ownerUser?.name || link.ownerName,
+    ownerEmail: ownerUser?.email || link.ownerEmail,
+  };
+}
+
+export async function updateNoteByShareToken(
+  storage: StorageBackendMode,
+  token: string,
+  patch: Partial<Pick<NoteDocument, 'title' | 'content'>>,
+  updatedAt: number
+): Promise<void> {
+  const cleanToken = token.trim();
+  if (!cleanToken) throw new Error('Invalid share link.');
+
+  if (storage === 'postgres') {
+    const res = await fetch(`/api/shared-link/${encodeURIComponent(cleanToken)}`, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...patch, updatedAt }),
+    });
+    if (!res.ok) {
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(data.error || 'Could not save changes.');
+    }
+    return;
+  }
+
+  const link = readLocalPublicLinks().find((l) => l.token === cleanToken);
+  if (!link || link.linkAccess !== 'edit') {
+    throw new Error('This link only allows viewing.');
+  }
+
+  const ownerNotes = readLocalNotesForUser(link.ownerUserId);
+  const idx = ownerNotes.findIndex((n) => n.id === link.noteId);
+  if (idx < 0) {
+    throw new Error('The shared document could not be found.');
+  }
+
+  ownerNotes[idx] = {
+    ...ownerNotes[idx],
+    ...patch,
+    updatedAt,
+  };
+  writeLocalNotesForUser(link.ownerUserId, ownerNotes);
 }

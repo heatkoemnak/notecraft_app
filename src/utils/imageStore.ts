@@ -97,6 +97,20 @@ export function clearImageMemoryCache(): void {
   memoryCache.clear();
 }
 
+function getShareTokenQueryParam(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('share')?.trim();
+    if (token) return `?shareToken=${encodeURIComponent(token)}`;
+    const match = window.location.pathname.match(/^\/share\/([^/]+)/);
+    if (match?.[1]) return `?shareToken=${encodeURIComponent(decodeURIComponent(match[1]))}`;
+  } catch {
+    // ignore URL parsing errors
+  }
+  return '';
+}
+
 export async function getImageDataUrl(refOrId: string): Promise<string | null> {
   const id = refOrId.startsWith(IMAGE_REF_PREFIX) ? extractImageId(refOrId) : refOrId;
   if (!id) return null;
@@ -127,7 +141,7 @@ export async function getImageDataUrl(refOrId: string): Promise<string | null> {
   }
 
   try {
-    const res = await fetch(`/api/images/${encodeURIComponent(id)}`, {
+    const res = await fetch(`/api/images/${encodeURIComponent(id)}${getShareTokenQueryParam()}`, {
       credentials: 'same-origin',
     });
     if (res.ok) {

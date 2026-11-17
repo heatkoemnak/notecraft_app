@@ -75,6 +75,8 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           content TEXT NOT NULL DEFAULT '',
           folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL,
           starred BOOLEAN NOT NULL DEFAULT FALSE,
+          share_token TEXT,
+          link_access TEXT NOT NULL DEFAULT 'off',
           created_at BIGINT NOT NULL,
           updated_at BIGINT NOT NULL
         );
@@ -122,12 +124,15 @@ export async function ensureSchema(pool: Pool): Promise<void> {
 
         ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+        ALTER TABLE notes ADD COLUMN IF NOT EXISTS share_token TEXT;
+        ALTER TABLE notes ADD COLUMN IF NOT EXISTS link_access TEXT NOT NULL DEFAULT 'off';
         ALTER TABLE snippets ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE note_images ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_folders_user_id ON folders(user_id);
         CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_share_token ON notes(share_token) WHERE share_token IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_snippets_user_id ON snippets(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_images_user_id ON note_images(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_files_user_id ON note_files(user_id);

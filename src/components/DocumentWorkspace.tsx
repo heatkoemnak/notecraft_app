@@ -15,6 +15,7 @@ import {
   Heading3,
   ImagePlus,
   Italic,
+  Link2,
   ListTree,
   Minus,
   PanelLeftOpen,
@@ -864,6 +865,9 @@ export function DocumentWorkspace({
   const isSharedWithMe = Boolean(note.isSharedWithMe);
   const isReadOnly = Boolean(isSharedWithMe && note.sharedPermission !== 'edit');
   const shareCount = note.shares?.length ?? 0;
+  const hasPublicLink = Boolean(
+    !isSharedWithMe && (note.linkAccess === 'view' || note.linkAccess === 'edit') && note.shareToken
+  );
 
   return (
     <div
@@ -1039,12 +1043,18 @@ export function DocumentWorkspace({
           <button
             type="button"
             onClick={onOpenShareModal}
-            title="Share by email or export PDF / DOC / MD"
+            title="Copy share link, invite by email, or export PDF / DOC / MD"
             aria-label="Share and export note"
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap tabular-nums"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors cursor-pointer whitespace-nowrap tabular-nums shrink-0"
           >
-            <Share2 className="w-3.5 h-3.5" />
-            <span>{!isSharedWithMe && shareCount > 0 ? `Share · ${shareCount}` : 'Share'}</span>
+            {hasPublicLink ? <Link2 className="w-3.5 h-3.5" /> : <Share2 className="w-3.5 h-3.5" />}
+            <span>
+              {!isSharedWithMe && shareCount > 0
+                ? `Share · ${shareCount}`
+                : hasPublicLink
+                ? 'Share · Link'
+                : 'Share'}
+            </span>
           </button>
         </div>
       </header>

@@ -68,6 +68,20 @@ export function clearFileMemoryCache(): void {
   memoryCache.clear();
 }
 
+function getShareTokenQueryParam(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('share')?.trim();
+    if (token) return `?shareToken=${encodeURIComponent(token)}`;
+    const match = window.location.pathname.match(/^\/share\/([^/]+)/);
+    if (match?.[1]) return `?shareToken=${encodeURIComponent(decodeURIComponent(match[1]))}`;
+  } catch {
+    // ignore URL parsing errors
+  }
+  return '';
+}
+
 export async function getAttachmentFile(refOrId: string): Promise<StoredFileRecord | null> {
   const id = refOrId.startsWith(FILE_REF_PREFIX) ? extractFileId(refOrId) : refOrId;
   if (!id) return null;
@@ -98,7 +112,7 @@ export async function getAttachmentFile(refOrId: string): Promise<StoredFileReco
   }
 
   try {
-    const res = await fetch(`/api/files/${encodeURIComponent(id)}`, {
+    const res = await fetch(`/api/files/${encodeURIComponent(id)}${getShareTokenQueryParam()}`, {
       credentials: 'same-origin',
     });
     if (res.ok) {

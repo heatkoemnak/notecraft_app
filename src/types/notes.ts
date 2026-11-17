@@ -7,6 +7,7 @@ export type SidebarFilter =
   | { type: 'folder'; folderId: string };
 
 export type SharePermission = 'view' | 'edit';
+export type LinkAccess = 'off' | 'view' | 'edit';
 
 export interface NoteShareEntry {
   id: string;
@@ -37,6 +38,20 @@ export interface NoteDocument {
   ownerEmail?: string;
   sharedPermission?: SharePermission;
   shares?: NoteShareEntry[];
+  shareToken?: string | null;
+  linkAccess?: LinkAccess;
+}
+
+export interface SharedLinkNote {
+  id: string;
+  title: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+  shareToken: string;
+  linkAccess: SharePermission;
+  ownerName: string;
+  ownerEmail: string;
 }
 
 export interface Snippet {

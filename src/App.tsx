@@ -4,6 +4,7 @@ import { CommandPalette } from './components/CommandPalette';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
 import { ImportDestinationMode, ImportFileModal } from './components/ImportFileModal';
 import { ShareNoteModal } from './components/ShareNoteModal';
+import { SharedLinkView } from './components/SharedLinkView';
 import { Sidebar } from './components/Sidebar';
 import { SnippetModal } from './components/SnippetModal';
 import { SnippetsView } from './components/SnippetsView';
@@ -17,7 +18,9 @@ import {
 import {
   AuthUser,
   Folder,
+  LinkAccess,
   NoteDocument,
+  SharedLinkNote,
   SharePermission,
   SidebarFilter,
   Snippet,
@@ -38,6 +41,7 @@ import {
   refreshSharedNotes,
   removeNoteShare,
   shareNoteWithEmail,
+  updateNoteShareLink,
   updateSharedNoteLocal,
 } from './utils/shareClient';
 
@@ -66,9 +70,25 @@ function readStorage<T>(key: string, fallback: T): T {
   }
 }
 
+function getShareTokenFromUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const queryToken = params.get('share')?.trim();
+    if (queryToken) return queryToken;
+    const match = window.location.pathname.match(/^\/share\/([^/]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() =>
     readStorage<'dark' | 'light'>(THEME_STORAGE_KEY, 'dark')
+  );
+  const [activeShareToken, setActiveShareToken] = useState<string | null>(() =>
+    getShareTokenFromUrl()
   );
   const [authReady, setAuthReady] = useState(false);
   const [storageMode, setStorageMode] = useState<StorageBackendMode>('local');
@@ -134,6 +154,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setActiveShareToken(getShareTokenFromUrl());
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   // Load authenticated user's workspace
@@ -842,6 +870,35 @@ export default function App() {
     setNotes(nextNotes);
   };
 
+  const handleUpdateShareLink = async (
+    noteId: string,
+    linkAccess: LinkAccess,
+    regenerate = false
+  ) => {
+    if (!currentUser) {
+      throw new Error('Authentication required');
+    }
+    const targetNote = notesRef.current.find((n) => n.id === noteId);
+    if (!targetNote) {
+      throw new Error('Note not found');
+    }
+    const result = await updateNoteShareLink(
+      storageMode,
+      currentUser,
+      targetNote,
+      linkAccess,
+      regenerate
+    );
+    const nextNotes = notesRef.current.map((n) =>
+      n.id === noteId
+        ? { ...n, shareToken: result.shareToken, linkAccess: result.linkAccess }
+        : n
+    );
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    return result;
+  };
+
   const handleDuplicateSharedNote = (sourceNote: NoteDocument) => {
     const now = Date.now();
     const duplicated: NoteDocument = {
@@ -864,6 +921,38 @@ export default function App() {
     if (dbEnabledRef.current) {
       void syncApi('/api/notes', 'POST', duplicated);
     }
+  };
+
+  const handleExitShareView = () => {
+    setActiveShareToken(null);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState({}, '', '/');
+    }
+  };
+
+  const handleSaveCopyFromShareLink = (sharedNote: SharedLinkNote) => {
+    const now = Date.now();
+    const duplicated: NoteDocument = {
+      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      title: sharedNote.title ? `${sharedNote.title} (Copy)` : 'Untitled Note (Copy)',
+      content: sharedNote.content,
+      folderId: folders[0]?.id ?? null,
+      starred: false,
+      createdAt: now,
+      updatedAt: now,
+      shares: [],
+    };
+    const nextNotes = [duplicated, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(duplicated.id);
+    setFilter({ type: 'all' });
+    setViewMode('read');
+
+    if (dbEnabledRef.current) {
+      void syncApi('/api/notes', 'POST', duplicated);
+    }
+    handleExitShareView();
   };
 
   const handleLogout = async () => {
@@ -893,6 +982,20 @@ export default function App() {
       <div className="h-screen w-screen flex items-center justify-center bg-white dark:bg-[#121214] text-neutral-500 dark:text-neutral-400 text-[13.5px]">
         Loading NoteCraft...
       </div>
+    );
+  }
+
+  if (activeShareToken) {
+    return (
+      <SharedLinkView
+        token={activeShareToken}
+        storageMode={storageMode}
+        theme={theme}
+        currentUser={currentUser}
+        onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+        onExitShareView={handleExitShareView}
+        onSaveCopy={currentUser && workspaceLoaded ? handleSaveCopyFromShareLink : undefined}
+      />
     );
   }
 
@@ -1023,6 +1126,7 @@ export default function App() {
         onClose={() => setShareModalOpen(false)}
         onShare={handleShareNote}
         onRevoke={handleRevokeShare}
+        onUpdateShareLink={handleUpdateShareLink}
       />
 
       <ImportFileModal

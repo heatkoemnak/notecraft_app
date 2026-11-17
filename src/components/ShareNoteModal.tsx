@@ -1,10 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Check,
   ChevronDown,
   ChevronUp,
+  Copy,
   Download,
   FileCode2,
   FileText,
+  Globe,
+  Link2,
+  Lock,
   Mail,
   Printer,
   RotateCcw,
@@ -13,7 +18,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { AuthUser, NoteDocument, SharePermission } from '../types/notes';
+import { AuthUser, LinkAccess, NoteDocument, SharePermission } from '../types/notes';
 import {
   DEFAULT_PDF_EXPORT_OPTIONS,
   exportNoteAsDocx,
@@ -23,6 +28,7 @@ import {
   PdfExportOptions,
   PdfSlotPlacement,
 } from '../utils/documentExporter';
+import { buildShareUrl, copyTextToClipboard } from '../utils/shareClient';
 
 interface ShareNoteModalProps {
   isOpen: boolean;
@@ -31,6 +37,11 @@ interface ShareNoteModalProps {
   onClose: () => void;
   onShare: (noteId: string, email: string, permission: SharePermission) => Promise<void>;
   onRevoke: (noteId: string, shareId: string) => Promise<void>;
+  onUpdateShareLink: (
+    noteId: string,
+    linkAccess: LinkAccess,
+    regenerate?: boolean
+  ) => Promise<{ shareToken: string; linkAccess: LinkAccess }>;
 }
 
 type ExportFormat = 'pdf' | 'doc' | 'md';
@@ -82,11 +93,15 @@ export function ShareNoteModal({
   onClose,
   onShare,
   onRevoke,
+  onUpdateShareLink,
 }: ShareNoteModalProps) {
   const [email, setEmail] = useState('');
   const [permission, setPermission] = useState<SharePermission>('view');
   const [submitting, setSubmitting] = useState(false);
   const [busyShareId, setBusyShareId] = useState<string | null>(null);
+  const [linkUpdating, setLinkUpdating] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const [exportingFormat, setExportingFormat] = useState<ExportFormat | null>(null);
   const [showPdfOptions, setShowPdfOptions] = useState(false);
   const [pdfOptions, setPdfOptions] = useState<PdfExportOptions>(loadSavedPdfOptions);
@@ -98,9 +113,12 @@ export function ShareNoteModal({
     setEmail('');
     setPermission('view');
     setError(null);
+    setLinkError(null);
     setExportError(null);
     setSubmitting(false);
     setBusyShareId(null);
+    setLinkUpdating(false);
+    setLinkCopied(false);
     setExportingFormat(null);
     setShowPdfOptions(false);
   }, [isOpen, note?.id]);
@@ -147,6 +165,65 @@ export function ShareNoteModal({
       await onShare(note.id, recipientEmail, nextPerm);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not update permission.');
+    }
+  };
+
+  const currentLinkAccess: LinkAccess =
+    note.linkAccess === 'view' || note.linkAccess === 'edit' ? note.linkAccess : 'off';
+  const currentShareUrl = note.shareToken ? buildShareUrl(note.shareToken) : '';
+
+  const handleLinkAccessChange = async (nextAccess: LinkAccess) => {
+    setLinkError(null);
+    setLinkUpdating(true);
+    try {
+      await onUpdateShareLink(note.id, nextAccess, false);
+    } catch (err) {
+      setLinkError(err instanceof Error ? err.message : 'Could not update link access.');
+    } finally {
+      setLinkUpdating(false);
+    }
+  };
+
+  const handleCopyShareLink = async () => {
+    setLinkError(null);
+    setLinkUpdating(true);
+    try {
+      let token = note.shareToken ?? null;
+      if (currentLinkAccess === 'off' || !token) {
+        const nextAccess: LinkAccess = currentLinkAccess === 'off' ? 'view' : currentLinkAccess;
+        const result = await onUpdateShareLink(note.id, nextAccess, false);
+        token = result.shareToken;
+      }
+      const url = buildShareUrl(token);
+      const copied = await copyTextToClipboard(url);
+      if (!copied) {
+        setLinkError('Copy failed. Select the link above to copy manually.');
+        return;
+      }
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 2200);
+    } catch (err) {
+      setLinkError(err instanceof Error ? err.message : 'Could not copy share link.');
+    } finally {
+      setLinkUpdating(false);
+    }
+  };
+
+  const handleRegenerateLink = async () => {
+    setLinkError(null);
+    setLinkUpdating(true);
+    try {
+      const targetAccess: LinkAccess = currentLinkAccess === 'off' ? 'view' : currentLinkAccess;
+      const result = await onUpdateShareLink(note.id, targetAccess, true);
+      const copied = await copyTextToClipboard(buildShareUrl(result.shareToken));
+      if (copied) {
+        setLinkCopied(true);
+        window.setTimeout(() => setLinkCopied(false), 2200);
+      }
+    } catch (err) {
+      setLinkError(err instanceof Error ? err.message : 'Could not reset share link.');
+    } finally {
+      setLinkUpdating(false);
     }
   };
 
@@ -246,7 +323,7 @@ export function ShareNoteModal({
             <p className="mt-0.5 text-[12.5px] text-neutral-500 dark:text-neutral-400">
               {isSharedWithMe
                 ? `Shared by ${note.ownerName || note.ownerEmail} · Export a copy below.`
-                : 'Invite NoteCraft users by email or export this document as PDF, Word, or Markdown.'}
+                : 'Copy a shareable link, invite teammates by email, or export this document.'}
             </p>
           </div>
           <button
@@ -525,6 +602,98 @@ export function ShareNoteModal({
 
           {!isSharedWithMe && (
             <>
+              {/* Share by link */}
+              <div className="pt-4 border-t border-neutral-200 dark:border-white/[0.08] space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-[12.5px] font-medium text-neutral-700 dark:text-neutral-300">
+                    <Link2 className="w-3.5 h-3.5 text-neutral-400" />
+                    <span>Share by link</span>
+                  </span>
+
+                  <div className="inline-flex items-center gap-1.5">
+                    {currentLinkAccess === 'off' ? (
+                      <Lock className="w-3.5 h-3.5 text-neutral-400" />
+                    ) : (
+                      <Globe className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                    )}
+                    <select
+                      value={currentLinkAccess}
+                      disabled={linkUpdating}
+                      onChange={(e) => handleLinkAccessChange(e.target.value as LinkAccess)}
+                      aria-label="Link sharing access"
+                      className="px-2.5 py-1.5 text-[12.5px] rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#111114] text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-blue-500 cursor-pointer disabled:opacity-60"
+                    >
+                      <option value="off">Restricted · Invited only</option>
+                      <option value="view">Anyone with link · Can view</option>
+                      <option value="edit">Anyone with link · Can edit</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {currentLinkAccess !== 'off' && currentShareUrl ? (
+                    <input
+                      type="text"
+                      readOnly
+                      value={currentShareUrl}
+                      onFocus={(e) => e.currentTarget.select()}
+                      onClick={(e) => e.currentTarget.select()}
+                      aria-label="Shareable document URL"
+                      className="flex-1 min-w-0 px-3 py-2 text-[12.5px] font-mono-code rounded-lg border border-neutral-200 dark:border-white/10 bg-neutral-50 dark:bg-[#111114] text-neutral-700 dark:text-neutral-200 focus:outline-none focus:border-blue-500"
+                    />
+                  ) : (
+                    <div className="flex-1 min-w-0 px-3 py-2 text-[12.5px] rounded-lg border border-dashed border-neutral-300 dark:border-white/12 bg-neutral-50/70 dark:bg-white/[0.02] text-neutral-500 dark:text-neutral-400 truncate">
+                      Click Copy link to create a view-only link
+                    </div>
+                  )}
+
+                  {currentLinkAccess !== 'off' && note.shareToken && (
+                    <button
+                      type="button"
+                      disabled={linkUpdating}
+                      onClick={handleRegenerateLink}
+                      title="Generate a new link and invalidate the old one"
+                      aria-label="Reset share link"
+                      className="p-2 rounded-lg border border-neutral-200 dark:border-white/10 text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-100 dark:hover:bg-white/[0.06] disabled:opacity-50 transition-colors cursor-pointer shrink-0"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={linkUpdating}
+                    onClick={handleCopyShareLink}
+                    className={`inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg text-[13px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                      linkCopied
+                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                        : 'bg-blue-600 hover:bg-blue-700 text-white'
+                    }`}
+                  >
+                    {linkCopied ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy link</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {linkError && (
+                  <div
+                    role="alert"
+                    className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-700 dark:text-red-300"
+                  >
+                    {linkError}
+                  </div>
+                )}
+              </div>
+
               <form
                 onSubmit={handleSubmit}
                 className="pt-4 border-t border-neutral-200 dark:border-white/[0.08] space-y-3"

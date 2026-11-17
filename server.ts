@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express, { type Request, type Response } from 'express';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { Pool } from 'pg';
 import {
@@ -301,7 +301,7 @@ async function startServer() {
             [user.id]
           ),
           pool.query(
-            'SELECT id, title, content, folder_id, starred, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
+            'SELECT id, title, content, folder_id, starred, share_token, link_access, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC',
             [user.id]
           ),
           pool.query(
@@ -385,6 +385,9 @@ async function startServer() {
           content: r.content,
           folderId: r.folder_id,
           starred: Boolean(r.starred),
+          shareToken: r.share_token ?? null,
+          linkAccess:
+            r.link_access === 'view' || r.link_access === 'edit' ? r.link_access : 'off',
           createdAt: Number(r.created_at),
           updatedAt: Number(r.updated_at),
           shares: sharesByNoteId.get(r.id) ?? [],
@@ -727,6 +730,169 @@ async function startServer() {
     }
   });
 
+  // Manage shareable public link for an owned note
+  app.post('/api/notes/:id/share-link', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const rawAccess = req.body?.linkAccess;
+      const linkAccess: 'off' | 'view' | 'edit' =
+        rawAccess === 'off' || rawAccess === 'edit' || rawAccess === 'view'
+          ? rawAccess
+          : 'view';
+      const regenerate = Boolean(req.body?.regenerate);
+
+      const noteRes = await pool.query<{ id: string; share_token: string | null }>(
+        'SELECT id, share_token FROM notes WHERE id = $1 AND user_id = $2',
+        [req.params.id, user.id]
+      );
+      const existing = noteRes.rows[0];
+      if (!existing) {
+        return res.status(404).json({ error: 'Note not found or not owned by you.' });
+      }
+
+      const nextToken =
+        !existing.share_token || regenerate
+          ? randomBytes(12).toString('base64url')
+          : existing.share_token;
+
+      await pool.query(
+        'UPDATE notes SET share_token = $1, link_access = $2 WHERE id = $3 AND user_id = $4',
+        [nextToken, linkAccess, req.params.id, user.id]
+      );
+
+      return res.json({
+        shareToken: nextToken,
+        linkAccess,
+      });
+    } catch (err) {
+      console.error('Failed to update share link:', err);
+      return res.status(500).json({ error: 'Failed to update share link.' });
+    }
+  });
+
+  // Public endpoint: fetch a document via share token
+  app.get('/api/shared-link/:token', async (req, res) => {
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'PostgreSQL not configured' });
+    }
+
+    const token = typeof req.params.token === 'string' ? req.params.token.trim() : '';
+    if (!token || token.length > 128) {
+      return res.status(400).json({ error: 'Invalid share link.' });
+    }
+
+    try {
+      await ensureSchema(pool);
+      const result = await pool.query<{
+        id: string;
+        title: string;
+        content: string;
+        created_at: string | number;
+        updated_at: string | number;
+        share_token: string;
+        link_access: string;
+        owner_name: string;
+        owner_email: string;
+      }>(
+        `SELECT n.id, n.title, n.content, n.created_at, n.updated_at,
+                n.share_token, n.link_access, u.name AS owner_name, u.email AS owner_email
+         FROM notes n
+         JOIN users u ON u.id = n.user_id
+         WHERE n.share_token = $1 AND n.link_access IN ('view', 'edit')`,
+        [token]
+      );
+
+      const row = result.rows[0];
+      if (!row) {
+        return res
+          .status(404)
+          .json({ error: 'This share link is invalid or has been disabled by the owner.' });
+      }
+
+      return res.json({
+        note: {
+          id: row.id,
+          title: row.title,
+          content: row.content,
+          createdAt: Number(row.created_at),
+          updatedAt: Number(row.updated_at),
+          shareToken: row.share_token,
+          linkAccess: row.link_access === 'edit' ? 'edit' : 'view',
+          ownerName: row.owner_name,
+          ownerEmail: row.owner_email,
+        },
+      });
+    } catch (err) {
+      if (isPgConnectionError(err)) {
+        return res.status(503).json({ error: 'PostgreSQL unavailable' });
+      }
+      console.error('Failed to load shared note by link:', err);
+      return res.status(500).json({ error: 'Failed to load shared document.' });
+    }
+  });
+
+  // Public endpoint: update a document via an editable share token
+  app.patch('/api/shared-link/:token', async (req, res) => {
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'PostgreSQL not configured' });
+    }
+
+    const token = typeof req.params.token === 'string' ? req.params.token.trim() : '';
+    if (!token || token.length > 128) {
+      return res.status(400).json({ error: 'Invalid share link.' });
+    }
+
+    try {
+      await ensureSchema(pool);
+      const lookup = await pool.query<{ id: string; link_access: string }>(
+        `SELECT id, link_access FROM notes WHERE share_token = $1 AND link_access IN ('view', 'edit')`,
+        [token]
+      );
+      const target = lookup.rows[0];
+      if (!target) {
+        return res
+          .status(404)
+          .json({ error: 'This share link is invalid or has been disabled by the owner.' });
+      }
+      if (target.link_access !== 'edit') {
+        return res.status(403).json({ error: 'This link only allows viewing.' });
+      }
+
+      const { title, content, updatedAt } = req.body || {};
+      const sets: string[] = [];
+      const values: unknown[] = [];
+
+      if (typeof title === 'string') {
+        values.push(title);
+        sets.push(`title = $${values.length}`);
+      }
+      if (typeof content === 'string') {
+        values.push(content);
+        sets.push(`content = $${values.length}`);
+      }
+
+      const nextUpdatedAt = Number(updatedAt || Date.now());
+      values.push(nextUpdatedAt);
+      sets.push(`updated_at = $${values.length}`);
+      values.push(target.id);
+      const idIdx = values.length;
+
+      await pool.query(`UPDATE notes SET ${sets.join(', ')} WHERE id = $${idIdx}`, values);
+      return res.json({ ok: true, updatedAt: nextUpdatedAt });
+    } catch (err) {
+      if (isPgConnectionError(err)) {
+        return res.status(503).json({ error: 'PostgreSQL unavailable' });
+      }
+      console.error('Failed to update shared note by link:', err);
+      return res.status(500).json({ error: 'Failed to save changes.' });
+    }
+  });
+
   // Snippets CRUD
   app.post('/api/snippets', async (req, res) => {
     try {
@@ -817,32 +983,68 @@ async function startServer() {
   });
 
   app.get('/api/images/:id', async (req, res) => {
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'PostgreSQL not configured' });
+    }
+
     try {
-      const auth = await requireAuth(req, res);
-      if (!auth) return;
-      const { pool, user } = auth;
+      await ensureSchema(pool);
+      const user = await resolveSessionUser(pool, req);
+      const rawShareToken =
+        typeof req.query?.shareToken === 'string'
+          ? req.query.shareToken.trim()
+          : typeof req.query?.share === 'string'
+          ? req.query.share.trim()
+          : '';
+
+      if (!user && !rawShareToken) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
 
       const result = await pool.query<{ data_url: string }>(
         `SELECT ni.data_url
          FROM note_images ni
          WHERE ni.id = $1
            AND (
-             ni.user_id = $2
-             OR EXISTS (
-               SELECT 1
-               FROM note_shares ns
-               JOIN notes n ON n.id = ns.note_id
-               WHERE ns.recipient_email = $3
-                 AND n.user_id = ni.user_id
-                 AND n.content LIKE '%' || $1 || '%'
+             ($2::text IS NOT NULL AND ni.user_id = $2)
+             OR (
+               $3::text IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM note_shares ns
+                 JOIN notes n ON n.id = ns.note_id
+                 WHERE ns.recipient_email = $3
+                   AND n.user_id = ni.user_id
+                   AND n.content LIKE '%' || $1 || '%'
+               )
+             )
+             OR (
+               $4::text IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM notes n
+                 WHERE n.share_token = $4
+                   AND n.link_access IN ('view', 'edit')
+                   AND n.user_id = ni.user_id
+                   AND n.content LIKE '%' || $1 || '%'
+               )
              )
            )`,
-        [req.params.id, user.id, user.email.toLowerCase()]
+        [
+          req.params.id,
+          user?.id ?? null,
+          user ? user.email.toLowerCase() : null,
+          rawShareToken || null,
+        ]
       );
       const row = result.rows[0];
       if (!row) return res.status(404).json({ error: 'Image not found' });
       return res.json({ dataUrl: row.data_url });
     } catch (err) {
+      if (isPgConnectionError(err)) {
+        return res.status(503).json({ error: 'PostgreSQL unavailable' });
+      }
       console.error('Failed to fetch image from PostgreSQL:', err);
       return res.status(500).json({ error: 'Failed to fetch image' });
     }
@@ -881,10 +1083,24 @@ async function startServer() {
   });
 
   app.get('/api/files/:id', async (req, res) => {
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'PostgreSQL not configured' });
+    }
+
     try {
-      const auth = await requireAuth(req, res);
-      if (!auth) return;
-      const { pool, user } = auth;
+      await ensureSchema(pool);
+      const user = await resolveSessionUser(pool, req);
+      const rawShareToken =
+        typeof req.query?.shareToken === 'string'
+          ? req.query.shareToken.trim()
+          : typeof req.query?.share === 'string'
+          ? req.query.share.trim()
+          : '';
+
+      if (!user && !rawShareToken) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
 
       const result = await pool.query<{
         data_url: string;
@@ -896,17 +1112,36 @@ async function startServer() {
          FROM note_files nf
          WHERE nf.id = $1
            AND (
-             nf.user_id = $2
-             OR EXISTS (
-               SELECT 1
-               FROM note_shares ns
-               JOIN notes n ON n.id = ns.note_id
-               WHERE ns.recipient_email = $3
-                 AND n.user_id = nf.user_id
-                 AND n.content LIKE '%' || $1 || '%'
+             ($2::text IS NOT NULL AND nf.user_id = $2)
+             OR (
+               $3::text IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM note_shares ns
+                 JOIN notes n ON n.id = ns.note_id
+                 WHERE ns.recipient_email = $3
+                   AND n.user_id = nf.user_id
+                   AND n.content LIKE '%' || $1 || '%'
+               )
+             )
+             OR (
+               $4::text IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM notes n
+                 WHERE n.share_token = $4
+                   AND n.link_access IN ('view', 'edit')
+                   AND n.user_id = nf.user_id
+                   AND n.content LIKE '%' || $1 || '%'
+               )
              )
            )`,
-        [req.params.id, user.id, user.email.toLowerCase()]
+        [
+          req.params.id,
+          user?.id ?? null,
+          user ? user.email.toLowerCase() : null,
+          rawShareToken || null,
+        ]
       );
       const row = result.rows[0];
       if (!row) return res.status(404).json({ error: 'File not found' });
@@ -917,6 +1152,9 @@ async function startServer() {
         sizeBytes: Number(row.size_bytes),
       });
     } catch (err) {
+      if (isPgConnectionError(err)) {
+        return res.status(503).json({ error: 'PostgreSQL unavailable' });
+      }
       console.error('Failed to fetch file from PostgreSQL:', err);
       return res.status(500).json({ error: 'Failed to fetch file' });
     }
