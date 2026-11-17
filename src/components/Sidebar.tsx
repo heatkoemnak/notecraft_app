@@ -22,6 +22,7 @@ import {
   X,
 } from 'lucide-react';
 import { AuthUser, Folder, NoteDocument, SidebarFilter } from '../types/notes';
+import { UserSettingsModal } from './UserSettingsModal';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -84,6 +85,7 @@ export function Sidebar({
   const [confirmDeleteFolderId, setConfirmDeleteFolderId] = useState<string | null>(null);
   const [sharedExpanded, setSharedExpanded] = useState(true);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const starredCount = notes.filter((n) => n.starred).length;
 
@@ -620,8 +622,15 @@ export function Sidebar({
             </button>
           </div>
 
-          <div className="px-3 py-2.5 border-t border-neutral-200/70 dark:border-white/[0.05] flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5 min-w-0">
+          <div
+            onClick={() => setSettingsOpen(true)}
+            role="button"
+            tabIndex={0}
+            title="Open account settings and theme preferences"
+            aria-label="Open account settings"
+            className="px-3 py-2.5 border-t border-neutral-200/70 dark:border-white/[0.05] flex items-center justify-between gap-2 hover:bg-neutral-200/50 dark:hover:bg-white/[0.04] transition-colors cursor-pointer select-none"
+          >
+            <div className="flex items-center gap-2.5 min-w-0 pointer-events-none">
               <div className="w-7 h-7 rounded-lg bg-neutral-900 dark:bg-white/10 text-white dark:text-neutral-100 text-[11.5px] font-semibold flex items-center justify-center shrink-0 uppercase">
                 {user.name
                   .split(/\s+/)
@@ -641,7 +650,10 @@ export function Sidebar({
 
             <button
               type="button"
-              onClick={onLogout}
+              onClick={(e) => {
+                e.stopPropagation();
+                onLogout();
+              }}
               title="Sign out"
               aria-label="Sign out"
               className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-950 dark:text-neutral-400 dark:hover:text-white hover:bg-neutral-200/70 dark:hover:bg-white/[0.06] transition-colors cursor-pointer shrink-0"
@@ -650,6 +662,15 @@ export function Sidebar({
             </button>
           </div>
         </div>
+
+        <UserSettingsModal
+          isOpen={settingsOpen}
+          user={user}
+          theme={theme}
+          onClose={() => setSettingsOpen(false)}
+          onToggleTheme={onToggleTheme}
+          onLogout={onLogout}
+        />
       </aside>
     </>
   );
