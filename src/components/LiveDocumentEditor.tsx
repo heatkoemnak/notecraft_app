@@ -177,6 +177,182 @@ function toggleInlineCodeSelection(el: HTMLElement): boolean {
   return true;
 }
 
+function findInlineBacktickMatches(
+  text: string
+): Array<{ start: number; end: number; code: string }> {
+  const matches: Array<{ start: number; end: number; code: string }> = [];
+  let i = 0;
+
+  while (i < text.length) {
+    if (text[i] === '`') {
+      let tickCount = 1;
+      while (i + tickCount < text.length && text[i + tickCount] === '`') {
+        tickCount += 1;
+      }
+      if (tickCount > 1) {
+        i += tickCount;
+        continue;
+      }
+
+      let closeIdx = -1;
+      for (let j = i + 1; j < text.length; j += 1) {
+        if (text[j] === '\n') break;
+        if (text[j] === '`') {
+          closeIdx = j;
+          break;
+        }
+      }
+
+      if (closeIdx > i + 1) {
+        if (closeIdx + 1 < text.length && text[closeIdx + 1] === '`') {
+          i = closeIdx + 1;
+          continue;
+        }
+        const inner = text.slice(i + 1, closeIdx);
+        if (inner.trim().length > 0) {
+          matches.push({ start: i, end: closeIdx + 1, code: inner });
+        }
+        i = closeIdx + 1;
+        continue;
+      }
+    }
+    i += 1;
+  }
+
+  return matches;
+}
+
+function collectNonCodeTextNodes(root: Node, out: Text[]) {
+  const children = Array.from(root.childNodes);
+  for (const child of children) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out.push(child as Text);
+    } else if (
+      child.nodeType === Node.ELEMENT_NODE &&
+      (child as HTMLElement).tagName.toUpperCase() !== 'CODE'
+    ) {
+      collectNonCodeTextNodes(child, out);
+    }
+  }
+}
+
+function convertInlineBackticksInDom(el: HTMLElement): boolean {
+  const sel = window.getSelection();
+  const hasCaret = Boolean(
+    sel && sel.rangeCount > 0 && sel.isCollapsed && el.contains(sel.anchorNode)
+  );
+  const initialAnchorNode = hasCaret ? sel!.anchorNode : null;
+  const initialAnchorOffset = hasCaret ? sel!.anchorOffset : 0;
+  let nextCaretTarget: { node: Node; offset: number } | null = null;
+  let changed = false;
+
+  // Remove any empty <code> elements left after deleting all characters inside one
+  const codeNodes = Array.from(el.querySelectorAll('code'));
+  for (const codeEl of codeNodes) {
+    const cleanText = (codeEl.textContent || '').replace(/\u200B/g, '');
+    if (cleanText.length === 0) {
+      const parent = codeEl.parentNode;
+      if (parent) {
+        const idx = Array.from(parent.childNodes).indexOf(codeEl);
+        const caretWasInside = Boolean(
+          initialAnchorNode && (initialAnchorNode === codeEl || codeEl.contains(initialAnchorNode))
+        );
+        parent.removeChild(codeEl);
+        changed = true;
+        if (caretWasInside) {
+          nextCaretTarget = { node: parent, offset: Math.max(0, idx) };
+        }
+      }
+    }
+  }
+
+  const textNodes: Text[] = [];
+  collectNonCodeTextNodes(el, textNodes);
+
+  for (const textNode of textNodes) {
+    const text = textNode.textContent || '';
+    if (!text.includes('`')) continue;
+
+    const matches = findInlineBacktickMatches(text);
+    if (matches.length === 0) continue;
+
+    changed = true;
+    const caretInNode = initialAnchorNode === textNode;
+    const frag = document.createDocumentFragment();
+    let cursor = 0;
+    let pendingAfterCodeEl: HTMLElement | null = null;
+
+    for (let mIdx = 0; mIdx < matches.length; mIdx += 1) {
+      const m = matches[mIdx];
+      if (m.start > cursor) {
+        const plain = text.slice(cursor, m.start);
+        const plainNode = document.createTextNode(plain);
+        frag.appendChild(plainNode);
+        if (caretInNode && initialAnchorOffset >= cursor && initialAnchorOffset <= m.start) {
+          nextCaretTarget = { node: plainNode, offset: initialAnchorOffset - cursor };
+        }
+      }
+
+      const codeEl = document.createElement('code');
+      codeEl.setAttribute('data-inline-code', 'true');
+      codeEl.textContent = m.code;
+      frag.appendChild(codeEl);
+
+      if (caretInNode && initialAnchorOffset > m.start && initialAnchorOffset <= m.end) {
+        if (initialAnchorOffset === m.end) {
+          pendingAfterCodeEl = codeEl;
+        } else if (codeEl.firstChild) {
+          nextCaretTarget = {
+            node: codeEl.firstChild,
+            offset: Math.max(0, Math.min(m.code.length, initialAnchorOffset - (m.start + 1))),
+          };
+        }
+      }
+
+      cursor = m.end;
+    }
+
+    if (cursor < text.length) {
+      const afterText = text.slice(cursor);
+      const afterNode = document.createTextNode(afterText);
+      frag.appendChild(afterNode);
+
+      if (pendingAfterCodeEl) {
+        nextCaretTarget = { node: afterNode, offset: 0 };
+        pendingAfterCodeEl = null;
+      } else if (caretInNode && initialAnchorOffset >= cursor) {
+        nextCaretTarget = { node: afterNode, offset: initialAnchorOffset - cursor };
+      }
+    } else if (pendingAfterCodeEl) {
+      const nextSib = textNode.nextSibling;
+      if (
+        nextSib &&
+        nextSib.nodeType === Node.TEXT_NODE &&
+        (nextSib.textContent || '').replace(/\u200B/g, '').length > 0
+      ) {
+        nextCaretTarget = { node: nextSib, offset: 0 };
+      } else {
+        const exitAnchor = document.createTextNode('\u200B');
+        frag.appendChild(exitAnchor);
+        nextCaretTarget = { node: exitAnchor, offset: 1 };
+      }
+      pendingAfterCodeEl = null;
+    }
+
+    textNode.parentNode?.replaceChild(frag, textNode);
+  }
+
+  if (nextCaretTarget && sel) {
+    const nextRange = document.createRange();
+    nextRange.setStart(nextCaretTarget.node, nextCaretTarget.offset);
+    nextRange.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(nextRange);
+  }
+
+  return changed;
+}
+
 interface RichInlineFieldProps {
   markdown: string;
   externalSyncSeq: number;
@@ -207,6 +383,7 @@ function RichInlineField({
   const elRef = useRef<HTMLDivElement>(null);
   const lastEmittedRef = useRef<string>(markdown);
   const lastSyncSeqRef = useRef<number>(-1);
+  const isComposingRef = useRef<boolean>(false);
 
   useEffect(() => {
     registerRef?.(elRef.current);
@@ -226,9 +403,12 @@ function RichInlineField({
     }
   }, [markdown, externalSyncSeq]);
 
-  const emitFromDom = () => {
+  const emitFromDom = (skipInlineConvert = false) => {
     const el = elRef.current;
     if (!el) return;
+    if (!skipInlineConvert && !isComposingRef.current) {
+      convertInlineBackticksInDom(el);
+    }
     const nextMd = htmlToInlineMarkdown(el);
     lastEmittedRef.current = nextMd;
     if (nextMd !== markdown) {
@@ -246,9 +426,17 @@ function RichInlineField({
       aria-label={ariaLabel}
       data-placeholder={placeholder}
       onFocus={onFocusBlock}
-      onInput={emitFromDom}
+      onCompositionStart={() => {
+        isComposingRef.current = true;
+      }}
+      onCompositionEnd={() => {
+        isComposingRef.current = false;
+        emitFromDom();
+      }}
+      onInput={() => emitFromDom()}
       onKeyDown={(e) => {
-        if (!elRef.current) return;
+        const el = elRef.current;
+        if (!el) return;
         const mod = (e.ctrlKey || e.metaKey) && !e.altKey;
         if (mod && e.key.toLowerCase() === 'b') {
           e.preventDefault();
@@ -262,7 +450,79 @@ function RichInlineField({
           emitFromDom();
           return;
         }
-        onKeyDown?.(e, elRef.current);
+
+        // Smooth Backspace when caret sits immediately after a <code> chip on a ZWSP anchor
+        if (e.key === 'Backspace' && !e.shiftKey && !mod) {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && sel.isCollapsed) {
+            const range = sel.getRangeAt(0);
+            if (range.startContainer.nodeType === Node.TEXT_NODE) {
+              const tn = range.startContainer as Text;
+              const prefix = (tn.textContent || '').slice(0, range.startOffset);
+              const prev = tn.previousSibling;
+              if (
+                prefix.length > 0 &&
+                /^\u200B+$/.test(prefix) &&
+                prev &&
+                prev.nodeType === Node.ELEMENT_NODE &&
+                (prev as HTMLElement).tagName.toUpperCase() === 'CODE'
+              ) {
+                e.preventDefault();
+                const codeEl = prev as HTMLElement;
+                const codeText = (codeEl.textContent || '').replace(/\u200B/g, '');
+                if (codeText.length > 1) {
+                  codeEl.textContent = codeText.slice(0, -1);
+                } else {
+                  codeEl.remove();
+                  const remaining = (tn.textContent || '').slice(range.startOffset);
+                  if (remaining) {
+                    tn.textContent = remaining;
+                    const r = document.createRange();
+                    r.setStart(tn, 0);
+                    r.collapse(true);
+                    sel.removeAllRanges();
+                    sel.addRange(r);
+                  } else {
+                    tn.remove();
+                  }
+                }
+                emitFromDom(true);
+                return;
+              }
+            }
+          }
+        }
+
+        // Smooth ArrowRight to step outside a trailing <code> chip
+        if (e.key === 'ArrowRight' && !e.shiftKey && !mod) {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && sel.isCollapsed) {
+            let node: Node | null = sel.anchorNode;
+            while (node && node !== el) {
+              if (
+                node.nodeType === Node.ELEMENT_NODE &&
+                (node as HTMLElement).tagName.toUpperCase() === 'CODE'
+              ) {
+                const codeEl = node as HTMLElement;
+                if (isCaretAtEnd(codeEl) && !codeEl.nextSibling) {
+                  e.preventDefault();
+                  const exitAnchor = document.createTextNode('\u200B');
+                  codeEl.after(exitAnchor);
+                  const nextRange = document.createRange();
+                  nextRange.setStart(exitAnchor, 1);
+                  nextRange.collapse(true);
+                  sel.removeAllRanges();
+                  sel.addRange(nextRange);
+                  return;
+                }
+                break;
+              }
+              node = node.parentNode;
+            }
+          }
+        }
+
+        onKeyDown?.(e, el);
       }}
       onPaste={(e) => {
         const items = Array.from(e.clipboardData?.items || []);
@@ -285,7 +545,7 @@ function RichInlineField({
           emitFromDom();
         }
       }}
-      className={`live-editable outline-none break-words [&_strong]:font-semibold [&_strong]:text-neutral-950 dark:[&_strong]:text-white [&_em]:italic [&_code]:font-mono-code [&_code]:text-[13px] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:bg-neutral-100 dark:[&_code]:bg-white/[0.08] [&_code]:text-neutral-900 dark:[&_code]:text-neutral-100 [&_code]:border [&_code]:border-neutral-200/70 dark:[&_code]:border-white/[0.06] [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_a]:underline-offset-2 ${className}`}
+      className={`live-editable outline-none break-words [&_strong]:font-semibold [&_strong]:text-neutral-950 dark:[&_strong]:text-white [&_em]:italic [&_code]:font-mono-code [&_code]:text-[13px] [&_code]:px-1.5 [&_code]:py-[1px] [&_code]:rounded-md [&_code]:bg-neutral-100 dark:[&_code]:bg-white/[0.09] [&_code]:text-neutral-900 dark:[&_code]:text-neutral-100 [&_code]:border [&_code]:border-neutral-200/80 dark:[&_code]:border-white/[0.09] [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_a]:underline [&_a]:underline-offset-2 ${className}`}
     />
   );
 }

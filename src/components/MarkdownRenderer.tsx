@@ -571,7 +571,7 @@ export function MarkdownRenderer({ content, onToggleCheckbox }: MarkdownRenderer
               return <CodeBlock language={lang || 'text'} code={text} />;
             }
             return (
-              <code className="font-mono-code text-[13px] px-1.5 py-0.5 rounded-md bg-neutral-100 dark:bg-white/[0.08] text-neutral-900 dark:text-neutral-100 border border-neutral-200/70 dark:border-white/[0.06]">
+              <code className="font-mono-code text-[13px] px-1.5 py-[1px] rounded-md bg-neutral-100 dark:bg-white/[0.09] text-neutral-900 dark:text-neutral-100 border border-neutral-200/80 dark:border-white/[0.09]">
                 {children}
               </code>
             );

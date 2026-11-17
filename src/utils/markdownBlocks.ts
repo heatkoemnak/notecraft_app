@@ -72,22 +72,23 @@ function formatInlineSegment(segment: string): string {
 
 export function inlineMarkdownToHtml(markdown: string): string {
   if (!markdown) return '';
+  const cleanMarkdown = markdown.replace(/\u200B/g, '');
 
   const parts: string[] = [];
   const codeRegex = /`([^`\n]+)`/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = codeRegex.exec(markdown)) !== null) {
+  while ((match = codeRegex.exec(cleanMarkdown)) !== null) {
     if (match.index > lastIndex) {
-      parts.push(formatInlineSegment(markdown.slice(lastIndex, match.index)));
+      parts.push(formatInlineSegment(cleanMarkdown.slice(lastIndex, match.index)));
     }
     parts.push(`<code data-inline-code="true">${escapeHtml(match[1])}</code>`);
     lastIndex = codeRegex.lastIndex;
   }
 
-  if (lastIndex < markdown.length) {
-    parts.push(formatInlineSegment(markdown.slice(lastIndex)));
+  if (lastIndex < cleanMarkdown.length) {
+    parts.push(formatInlineSegment(cleanMarkdown.slice(lastIndex)));
   }
 
   return parts.join('');
@@ -109,7 +110,7 @@ function serializeChildNodes(parent: Node): string {
   for (let i = 0; i < nodes.length; i += 1) {
     const node = nodes[i];
     if (node.nodeType === Node.TEXT_NODE) {
-      result += (node.textContent || '').replace(/\u00A0/g, ' ');
+      result += (node.textContent || '').replace(/\u00A0/g, ' ').replace(/\u200B/g, '');
       continue;
     }
 
@@ -127,7 +128,10 @@ function serializeChildNodes(parent: Node): string {
     }
 
     if (tag === 'CODE') {
-      const codeText = (el.textContent || '').replace(/\u00A0/g, ' ').replace(/`/g, '');
+      const codeText = (el.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\u200B/g, '')
+        .replace(/`/g, '');
       if (codeText) {
         result += `\`${codeText}\``;
       }
