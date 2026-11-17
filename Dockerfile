@@ -29,6 +29,7 @@ RUN if [ -f package-lock.json ]; then \
     fi
 
 COPY --from=builder /app/dist ./dist
+COPY tsconfig.json ./
 COPY server.ts ./
 COPY server ./server
 COPY src/data ./src/data
