@@ -13,6 +13,8 @@ interface GoogleAccountSelectorModalProps {
 interface OAuthStatus {
   googleConfigured: boolean;
   githubConfigured: boolean;
+  googleClientId?: string | null;
+  githubClientId?: string | null;
   appUrl: string;
   googleCallbackUrl: string;
   githubCallbackUrl: string;
@@ -255,19 +257,28 @@ APP_URL=${oauthStatus?.appUrl || origin}`;
                     : 'border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-200'
                 }`}
               >
-                <div className="flex items-center gap-2 font-semibold mb-1">
-                  <Shield className="w-4 h-4 shrink-0" />
+                <div className="flex items-center gap-2 font-semibold mb-1 text-[13px]">
+                  <Shield className="w-4 h-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
                   <span>
                     {isConfigured
-                      ? `Server has valid ${isGoogle ? 'Google' : 'GitHub'} credentials configured!`
+                      ? `${isGoogle ? 'Google' : 'GitHub'} OAuth 2.0 Credentials Active`
                       : `Server credentials required for real ${isGoogle ? 'Google' : 'GitHub'} login`}
                   </span>
                 </div>
-                <p>
-                  {isConfigured
-                    ? `Click the button below to connect with your real ${isGoogle ? 'Google' : 'GitHub'} account.`
-                    : `In Portainer or Docker, replace placeholder values with your real credentials obtained from ${isGoogle ? 'Google Cloud Console' : 'GitHub Developer Settings'}.`}
-                </p>
+                {isConfigured ? (
+                  <div className="space-y-1">
+                    <p className="text-neutral-700 dark:text-neutral-300">
+                      Client ID: <code className="font-mono text-xs text-neutral-900 dark:text-white bg-neutral-200/60 dark:bg-black/30 px-1.5 py-0.5 rounded break-all">{oauthStatus?.googleClientId || 'Connected'}</code>
+                    </p>
+                    <p className="text-[12px] text-neutral-600 dark:text-neutral-400">
+                      Click the button below to sign in with your real Google account.
+                    </p>
+                  </div>
+                ) : (
+                  <p>
+                    In Portainer or Docker, replace placeholder values with your real credentials obtained from {isGoogle ? 'Google Cloud Console' : 'GitHub Developer Settings'}.
+                  </p>
+                )}
               </div>
 
               {error && (

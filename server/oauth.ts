@@ -11,6 +11,24 @@ import {
 import { ensureSchema, seedUserWorkspace } from './db.ts';
 
 export function getHostUrl(req: Request): string {
+  const forwardedHost = req.headers['x-forwarded-host'];
+  const host =
+    typeof forwardedHost === 'string'
+      ? forwardedHost.split(',')[0].trim()
+      : req.get('host');
+
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  const proto =
+    typeof forwardedProto === 'string'
+      ? forwardedProto.split(',')[0].trim()
+      : req.secure || (host && !host.includes('localhost'))
+      ? 'https'
+      : req.protocol || 'http';
+
+  if (host && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+    return `${proto}://${host}`.replace(/\/+$/, '');
+  }
+
   const envUrl = process.env.APP_URL?.trim();
   if (
     envUrl &&
@@ -20,19 +38,8 @@ export function getHostUrl(req: Request): string {
   ) {
     return envUrl.replace(/\/+$/, '');
   }
-  const forwardedProto = req.headers['x-forwarded-proto'];
-  const proto =
-    typeof forwardedProto === 'string'
-      ? forwardedProto.split(',')[0].trim()
-      : req.secure
-      ? 'https'
-      : req.protocol;
-  const forwardedHost = req.headers['x-forwarded-host'];
-  const host =
-    typeof forwardedHost === 'string'
-      ? forwardedHost.split(',')[0].trim()
-      : req.get('host');
-  return `${proto}://${host}`;
+
+  return `${proto}://${host || 'localhost:3000'}`.replace(/\/+$/, '');
 }
 
 export function registerOAuthRoutes(
@@ -54,9 +61,14 @@ export function registerOAuthRoutes(
       val.includes('your_google_client_secret') ||
       val.includes('your_github_client_secret');
 
+    const googleValid = Boolean(googleClientId && googleClientSecret && !isPlaceholder(googleClientId));
+    const githubValid = Boolean(githubClientId && githubClientSecret && !isPlaceholder(githubClientId));
+
     res.json({
-      googleConfigured: Boolean(googleClientId && googleClientSecret && !isPlaceholder(googleClientId)),
-      githubConfigured: Boolean(githubClientId && githubClientSecret && !isPlaceholder(githubClientId)),
+      googleConfigured: googleValid,
+      githubConfigured: githubValid,
+      googleClientId: googleValid ? googleClientId : null,
+      githubClientId: githubValid ? githubClientId : null,
       appUrl: hostUrl,
       googleCallbackUrl: `${hostUrl}/api/auth/google/callback`,
       githubCallbackUrl: `${hostUrl}/api/auth/github/callback`,
