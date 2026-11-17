@@ -210,6 +210,21 @@ async function callGroqChat(
   }
 }
 
+function resolveGroqConfig(): { apiKey: string; model: string } {
+  const rawKey = process.env.GROQ_API_KEY ?? process.env.GROQ_KEY ?? '';
+  const apiKey = rawKey.trim().replace(/^['"]|['"]$/g, '').trim();
+  if (!apiKey || apiKey === 'MY_GROQ_API_KEY') {
+    throw new GroqProofreadError(
+      'GROQ_API_KEY is not configured on the server. Add GROQ_API_KEY to your environment secrets or Docker/Portainer stack environment variables and restart the server.',
+      503
+    );
+  }
+  const rawModel = process.env.GROQ_MODEL ?? '';
+  const model =
+    rawModel.trim().replace(/^['"]|['"]$/g, '').trim() || DEFAULT_GROQ_MODEL;
+  return { apiKey, model };
+}
+
 export async function proofreadWithGroq({
   text,
   mode = 'proofread',
@@ -217,15 +232,7 @@ export async function proofreadWithGroq({
   text: string;
   mode?: ProofreadMode;
 }): Promise<ProofreadResult> {
-  const apiKey = process.env.GROQ_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GROQ_API_KEY') {
-    throw new GroqProofreadError(
-      'GROQ_API_KEY is not configured on the server. Add your Groq API key to GROQ_API_KEY in environment secrets.',
-      503
-    );
-  }
-
-  const model = process.env.GROQ_MODEL?.trim() || DEFAULT_GROQ_MODEL;
+  const { apiKey, model } = resolveGroqConfig();
   const systemPrompt = buildSystemPrompt(mode);
   const { maskedText, restore } = protectNonProseSegments(text);
 
