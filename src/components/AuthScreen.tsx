@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Eye, EyeOff, FileText, Lock, Mail, Moon, Sun, User } from 'lucide-react';
 import { AuthUser } from '../types/notes';
 import { loginAccount, registerAccount, StorageBackendMode } from '../utils/authClient';
+import { GoogleAccountSelectorModal } from './GoogleAccountSelectorModal';
 
 interface AuthScreenProps {
   storageMode: StorageBackendMode;
@@ -23,6 +24,7 @@ export function AuthScreen({
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [oauthProviderModal, setOauthProviderModal] = useState<'google' | 'github' | null>(null);
 
   const handleModeChange = (nextMode: 'login' | 'register') => {
     setMode(nextMode);
@@ -228,8 +230,55 @@ export function AuthScreen({
                 : 'Create account'}
             </button>
           </form>
+
+          <div className="relative my-5">
+            <div className="absolute inset-0 flex items-center" aria-hidden="true">
+              <div className="w-full border-t border-neutral-200 dark:border-white/10" />
+            </div>
+            <div className="relative flex justify-center text-[11.5px] uppercase">
+              <span className="bg-[#fafafa] dark:bg-[#18181c] px-2 text-neutral-400 font-medium">
+                Or continue with
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2.5">
+            <button
+              type="button"
+              onClick={() => setOauthProviderModal('google')}
+              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+            >
+              <span className="w-4 h-4 rounded-full bg-red-500 text-white font-bold text-[10px] flex items-center justify-center">
+                G
+              </span>
+              <span>Google</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setOauthProviderModal('github')}
+              className="w-full py-2 px-3 rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#121214] text-[12.5px] font-medium text-neutral-800 dark:text-neutral-200 hover:bg-neutral-50 dark:hover:bg-white/[0.05] transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+            >
+              <span className="w-4 h-4 rounded-full bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 font-bold text-[10px] flex items-center justify-center">
+                GH
+              </span>
+              <span>GitHub</span>
+            </button>
+          </div>
         </div>
       </main>
+
+      {oauthProviderModal && (
+        <GoogleAccountSelectorModal
+          isOpen={Boolean(oauthProviderModal)}
+          provider={oauthProviderModal}
+          onClose={() => setOauthProviderModal(null)}
+          onSuccess={(user) => {
+            setOauthProviderModal(null);
+            onAuthenticated(user);
+          }}
+        />
+      )}
     </div>
   );
 }
