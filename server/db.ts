@@ -134,6 +134,20 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           created_at BIGINT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS database_profiles (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          engine TEXT NOT NULL DEFAULT 'postgres',
+          host TEXT NOT NULL,
+          port INTEGER NOT NULL DEFAULT 5432,
+          database_name TEXT NOT NULL,
+          username TEXT NOT NULL,
+          ssl BOOLEAN NOT NULL DEFAULT FALSE,
+          last_connected_at BIGINT,
+          created_at BIGINT NOT NULL
+        );
+
         ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS share_token TEXT;
@@ -151,6 +165,7 @@ export async function ensureSchema(pool: Pool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_note_shares_recipient_email ON note_shares(recipient_email);
         CREATE INDEX IF NOT EXISTS idx_note_shares_note_id ON note_shares(note_id);
         CREATE INDEX IF NOT EXISTS idx_ssh_profiles_user_id ON ssh_profiles(user_id);
+        CREATE INDEX IF NOT EXISTS idx_database_profiles_user_id ON database_profiles(user_id);
       `);
 
       schemaInitialized = true;

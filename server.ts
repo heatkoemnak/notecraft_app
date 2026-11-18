@@ -29,6 +29,12 @@ import {
 import { listAvailableGroqModels } from './server/groqModels.ts';
 import { registerOAuthRoutes } from './server/oauth.ts';
 import { attachSshWebSocketServer } from './server/sshGateway.ts';
+import {
+  DatabaseGatewayError,
+  executeDatabaseQuery,
+  normalizeDatabaseConnection,
+  testAndIntrospectDatabase,
+} from './server/databaseGateway.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -1428,6 +1434,207 @@ async function startServer() {
     } catch (err) {
       console.error('Failed to delete SSH profile:', err);
       return res.status(500).json({ error: 'Failed to delete SSH server profile' });
+    }
+  });
+
+  // External database saved profiles CRUD
+  app.get('/api/database/profiles', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const result = await pool.query<{
+        id: string;
+        label: string;
+        engine: string;
+        host: string;
+        port: number;
+        database_name: string;
+        username: string;
+        ssl: boolean;
+        last_connected_at: string | number | null;
+        created_at: string | number;
+      }>(
+        `SELECT id, label, engine, host, port, database_name, username, ssl, last_connected_at, created_at
+         FROM database_profiles
+         WHERE user_id = $1
+         ORDER BY COALESCE(last_connected_at, created_at) DESC`,
+        [user.id]
+      );
+
+      return res.json({
+        profiles: result.rows.map((r) => ({
+          id: r.id,
+          label: r.label,
+          engine: r.engine === 'mysql' ? 'mysql' : 'postgres',
+          host: r.host,
+          port: Number(r.port || 5432),
+          database: r.database_name,
+          username: r.username,
+          ssl: Boolean(r.ssl),
+          lastConnectedAt: r.last_connected_at ? Number(r.last_connected_at) : null,
+          createdAt: Number(r.created_at),
+        })),
+      });
+    } catch (err) {
+      console.error('Failed to load database profiles:', err);
+      return res.status(500).json({ error: 'Failed to load saved database connections' });
+    }
+  });
+
+  app.post('/api/database/profiles', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const {
+        id,
+        label,
+        engine,
+        host,
+        port,
+        database,
+        username,
+        ssl,
+        lastConnectedAt,
+        createdAt,
+      } = req.body || {};
+
+      const cleanEngine = engine === 'mysql' ? 'mysql' : 'postgres';
+      const cleanHost = typeof host === 'string' ? host.trim() : '';
+      const cleanDatabase = typeof database === 'string' ? database.trim() : '';
+      const cleanUser = typeof username === 'string' ? username.trim() : '';
+      if (!cleanHost || !cleanDatabase || !cleanUser) {
+        return res
+          .status(400)
+          .json({ error: 'Host, database name, and username are required' });
+      }
+      const defaultPort = cleanEngine === 'mysql' ? 3306 : 5432;
+      const cleanPort = Math.max(1, Math.min(65535, Math.round(Number(port || defaultPort))));
+      const cleanLabel =
+        typeof label === 'string' && label.trim()
+          ? label.trim()
+          : `${cleanDatabase}@${cleanHost}`;
+      const cleanSsl = Boolean(ssl);
+      const profileId =
+        typeof id === 'string' && id.trim() ? id.trim() : `db-${randomUUID()}`;
+      const now = Date.now();
+
+      await pool.query(
+        `INSERT INTO database_profiles (id, user_id, label, engine, host, port, database_name, username, ssl, last_connected_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (id) DO UPDATE SET
+           label = EXCLUDED.label,
+           engine = EXCLUDED.engine,
+           host = EXCLUDED.host,
+           port = EXCLUDED.port,
+           database_name = EXCLUDED.database_name,
+           username = EXCLUDED.username,
+           ssl = EXCLUDED.ssl,
+           last_connected_at = COALESCE(EXCLUDED.last_connected_at, database_profiles.last_connected_at)
+         WHERE database_profiles.user_id = EXCLUDED.user_id`,
+        [
+          profileId,
+          user.id,
+          cleanLabel,
+          cleanEngine,
+          cleanHost,
+          cleanPort,
+          cleanDatabase,
+          cleanUser,
+          cleanSsl,
+          lastConnectedAt ? Number(lastConnectedAt) : null,
+          Number(createdAt || now),
+        ]
+      );
+
+      return res.status(201).json({
+        profile: {
+          id: profileId,
+          label: cleanLabel,
+          engine: cleanEngine,
+          host: cleanHost,
+          port: cleanPort,
+          database: cleanDatabase,
+          username: cleanUser,
+          ssl: cleanSsl,
+          lastConnectedAt: lastConnectedAt ? Number(lastConnectedAt) : null,
+          createdAt: Number(createdAt || now),
+        },
+      });
+    } catch (err) {
+      console.error('Failed to save database profile:', err);
+      return res.status(500).json({ error: 'Failed to save database profile' });
+    }
+  });
+
+  app.delete('/api/database/profiles/:id', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      await pool.query('DELETE FROM database_profiles WHERE id = $1 AND user_id = $2', [
+        req.params.id,
+        user.id,
+      ]);
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Failed to delete database profile:', err);
+      return res.status(500).json({ error: 'Failed to delete database profile' });
+    }
+  });
+
+  const authorizeDatabaseGateway = async (req: Request, res: Response): Promise<boolean> => {
+    const pool = getPool();
+    if (!pool) return true;
+    try {
+      await ensureSchema(pool);
+      const user = await resolveSessionUser(pool, req);
+      if (!user) {
+        res.status(401).json({ error: 'Authentication required' });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      if (isPgConnectionError(err)) return true;
+      res.status(500).json({ error: 'Session verification failed' });
+      return false;
+    }
+  };
+
+  // External database: test connection and introspect schema
+  app.post('/api/database/connect', async (req, res) => {
+    if (!(await authorizeDatabaseGateway(req, res))) return;
+    try {
+      const cfg = normalizeDatabaseConnection(req.body);
+      const info = await testAndIntrospectDatabase(cfg);
+      return res.json(info);
+    } catch (err) {
+      if (err instanceof DatabaseGatewayError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('Database connect failed:', err);
+      return res.status(500).json({ error: 'Failed to connect to database' });
+    }
+  });
+
+  // External database: execute SQL query
+  app.post('/api/database/query', async (req, res) => {
+    if (!(await authorizeDatabaseGateway(req, res))) return;
+    try {
+      const cfg = normalizeDatabaseConnection(req.body);
+      const sql = typeof req.body?.sql === 'string' ? req.body.sql : '';
+      const result = await executeDatabaseQuery(cfg, sql, 200);
+      return res.json(result);
+    } catch (err) {
+      if (err instanceof DatabaseGatewayError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('Database query failed:', err);
+      return res.status(500).json({ error: 'Failed to execute database query' });
     }
   });
 

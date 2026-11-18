@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { CommandPalette } from './components/CommandPalette';
+import { DatabaseExplorerView } from './components/DatabaseExplorerView';
 import { DocumentWorkspace } from './components/DocumentWorkspace';
 import { ImportDestinationMode, ImportFileModal } from './components/ImportFileModal';
 import { ShareNoteModal } from './components/ShareNoteModal';
@@ -427,6 +428,7 @@ export default function App() {
         if (
           filter.type === 'snippets' ||
           filter.type === 'ssh' ||
+          filter.type === 'database' ||
           !activeNoteId ||
           searchOpen ||
           shareModalOpen ||
@@ -522,7 +524,11 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     setActiveNoteId(newNote.id);
-    if (filter.type === 'snippets' || filter.type === 'ssh') {
+    if (
+      filter.type === 'snippets' ||
+      filter.type === 'ssh' ||
+      filter.type === 'database'
+    ) {
       setFilter({ type: 'all' });
     }
     setViewMode('read');
@@ -705,7 +711,13 @@ export default function App() {
           { source: 'discrete', field: 'content' }
         );
       }
-      if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
+      if (
+        filter.type === 'snippets' ||
+        filter.type === 'ssh' ||
+        filter.type === 'database'
+      ) {
+        setFilter({ type: 'all' });
+      }
       return;
     }
 
@@ -727,7 +739,13 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     setActiveNoteId(createdNotes[0].id);
-    if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
+    if (
+      filter.type === 'snippets' ||
+      filter.type === 'ssh' ||
+      filter.type === 'database'
+    ) {
+      setFilter({ type: 'all' });
+    }
     setViewMode('read');
     if (window.innerWidth < 1024) setSidebarOpen(false);
 
@@ -872,6 +890,48 @@ export default function App() {
       id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
       title: `SSH Session: ${serverLabel}`,
       content: `## SSH Session — ${serverLabel}\n\nCaptured on ${timestamp}\n\n\`\`\`bash\n${cleanTranscript}\n\`\`\`\n`,
+      folderId: validFolderId,
+      starred: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const nextNotes = [newNote, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(newNote.id);
+    setFilter(validFolderId ? { type: 'folder', folderId: validFolderId } : { type: 'all' });
+    setViewMode('read');
+
+    if (dbEnabledRef.current) {
+      void syncApi('/api/notes', 'POST', newNote);
+    }
+
+    if (options?.openAiAfterSave) {
+      setAiWriterRequest((prev) => ({
+        seq: (prev?.seq ?? 0) + 1,
+        preset: 'explain-project',
+      }));
+    }
+  };
+
+  const handleSaveDatabaseOutputToNote = (
+    title: string,
+    markdownContent: string,
+    options?: { folderId?: string | null; openAiAfterSave?: boolean }
+  ) => {
+    const now = Date.now();
+    const requestedFolderId =
+      options?.folderId !== undefined ? options.folderId : folders[0]?.id ?? null;
+    const validFolderId =
+      requestedFolderId && folders.some((f) => f.id === requestedFolderId)
+        ? requestedFolderId
+        : null;
+
+    const newNote: NoteDocument = {
+      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      title: title.trim() || 'Database Snapshot',
+      content: markdownContent,
       folderId: validFolderId,
       starred: false,
       createdAt: now,
@@ -1117,14 +1177,20 @@ export default function App() {
           }
           if (
             window.innerWidth < 1024 &&
-            (nextFilter.type === 'snippets' || nextFilter.type === 'ssh')
+            (nextFilter.type === 'snippets' ||
+              nextFilter.type === 'ssh' ||
+              nextFilter.type === 'database')
           ) {
             setSidebarOpen(false);
           }
         }}
         onSelectNote={(noteId) => {
           setActiveNoteId(noteId);
-          if (filter.type === 'snippets' || filter.type === 'ssh') {
+          if (
+            filter.type === 'snippets' ||
+            filter.type === 'ssh' ||
+            filter.type === 'database'
+          ) {
             setFilter({ type: 'all' });
           }
           if (window.innerWidth < 1024) {
@@ -1167,6 +1233,17 @@ export default function App() {
           sidebarOpen={sidebarOpen}
           onOpenSidebar={() => setSidebarOpen(true)}
           onSaveTranscriptToNote={handleSaveSshTranscriptToNote}
+        />
+      ) : filter.type === 'database' ? (
+        <DatabaseExplorerView
+          storageMode={storageMode}
+          currentUser={currentUser}
+          folders={folders}
+          defaultFolderId={folders[0]?.id ?? null}
+          snippets={snippets}
+          sidebarOpen={sidebarOpen}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onSaveToNote={handleSaveDatabaseOutputToNote}
         />
       ) : (
         <DocumentWorkspace
@@ -1212,7 +1289,13 @@ export default function App() {
         onClose={() => setSearchOpen(false)}
         onSelectNote={(noteId) => {
           setActiveNoteId(noteId);
-          if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
+          if (
+            filter.type === 'snippets' ||
+            filter.type === 'ssh' ||
+            filter.type === 'database'
+          ) {
+            setFilter({ type: 'all' });
+          }
         }}
         onInsertSnippet={handleInsertSnippetIntoActiveNote}
       />

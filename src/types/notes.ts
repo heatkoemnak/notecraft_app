@@ -5,6 +5,7 @@ export type SidebarFilter =
   | { type: 'starred' }
   | { type: 'snippets' }
   | { type: 'ssh' }
+  | { type: 'database' }
   | { type: 'folder'; folderId: string };
 
 export type SharePermission = 'view' | 'edit';
@@ -92,4 +93,42 @@ export interface SshProfile {
   createdAt: number;
 }
 
+export type DatabaseEngine = 'postgres' | 'mysql';
+
+export interface DatabaseProfile {
+  id: string;
+  label: string;
+  engine: DatabaseEngine;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  ssl: boolean;
+  lastConnectedAt?: number | null;
+  createdAt: number;
+}
+
+export interface DatabaseTableColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+  isPrimaryKey: boolean;
+  foreignKey?: string | null;
+}
+
+export interface DatabaseTableInfo {
+  schema: string;
+  name: string;
+  estimatedRows: number | null;
+  columns: DatabaseTableColumn[];
+}
+
+export interface DatabaseQueryResult {
+  columns: Array<{ name: string; type?: string }>;
+  rows: Array<Record<string, unknown>>;
+  rowCount: number;
+  truncated: boolean;
+  durationMs: number;
+  command?: string;
+}
 
