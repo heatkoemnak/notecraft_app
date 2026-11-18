@@ -4,10 +4,10 @@ import {
   ArrowLeft,
   ArrowUp,
   Check,
+  ChevronsDownUp,
   Copy,
   FilePlus2,
   FileText,
-  Folder as FolderIcon,
   FolderOpen,
   Loader2,
   Maximize2,
@@ -18,72 +18,16 @@ import {
   RotateCcw,
   Save,
   WrapText,
-  X,
 } from 'lucide-react';
 import { highlightCodeToHtml } from '../utils/codeHighlight';
+import {
+  getFileIconColorClass,
+  ProjectTreeView,
+  RemoteDirEntry,
+  RemoteFilePreview,
+} from './ProjectTreeView';
 
-function getFileIconColorClass(filename: string): string {
-  const lower = filename.toLowerCase();
-  if (lower === 'dockerfile' || lower.startsWith('dockerfile.')) return 'text-sky-400';
-  if (lower === '.env' || lower.startsWith('.env.')) return 'text-amber-400';
-  const ext = lower.includes('.') ? lower.split('.').pop() || '' : '';
-  switch (ext) {
-    case 'ts':
-    case 'tsx':
-      return 'text-blue-400';
-    case 'js':
-    case 'jsx':
-    case 'mjs':
-    case 'cjs':
-      return 'text-amber-400';
-    case 'json':
-      return 'text-emerald-400';
-    case 'py':
-      return 'text-sky-400';
-    case 'go':
-      return 'text-cyan-400';
-    case 'rs':
-      return 'text-orange-400';
-    case 'sh':
-    case 'bash':
-    case 'zsh':
-      return 'text-green-400';
-    case 'yml':
-    case 'yaml':
-    case 'toml':
-      return 'text-purple-400';
-    case 'css':
-    case 'scss':
-      return 'text-pink-400';
-    case 'html':
-    case 'xml':
-    case 'svg':
-      return 'text-rose-400';
-    case 'sql':
-      return 'text-orange-300';
-    case 'md':
-      return 'text-teal-400';
-    default:
-      return 'text-neutral-400';
-  }
-}
-
-export interface RemoteDirEntry {
-  name: string;
-  path: string;
-  isDirectory: boolean;
-  size: number;
-  modifiedAt: number | null;
-}
-
-export interface RemoteFilePreview {
-  path: string;
-  name: string;
-  content: string;
-  size: number;
-  truncated: boolean;
-  isBinary: boolean;
-}
+export type { RemoteDirEntry, RemoteFilePreview };
 
 interface RemoteCodeEditorProps {
   file: RemoteFilePreview;
@@ -92,13 +36,19 @@ interface RemoteCodeEditorProps {
   saveError: string | null;
   lastSavedAt: number | null;
   currentRemotePath: string;
-  dirEntries: RemoteDirEntry[];
-  dirLoading: boolean;
+  dirCache: Record<string, RemoteDirEntry[]>;
+  expandedDirs: Record<string, boolean>;
+  loadingDirs: Record<string, boolean>;
+  truncatedDirs: Record<string, boolean>;
   onToggleFullScreen: (next: boolean) => void;
   onCloseFile: () => void;
   onSaveFile: (path: string, nextContent: string) => void;
   onReloadFile: (path: string) => void;
-  onNavigateDir: (path: string) => void;
+  onToggleDir: (dirPath: string) => void;
+  onNavigateRootDir: (dirPath: string) => void;
+  onCollapseAllDirs: () => void;
+  onRefreshExplorer: () => void;
+  onOpenInTerminal?: (dirPath: string) => void;
   onOpenFile: (path: string) => void;
   onCreateNewFile: (fullPath: string) => void;
   onCopyText: (text: string) => Promise<boolean>;
@@ -161,13 +111,19 @@ export function RemoteCodeEditor({
   saveError,
   lastSavedAt,
   currentRemotePath,
-  dirEntries,
-  dirLoading,
+  dirCache,
+  expandedDirs,
+  loadingDirs,
+  truncatedDirs,
   onToggleFullScreen,
   onCloseFile,
   onSaveFile,
   onReloadFile,
-  onNavigateDir,
+  onToggleDir,
+  onNavigateRootDir,
+  onCollapseAllDirs,
+  onRefreshExplorer,
+  onOpenInTerminal,
   onOpenFile,
   onCreateNewFile,
   onCopyText,
@@ -178,8 +134,7 @@ export function RemoteCodeEditor({
   const [copiedNotice, setCopiedNotice] = useState(false);
   const [savedBannerVisible, setSavedBannerVisible] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(true);
-  const [creatingFile, setCreatingFile] = useState(false);
-  const [newFileName, setNewFileName] = useState('');
+  const [creatingInDir, setCreatingInDir] = useState<string | null>(null);
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
   const [editorScrollTop, setEditorScrollTop] = useState(0);
   const [pendingAction, setPendingAction] = useState<
@@ -251,9 +206,8 @@ export function RemoteCodeEditor({
         return;
       }
       if (e.key === 'Escape') {
-        if (creatingFile) {
-          setCreatingFile(false);
-          setNewFileName('');
+        if (creatingInDir !== null) {
+          setCreatingInDir(null);
           return;
         }
         if (pendingAction) {
@@ -276,7 +230,7 @@ export function RemoteCodeEditor({
     file.path,
     draft,
     saving,
-    creatingFile,
+    creatingInDir,
     pendingAction,
     isDirty,
     onSaveFile,
@@ -356,14 +310,9 @@ export function RemoteCodeEditor({
     }
   };
 
-  const handleCreateFileSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const clean = newFileName.trim().replace(/^\/+/, '');
-    if (!clean) return;
-    const baseDir = currentRemotePath || getParentPosixPath(file.path);
-    const full = `${baseDir.replace(/\/+$/, '')}/${clean}`;
-    setCreatingFile(false);
-    setNewFileName('');
+  const handleSubmitNewFile = (targetDir: string, cleanName: string) => {
+    const full = `${targetDir.replace(/\/+$/, '')}/${cleanName}`;
+    setCreatingInDir(null);
     onCreateNewFile(full);
   };
 
@@ -794,109 +743,91 @@ export function RemoteCodeEditor({
       {/* Main Split: Optional Project Explorer Sidebar + Code Canvas */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
         {explorerOpen && (
-          <aside className="w-[260px] shrink-0 border-r border-white/[0.08] bg-[#121217] flex flex-col min-h-0">
+          <aside className="w-[270px] shrink-0 border-r border-white/[0.08] bg-[#121217] flex flex-col min-h-0">
             <div className="shrink-0 px-3 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2">
-              <span className="text-[12px] font-semibold text-neutral-200 truncate flex items-center gap-1.5">
+              <div
+                className="min-w-0 flex items-center gap-1.5"
+                title={currentRemotePath || getParentPosixPath(file.path)}
+              >
                 <FolderOpen className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                <span className="truncate font-mono-code">
-                  {currentRemotePath || getParentPosixPath(file.path)}
+                <span className="text-[11.5px] font-semibold uppercase tracking-wider text-neutral-300 truncate">
+                  {(currentRemotePath || getParentPosixPath(file.path))
+                    .split('/')
+                    .filter(Boolean)
+                    .pop() || '/'}
                 </span>
-              </span>
-              <div className="flex items-center gap-1 shrink-0">
+              </div>
+              <div className="flex items-center gap-0.5 shrink-0">
                 <button
                   type="button"
                   onClick={() =>
-                    onNavigateDir(
+                    onNavigateRootDir(
                       getParentPosixPath(currentRemotePath || getParentPosixPath(file.path))
                     )
                   }
-                  disabled={dirLoading || currentRemotePath === '/'}
-                  title="Parent directory"
-                  className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
+                  disabled={
+                    Boolean(loadingDirs[currentRemotePath]) || currentRemotePath === '/'
+                  }
+                  title="Open parent folder"
+                  className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
                 >
                   <ArrowUp className="w-3.5 h-3.5" />
                 </button>
                 <button
                   type="button"
-                  onClick={() => setCreatingFile((p) => !p)}
-                  title="New file in current directory"
+                  onClick={() => {
+                    const base = currentRemotePath || getParentPosixPath(file.path);
+                    setCreatingInDir((prev) => (prev === base ? null : base));
+                  }}
+                  title="New file in root folder"
                   className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
                 </button>
-              </div>
-            </div>
-
-            {creatingFile && (
-              <form
-                onSubmit={handleCreateFileSubmit}
-                className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1.5"
-              >
-                <input
-                  type="text"
-                  autoFocus
-                  value={newFileName}
-                  onChange={(e) => setNewFileName(e.target.value)}
-                  placeholder="filename.ts"
-                  className="font-mono-code flex-1 min-w-0 px-2 py-1 text-[12px] rounded border border-white/15 bg-[#0c0c10] text-white placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
-                />
                 <button
-                  type="submit"
-                  className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
+                  type="button"
+                  onClick={onCollapseAllDirs}
+                  title="Collapse all folders"
+                  className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
                 >
-                  Create
+                  <ChevronsDownUp className="w-3.5 h-3.5" />
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setCreatingFile(false);
-                    setNewFileName('');
-                  }}
-                  className="p-1 text-neutral-400 hover:text-white cursor-pointer"
+                  onClick={onRefreshExplorer}
+                  title="Refresh explorer"
+                  className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
                 >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </form>
-            )}
-
-            <div className="flex-1 min-h-0 overflow-y-auto p-1.5 space-y-0.5">
-              {dirLoading && (
-                <div className="flex items-center gap-2 px-2 py-2 text-[12px] text-neutral-400">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
-                  <span>Loading...</span>
-                </div>
-              )}
-
-              {dirEntries.map((entry) => {
-                const isSelected = !entry.isDirectory && entry.path === file.path;
-                return (
-                  <button
-                    key={entry.path}
-                    type="button"
-                    onClick={() => {
-                      if (entry.isDirectory) {
-                        onNavigateDir(entry.path);
-                      } else {
-                        handleAttemptSelectFile(entry.path);
-                      }
-                    }}
-                    className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'bg-blue-600/20 text-white font-medium'
-                        : 'text-neutral-300 hover:bg-white/[0.06]'
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${
+                      loadingDirs[currentRemotePath] ? 'animate-spin' : ''
                     }`}
-                  >
-                    {entry.isDirectory ? (
-                      <FolderIcon className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                    ) : (
-                      <FileText
-                        className={`w-3.5 h-3.5 shrink-0 ${getFileIconColorClass(entry.name)}`}
-                      />
-                    )}
-                    <span className="font-mono-code text-[12px] truncate">{entry.name}</span>
-                  </button>
-                );
-              })}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
+              <ProjectTreeView
+                rootPath={currentRemotePath || getParentPosixPath(file.path)}
+                dirCache={dirCache}
+                expandedDirs={expandedDirs}
+                loadingDirs={loadingDirs}
+                truncatedDirs={truncatedDirs}
+                selectedFilePath={file.path}
+                creatingInDir={creatingInDir}
+                onToggleDir={onToggleDir}
+                onSelectFile={handleAttemptSelectFile}
+                onOpenInTerminal={onOpenInTerminal}
+                onRequestCreateFile={(dirPath) => {
+                  if (!expandedDirs[dirPath]) {
+                    onToggleDir(dirPath);
+                  }
+                  setCreatingInDir(dirPath);
+                }}
+                onSubmitNewFile={handleSubmitNewFile}
+                onCancelNewFile={() => setCreatingInDir(null)}
+              />
             </div>
           </aside>
         )}

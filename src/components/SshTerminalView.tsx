@@ -9,6 +9,7 @@ import {
   Braces,
   Check,
   ChevronDown,
+  ChevronsDownUp,
   ChevronRight,
   ClipboardPaste,
   Copy,
@@ -16,15 +17,12 @@ import {
   Eye,
   EyeOff,
   FilePlus2,
-  FileText,
-  Folder as FolderIcon,
   FolderOpen,
   FolderTree,
   Home,
   KeyRound,
   Loader2,
   Lock,
-  Maximize2,
   PanelLeftOpen,
   Plug,
   PlugZap,
@@ -48,6 +46,7 @@ import {
   parseSshCommand,
   saveSshProfile,
 } from '../utils/sshClient';
+import { ProjectTreeView } from './ProjectTreeView';
 import {
   RemoteCodeEditor,
   RemoteDirEntry,
@@ -189,18 +188,18 @@ export function SshTerminalView({
   const [dirBrowserOpen, setDirBrowserOpen] = useState(false);
   const [currentRemotePath, setCurrentRemotePath] = useState('');
   const [pathInput, setPathInput] = useState('');
-  const [dirEntries, setDirEntries] = useState<RemoteDirEntry[]>([]);
-  const [dirLoading, setDirLoading] = useState(false);
+  const [dirCache, setDirCache] = useState<Record<string, RemoteDirEntry[]>>({});
+  const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
+  const [loadingDirs, setLoadingDirs] = useState<Record<string, boolean>>({});
+  const [truncatedDirs, setTruncatedDirs] = useState<Record<string, boolean>>({});
   const [dirError, setDirError] = useState<string | null>(null);
-  const [dirTruncated, setDirTruncated] = useState(false);
   const [previewFile, setPreviewFile] = useState<RemoteFilePreview | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
   const [editorFullScreen, setEditorFullScreen] = useState(false);
   const [savingFile, setSavingFile] = useState(false);
   const [saveFileError, setSaveFileError] = useState<string | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
-  const [creatingDirFile, setCreatingDirFile] = useState(false);
-  const [newDirFileName, setNewDirFileName] = useState('');
+  const [creatingInDir, setCreatingInDir] = useState<string | null>(null);
 
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -210,7 +209,13 @@ export function SshTerminalView({
   const passwordInputRef = useRef<HTMLInputElement>(null);
   const snippetMenuRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
-  const dirReqIdRef = useRef<string>('');
+  const pendingDirReqRef = useRef<
+    Map<string, { requestedPath: string; mode: 'root' | 'expand' }>
+  >(new Map());
+  const dirCacheRef = useRef<Record<string, RemoteDirEntry[]>>(dirCache);
+  dirCacheRef.current = dirCache;
+  const expandedDirsRef = useRef<Record<string, boolean>>(expandedDirs);
+  expandedDirsRef.current = expandedDirs;
   const fileReqIdRef = useRef<string>('');
   const writeReqIdRef = useRef<string>('');
   const openFullScreenOnLoadRef = useRef<boolean>(false);
@@ -557,41 +562,85 @@ export function SshTerminalView({
     setDirBrowserOpen(false);
     setCurrentRemotePath('');
     setPathInput('');
-    setDirEntries([]);
+    setDirCache({});
+    setExpandedDirs({});
+    setLoadingDirs({});
+    setTruncatedDirs({});
+    pendingDirReqRef.current.clear();
     setPreviewFile(null);
     setEditorFullScreen(false);
     setSavingFile(false);
     setSaveFileError(null);
     setLastSavedAt(null);
-    setCreatingDirFile(false);
-    setNewDirFileName('');
+    setCreatingInDir(null);
     pendingSaveDraftRef.current = null;
     openFullScreenOnLoadRef.current = false;
     setDirError(null);
   };
 
   const requestListDir = useCallback(
-    (targetPath?: string, options?: { keepPreview?: boolean }) => {
+    (
+      targetPath?: string,
+      options?: { mode?: 'root' | 'expand'; keepPreview?: boolean }
+    ) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const mode = options?.mode ?? 'root';
+      const cleanReqPath = targetPath ?? '';
+      const loadKey = cleanReqPath || '__root__';
       const reqId = `dir-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      dirReqIdRef.current = reqId;
-      setDirLoading(true);
+      pendingDirReqRef.current.set(reqId, { requestedPath: loadKey, mode });
+      setLoadingDirs((prev) => ({ ...prev, [loadKey]: true }));
       setDirError(null);
-      if (!options?.keepPreview) {
+      if (mode === 'root' && !options?.keepPreview) {
         setPreviewFile(null);
         setEditorFullScreen(false);
+        setCreatingInDir(null);
       }
       ws.send(
         JSON.stringify({
           type: 'listDir',
           requestId: reqId,
-          path: targetPath ?? '',
+          path: cleanReqPath,
         })
       );
     },
     []
   );
+
+  const handleToggleTreeDir = useCallback(
+    (dirPath: string) => {
+      const currentlyExpanded = Boolean(expandedDirsRef.current[dirPath]);
+      if (currentlyExpanded) {
+        setExpandedDirs((prev) => ({ ...prev, [dirPath]: false }));
+        return;
+      }
+      setExpandedDirs((prev) => ({ ...prev, [dirPath]: true }));
+      if (!dirCacheRef.current[dirPath]) {
+        requestListDir(dirPath, { mode: 'expand', keepPreview: true });
+      }
+    },
+    [requestListDir]
+  );
+
+  const handleCollapseAllDirs = useCallback(() => {
+    setExpandedDirs({});
+    setCreatingInDir(null);
+  }, []);
+
+  const handleRefreshExplorer = useCallback(() => {
+    const root = currentRemotePathRef.current;
+    if (!root) {
+      requestListDir('', { mode: 'root', keepPreview: true });
+      return;
+    }
+    requestListDir(root, { mode: 'root', keepPreview: true });
+    Object.entries(expandedDirsRef.current).forEach(([dirPath, isOpen]) => {
+      if (isOpen && dirPath !== root) {
+        requestListDir(dirPath, { mode: 'expand', keepPreview: true });
+      }
+    });
+  }, [requestListDir]);
 
   const requestReadFile = useCallback(
     (filePath: string, options?: { openFullScreen?: boolean }) => {
@@ -649,8 +698,8 @@ export function SshTerminalView({
     if (status !== 'connected') return;
     const nextOpen = !dirBrowserOpen;
     setDirBrowserOpen(nextOpen);
-    if (nextOpen && !currentRemotePath && dirEntries.length === 0) {
-      requestListDir('');
+    if (nextOpen && !currentRemotePath) {
+      requestListDir('', { mode: 'root' });
     }
   };
 
@@ -693,14 +742,17 @@ export function SshTerminalView({
     setConnectedTarget(null);
     setCurrentRemotePath('');
     setPathInput('');
-    setDirEntries([]);
+    setDirCache({});
+    setExpandedDirs({});
+    setLoadingDirs({});
+    setTruncatedDirs({});
+    pendingDirReqRef.current.clear();
     setPreviewFile(null);
     setEditorFullScreen(false);
     setSavingFile(false);
     setSaveFileError(null);
     setLastSavedAt(null);
-    setCreatingDirFile(false);
-    setNewDirFileName('');
+    setCreatingInDir(null);
     pendingSaveDraftRef.current = null;
     openFullScreenOnLoadRef.current = false;
     setDirError(null);
@@ -771,19 +823,47 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'dirListing') {
-        if (msg.requestId && msg.requestId !== dirReqIdRef.current) return;
-        setDirLoading(false);
+        const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
+        if (msg.requestId) {
+          pendingDirReqRef.current.delete(msg.requestId);
+        }
+        const resolvedPath = msg.path || '/';
+        const entries = Array.isArray(msg.entries) ? msg.entries : [];
+
+        setLoadingDirs((prev) => {
+          const next = { ...prev };
+          if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
+          delete next[resolvedPath];
+          delete next['__root__'];
+          return next;
+        });
         setDirError(null);
-        setCurrentRemotePath(msg.path || '/');
-        setPathInput(msg.path || '/');
-        setDirEntries(Array.isArray(msg.entries) ? msg.entries : []);
-        setDirTruncated(Boolean(msg.truncated));
+        setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
+        setTruncatedDirs((prev) => ({
+          ...prev,
+          [resolvedPath]: Boolean(msg.truncated),
+        }));
+
+        if (!reqInfo || reqInfo.mode === 'root') {
+          setCurrentRemotePath(resolvedPath);
+          setPathInput(resolvedPath);
+        } else {
+          setExpandedDirs((prev) => ({ ...prev, [resolvedPath]: true }));
+        }
         return;
       }
 
       if (msg.type === 'dirError') {
-        if (msg.requestId && msg.requestId !== dirReqIdRef.current) return;
-        setDirLoading(false);
+        const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
+        if (msg.requestId) {
+          pendingDirReqRef.current.delete(msg.requestId);
+        }
+        setLoadingDirs((prev) => {
+          const next = { ...prev };
+          if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
+          delete next['__root__'];
+          return next;
+        });
         setDirError(msg.error || 'Unable to list remote directory.');
         return;
       }
@@ -842,8 +922,13 @@ export function SshTerminalView({
           return prev;
         });
 
-        if (currentRemotePathRef.current) {
-          requestListDir(currentRemotePathRef.current, { keepPreview: true });
+        const parentDir = savedPath ? getParentPosixPath(savedPath) : currentRemotePathRef.current;
+        if (parentDir) {
+          const isRoot = parentDir === currentRemotePathRef.current;
+          requestListDir(parentDir, {
+            mode: isRoot ? 'root' : 'expand',
+            keepPreview: true,
+          });
         }
         return;
       }
@@ -1794,26 +1879,42 @@ export function SshTerminalView({
                       Project Directory
                     </span>
                   </div>
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="flex items-center gap-0.5 shrink-0">
                     <button
                       type="button"
-                      onClick={() => setCreatingDirFile((p) => !p)}
-                      disabled={!currentRemotePath || dirLoading}
-                      title="New file in current directory"
+                      onClick={() => {
+                        if (!currentRemotePath) return;
+                        setCreatingInDir((prev) =>
+                          prev === currentRemotePath ? null : currentRemotePath
+                        );
+                      }}
+                      disabled={!currentRemotePath || Boolean(previewFile)}
+                      title="New file in root directory"
                       className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
                     >
                       <Plus className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"
-                      onClick={() =>
-                        requestListDir(currentRemotePath || '', { keepPreview: Boolean(previewFile) })
-                      }
-                      disabled={dirLoading}
-                      title="Refresh directory"
+                      onClick={handleCollapseAllDirs}
+                      disabled={!currentRemotePath || Boolean(previewFile)}
+                      title="Collapse all expanded folders"
+                      className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
+                    >
+                      <ChevronsDownUp className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRefreshExplorer}
+                      disabled={Boolean(loadingDirs[currentRemotePath || '__root__'])}
+                      title="Refresh project tree"
                       className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${dirLoading ? 'animate-spin' : ''}`} />
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${
+                          loadingDirs[currentRemotePath || '__root__'] ? 'animate-spin' : ''
+                        }`}
+                      />
                     </button>
                     <button
                       type="button"
@@ -1833,15 +1934,22 @@ export function SshTerminalView({
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
-                    requestListDir(pathInput);
+                    requestListDir(pathInput, { mode: 'root' });
                   }}
                   className="shrink-0 p-2.5 border-b border-white/[0.08] space-y-2"
                 >
                   <div className="flex items-center gap-1">
                     <button
                       type="button"
-                      onClick={() => requestListDir(getParentPosixPath(currentRemotePath || '/'))}
-                      disabled={dirLoading || currentRemotePath === '/'}
+                      onClick={() =>
+                        requestListDir(getParentPosixPath(currentRemotePath || '/'), {
+                          mode: 'root',
+                        })
+                      }
+                      disabled={
+                        Boolean(loadingDirs[currentRemotePath || '__root__']) ||
+                        currentRemotePath === '/'
+                      }
                       title="Parent directory"
                       className="p-1.5 rounded-md border border-white/10 text-neutral-300 hover:bg-white/10 disabled:opacity-35 cursor-pointer shrink-0"
                     >
@@ -1849,8 +1957,8 @@ export function SshTerminalView({
                     </button>
                     <button
                       type="button"
-                      onClick={() => requestListDir('~')}
-                      disabled={dirLoading}
+                      onClick={() => requestListDir('~', { mode: 'root' })}
+                      disabled={Boolean(loadingDirs[currentRemotePath || '__root__'])}
                       title="Home directory (~)"
                       className="p-1.5 rounded-md border border-white/10 text-neutral-300 hover:bg-white/10 disabled:opacity-35 cursor-pointer shrink-0"
                     >
@@ -1866,7 +1974,7 @@ export function SshTerminalView({
                     />
                     <button
                       type="submit"
-                      disabled={dirLoading}
+                      disabled={Boolean(loadingDirs[currentRemotePath || '__root__'])}
                       className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-[11.5px] font-medium cursor-pointer whitespace-nowrap shrink-0"
                     >
                       Open
@@ -1898,46 +2006,6 @@ export function SshTerminalView({
                   )}
                 </form>
 
-                {creatingDirFile && currentRemotePath && !previewFile && (
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      const clean = newDirFileName.trim().replace(/^\/+/, '');
-                      if (!clean) return;
-                      const fullPath = `${currentRemotePath.replace(/\/+$/, '')}/${clean}`;
-                      setCreatingDirFile(false);
-                      setNewDirFileName('');
-                      handleCreateNewRemoteFile(fullPath);
-                    }}
-                    className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1.5 bg-[#111115]"
-                  >
-                    <input
-                      type="text"
-                      autoFocus
-                      value={newDirFileName}
-                      onChange={(e) => setNewDirFileName(e.target.value)}
-                      placeholder="new-file.ts"
-                      className="font-mono-code flex-1 min-w-0 px-2 py-1 text-[12px] rounded border border-white/15 bg-[#0c0c10] text-white placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
-                    />
-                    <button
-                      type="submit"
-                      className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
-                    >
-                      Create
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCreatingDirFile(false);
-                        setNewDirFileName('');
-                      }}
-                      className="p-1 text-neutral-400 hover:text-white cursor-pointer"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </form>
-                )}
-
                 {dirError && (
                   <div className="m-2.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-[11.5px] text-red-300 flex items-start gap-2">
                     <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
@@ -1945,7 +2013,7 @@ export function SshTerminalView({
                   </div>
                 )}
 
-                {/* Remote Source Code Editor (Inline or Full-Screen) OR Directory Entries */}
+                {/* Remote Source Code Editor (Inline or Full-Screen) OR Collapsible Project Tree */}
                 {previewFile ? (
                   <RemoteCodeEditor
                     file={previewFile}
@@ -1954,8 +2022,10 @@ export function SshTerminalView({
                     saveError={saveFileError}
                     lastSavedAt={lastSavedAt}
                     currentRemotePath={currentRemotePath}
-                    dirEntries={dirEntries}
-                    dirLoading={dirLoading}
+                    dirCache={dirCache}
+                    expandedDirs={expandedDirs}
+                    loadingDirs={loadingDirs}
+                    truncatedDirs={truncatedDirs}
                     onToggleFullScreen={setEditorFullScreen}
                     onCloseFile={() => {
                       setEditorFullScreen(false);
@@ -1964,85 +2034,54 @@ export function SshTerminalView({
                     }}
                     onSaveFile={(filePath, nextContent) => requestWriteFile(filePath, nextContent)}
                     onReloadFile={(filePath) => requestReadFile(filePath)}
-                    onNavigateDir={(dirPath) => requestListDir(dirPath, { keepPreview: true })}
+                    onToggleDir={handleToggleTreeDir}
+                    onNavigateRootDir={(dirPath) =>
+                      requestListDir(dirPath, { mode: 'root', keepPreview: true })
+                    }
+                    onCollapseAllDirs={handleCollapseAllDirs}
+                    onRefreshExplorer={handleRefreshExplorer}
+                    onOpenInTerminal={handleOpenDirectoryInTerminal}
                     onOpenFile={(filePath) => requestReadFile(filePath)}
                     onCreateNewFile={handleCreateNewRemoteFile}
                     onCopyText={copyTextToClipboard}
                     onSaveToNote={handleSaveRemoteFileToNote}
                   />
                 ) : (
-                  <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-0.5">
-                    {(dirLoading || fileLoading) && (
-                      <div className="flex items-center gap-2 px-2 py-2 text-[12px] text-neutral-400">
+                  <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
+                    {fileLoading && (
+                      <div className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-neutral-400">
                         <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
-                        <span>{fileLoading ? 'Opening file...' : 'Loading directory...'}</span>
+                        <span>Opening file...</span>
                       </div>
                     )}
 
-                    {!dirLoading && dirEntries.length === 0 && !dirError && (
-                      <p className="text-[12px] text-neutral-500 px-2 py-4 text-center">
-                        Directory is empty.
-                      </p>
-                    )}
-
-                    {dirEntries.map((entry) => (
-                      <div
-                        key={entry.path}
-                        className="group flex items-center justify-between gap-1 rounded-md hover:bg-white/[0.06] px-2 py-1.5 transition-colors"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (entry.isDirectory) {
-                              requestListDir(entry.path);
-                            } else {
-                              requestReadFile(entry.path);
-                            }
-                          }}
-                          className="flex-1 min-w-0 flex items-center gap-2 text-left cursor-pointer"
-                        >
-                          {entry.isDirectory ? (
-                            <FolderIcon className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                          ) : (
-                            <FileText className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                          )}
-                          <span className="font-mono-code text-[12px] text-neutral-200 truncate">
-                            {entry.name}
-                          </span>
-                        </button>
-
-                        {entry.isDirectory ? (
-                          <button
-                            type="button"
-                            onClick={() => handleOpenDirectoryInTerminal(entry.path)}
-                            title={`cd ${entry.path}`}
-                            className="opacity-0 group-hover:opacity-100 px-1.5 py-0.5 rounded text-[10.5px] font-mono-code text-blue-300 hover:bg-blue-500/20 transition-opacity cursor-pointer shrink-0"
-                          >
-                            cd
-                          </button>
-                        ) : (
-                          <div className="flex items-center gap-1 shrink-0">
-                            <button
-                              type="button"
-                              onClick={() => requestReadFile(entry.path, { openFullScreen: true })}
-                              title="Open in Full Screen Code Editor"
-                              className="opacity-0 group-hover:opacity-100 p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 transition-opacity cursor-pointer"
-                            >
-                              <Maximize2 className="w-3 h-3" />
-                            </button>
-                            <span className="text-[10.5px] font-mono-code text-neutral-500 tabular-nums">
-                              {formatBytes(entry.size)}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-
-                    {dirTruncated && (
-                      <p className="text-[11px] text-neutral-500 px-2 pt-2">
-                        Showing first 300 entries.
-                      </p>
-                    )}
+                    <ProjectTreeView
+                      rootPath={currentRemotePath}
+                      dirCache={dirCache}
+                      expandedDirs={expandedDirs}
+                      loadingDirs={loadingDirs}
+                      truncatedDirs={truncatedDirs}
+                      selectedFilePath={null}
+                      creatingInDir={creatingInDir}
+                      onToggleDir={handleToggleTreeDir}
+                      onSelectFile={(filePath) => requestReadFile(filePath)}
+                      onOpenFileFullScreen={(filePath) =>
+                        requestReadFile(filePath, { openFullScreen: true })
+                      }
+                      onOpenInTerminal={handleOpenDirectoryInTerminal}
+                      onRequestCreateFile={(dirPath) => {
+                        if (!expandedDirs[dirPath]) {
+                          handleToggleTreeDir(dirPath);
+                        }
+                        setCreatingInDir(dirPath);
+                      }}
+                      onSubmitNewFile={(targetDir, cleanName) => {
+                        setCreatingInDir(null);
+                        handleCreateNewRemoteFile(`${targetDir.replace(/\/+$/, '')}/${cleanName}`);
+                      }}
+                      onCancelNewFile={() => setCreatingInDir(null)}
+                      showFileSize
+                    />
                   </div>
                 )}
               </aside>
