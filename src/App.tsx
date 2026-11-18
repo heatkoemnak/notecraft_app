@@ -8,6 +8,7 @@ import { SharedLinkView } from './components/SharedLinkView';
 import { Sidebar } from './components/Sidebar';
 import { SnippetModal } from './components/SnippetModal';
 import { SnippetsView } from './components/SnippetsView';
+import { SshTerminalView } from './components/SshTerminalView';
 import { INITIAL_FOLDERS, INITIAL_NOTES, INITIAL_SNIPPETS } from './data/seedData';
 import {
   NoteSelection,
@@ -411,12 +412,17 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!currentUser) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('.xterm')) {
+        return;
+      }
       const mod = (e.ctrlKey || e.metaKey) && !e.altKey;
       const key = e.key.toLowerCase();
 
       if (mod && (key === 'z' || (key === 'y' && !e.shiftKey))) {
         if (
           filter.type === 'snippets' ||
+          filter.type === 'ssh' ||
           !activeNoteId ||
           searchOpen ||
           shareModalOpen ||
@@ -512,7 +518,7 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     setActiveNoteId(newNote.id);
-    if (filter.type === 'snippets') {
+    if (filter.type === 'snippets' || filter.type === 'ssh') {
       setFilter({ type: 'all' });
     }
     setViewMode('read');
@@ -695,7 +701,7 @@ export default function App() {
           { source: 'discrete', field: 'content' }
         );
       }
-      if (filter.type === 'snippets') setFilter({ type: 'all' });
+      if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
       return;
     }
 
@@ -717,7 +723,7 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     setActiveNoteId(createdNotes[0].id);
-    if (filter.type === 'snippets') setFilter({ type: 'all' });
+    if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
     setViewMode('read');
     if (window.innerWidth < 1024) setSidebarOpen(false);
 
@@ -814,6 +820,32 @@ export default function App() {
       if (dbEnabledRef.current) {
         void syncApi('/api/notes', 'POST', created);
       }
+    }
+  };
+
+  const handleSaveSshTranscriptToNote = (serverLabel: string, transcript: string) => {
+    const now = Date.now();
+    const timestamp = new Date(now).toLocaleString();
+    const cleanTranscript = transcript.trimEnd();
+    const newNote: NoteDocument = {
+      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      title: `SSH Session: ${serverLabel}`,
+      content: `## SSH Session — ${serverLabel}\n\nCaptured on ${timestamp}\n\n\`\`\`bash\n${cleanTranscript}\n\`\`\`\n`,
+      folderId: folders[0]?.id ?? null,
+      starred: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const nextNotes = [newNote, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(newNote.id);
+    setFilter({ type: 'all' });
+    setViewMode('read');
+
+    if (dbEnabledRef.current) {
+      void syncApi('/api/notes', 'POST', newNote);
     }
   };
 
@@ -1035,13 +1067,16 @@ export default function App() {
             const firstStarred = notes.find((n) => n.starred);
             if (firstStarred) setActiveNoteId(firstStarred.id);
           }
-          if (window.innerWidth < 1024 && nextFilter.type === 'snippets') {
+          if (
+            window.innerWidth < 1024 &&
+            (nextFilter.type === 'snippets' || nextFilter.type === 'ssh')
+          ) {
             setSidebarOpen(false);
           }
         }}
         onSelectNote={(noteId) => {
           setActiveNoteId(noteId);
-          if (filter.type === 'snippets') {
+          if (filter.type === 'snippets' || filter.type === 'ssh') {
             setFilter({ type: 'all' });
           }
           if (window.innerWidth < 1024) {
@@ -1073,6 +1108,15 @@ export default function App() {
           onEditSnippet={(snippet) => setSnippetModalState({ open: true, initial: snippet })}
           onDeleteSnippet={handleDeleteSnippet}
           onInsertIntoActiveNote={handleInsertSnippetIntoActiveNote}
+        />
+      ) : filter.type === 'ssh' ? (
+        <SshTerminalView
+          storageMode={storageMode}
+          currentUser={currentUser}
+          snippets={snippets}
+          sidebarOpen={sidebarOpen}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onSaveTranscriptToNote={handleSaveSshTranscriptToNote}
         />
       ) : (
         <DocumentWorkspace
@@ -1114,7 +1158,7 @@ export default function App() {
         onClose={() => setSearchOpen(false)}
         onSelectNote={(noteId) => {
           setActiveNoteId(noteId);
-          if (filter.type === 'snippets') setFilter({ type: 'all' });
+          if (filter.type === 'snippets' || filter.type === 'ssh') setFilter({ type: 'all' });
         }}
         onInsertSnippet={handleInsertSnippetIntoActiveNote}
       />

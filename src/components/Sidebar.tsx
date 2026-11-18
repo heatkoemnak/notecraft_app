@@ -16,6 +16,7 @@ import {
   Search,
   Star,
   Sun,
+  Terminal,
   Trash2,
   Upload,
   Users,
@@ -215,6 +216,21 @@ export function Sidebar({
               </span>
               <span className="text-[12px] text-neutral-500 dark:text-neutral-500 tabular-nums shrink-0">
                 {snippetCount}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onSelectFilter({ type: 'ssh' })}
+              className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-[13.5px] transition-colors cursor-pointer whitespace-nowrap ${
+                filter.type === 'ssh'
+                  ? 'bg-neutral-200/90 dark:bg-[#212125] text-neutral-950 dark:text-white font-medium'
+                  : 'text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/60 dark:hover:bg-white/[0.06]'
+              }`}
+            >
+              <span className="flex items-center gap-2.5 truncate">
+                <Terminal className="w-4 h-4 text-neutral-500 dark:text-neutral-400 shrink-0" />
+                <span className="truncate">SSH Terminal</span>
               </span>
             </button>
 
@@ -452,7 +468,9 @@ export function Sidebar({
                 ) : (
                   sharedNotes.map((sharedNote) => {
                     const isActive =
-                      filter.type !== 'snippets' && sharedNote.id === activeNoteId;
+                      filter.type !== 'snippets' &&
+                      filter.type !== 'ssh' &&
+                      sharedNote.id === activeNoteId;
                     const senderLabel =
                       sharedNote.ownerName || sharedNote.ownerEmail || 'Collaborator';
                     const permLabel =
@@ -513,7 +531,10 @@ export function Sidebar({
             ) : (
               <div className="space-y-0.5">
                 {visibleNotes.map((note) => {
-                  const isActive = filter.type !== 'snippets' && note.id === activeNoteId;
+                  const isActive =
+                    filter.type !== 'snippets' &&
+                    filter.type !== 'ssh' &&
+                    note.id === activeNoteId;
                   return (
                     <div
                       key={note.id}

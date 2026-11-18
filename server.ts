@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { type Request, type Response } from 'express';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
 import path from 'node:path';
 import type { Pool } from 'pg';
 import {
@@ -27,6 +28,7 @@ import {
 } from './server/groqGenerate.ts';
 import { listAvailableGroqModels } from './server/groqModels.ts';
 import { registerOAuthRoutes } from './server/oauth.ts';
+import { attachSshWebSocketServer } from './server/sshGateway.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -1280,6 +1282,130 @@ async function startServer() {
     }
   });
 
+  // SSH saved server profiles CRUD
+  app.get('/api/ssh/profiles', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const result = await pool.query<{
+        id: string;
+        label: string;
+        host: string;
+        port: number;
+        username: string;
+        auth_type: string;
+        last_connected_at: string | number | null;
+        created_at: string | number;
+      }>(
+        `SELECT id, label, host, port, username, auth_type, last_connected_at, created_at
+         FROM ssh_profiles
+         WHERE user_id = $1
+         ORDER BY COALESCE(last_connected_at, created_at) DESC`,
+        [user.id]
+      );
+
+      return res.json({
+        profiles: result.rows.map((r) => ({
+          id: r.id,
+          label: r.label,
+          host: r.host,
+          port: Number(r.port || 22),
+          username: r.username,
+          authType: r.auth_type === 'privateKey' ? 'privateKey' : 'password',
+          lastConnectedAt: r.last_connected_at ? Number(r.last_connected_at) : null,
+          createdAt: Number(r.created_at),
+        })),
+      });
+    } catch (err) {
+      console.error('Failed to load SSH profiles:', err);
+      return res.status(500).json({ error: 'Failed to load saved SSH servers' });
+    }
+  });
+
+  app.post('/api/ssh/profiles', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const { id, label, host, port, username, authType, lastConnectedAt, createdAt } =
+        req.body || {};
+      const cleanHost = typeof host === 'string' ? host.trim() : '';
+      const cleanUser = typeof username === 'string' ? username.trim() : '';
+      if (!cleanHost || !cleanUser) {
+        return res.status(400).json({ error: 'Host and username are required' });
+      }
+      const cleanPort = Math.max(1, Math.min(65535, Math.round(Number(port || 22))));
+      const cleanLabel =
+        typeof label === 'string' && label.trim()
+          ? label.trim()
+          : `${cleanUser}@${cleanHost}`;
+      const cleanAuthType = authType === 'privateKey' ? 'privateKey' : 'password';
+      const profileId =
+        typeof id === 'string' && id.trim() ? id.trim() : `ssh-${randomUUID()}`;
+      const now = Date.now();
+
+      await pool.query(
+        `INSERT INTO ssh_profiles (id, user_id, label, host, port, username, auth_type, last_connected_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO UPDATE SET
+           label = EXCLUDED.label,
+           host = EXCLUDED.host,
+           port = EXCLUDED.port,
+           username = EXCLUDED.username,
+           auth_type = EXCLUDED.auth_type,
+           last_connected_at = COALESCE(EXCLUDED.last_connected_at, ssh_profiles.last_connected_at)
+         WHERE ssh_profiles.user_id = EXCLUDED.user_id`,
+        [
+          profileId,
+          user.id,
+          cleanLabel,
+          cleanHost,
+          cleanPort,
+          cleanUser,
+          cleanAuthType,
+          lastConnectedAt ? Number(lastConnectedAt) : null,
+          Number(createdAt || now),
+        ]
+      );
+
+      return res.status(201).json({
+        profile: {
+          id: profileId,
+          label: cleanLabel,
+          host: cleanHost,
+          port: cleanPort,
+          username: cleanUser,
+          authType: cleanAuthType,
+          lastConnectedAt: lastConnectedAt ? Number(lastConnectedAt) : null,
+          createdAt: Number(createdAt || now),
+        },
+      });
+    } catch (err) {
+      console.error('Failed to save SSH profile:', err);
+      return res.status(500).json({ error: 'Failed to save SSH server profile' });
+    }
+  });
+
+  app.delete('/api/ssh/profiles/:id', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      await pool.query('DELETE FROM ssh_profiles WHERE id = $1 AND user_id = $2', [
+        req.params.id,
+        user.id,
+      ]);
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Failed to delete SSH profile:', err);
+      return res.status(500).json({ error: 'Failed to delete SSH server profile' });
+    }
+  });
+
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -1295,7 +1421,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = createHttpServer(app);
+  attachSshWebSocketServer(httpServer, getPool);
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`NoteCraft server listening on http://0.0.0.0:${PORT}`);
   });
 }

@@ -122,6 +122,18 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           UNIQUE (note_id, recipient_email)
         );
 
+        CREATE TABLE IF NOT EXISTS ssh_profiles (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          host TEXT NOT NULL,
+          port INTEGER NOT NULL DEFAULT 22,
+          username TEXT NOT NULL,
+          auth_type TEXT NOT NULL DEFAULT 'password',
+          last_connected_at BIGINT,
+          created_at BIGINT NOT NULL
+        );
+
         ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS share_token TEXT;
@@ -138,6 +150,7 @@ export async function ensureSchema(pool: Pool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_note_files_user_id ON note_files(user_id);
         CREATE INDEX IF NOT EXISTS idx_note_shares_recipient_email ON note_shares(recipient_email);
         CREATE INDEX IF NOT EXISTS idx_note_shares_note_id ON note_shares(note_id);
+        CREATE INDEX IF NOT EXISTS idx_ssh_profiles_user_id ON ssh_profiles(user_id);
       `);
 
       schemaInitialized = true;

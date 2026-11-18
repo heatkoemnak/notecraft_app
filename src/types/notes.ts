@@ -4,6 +4,7 @@ export type SidebarFilter =
   | { type: 'all' }
   | { type: 'starred' }
   | { type: 'snippets' }
+  | { type: 'ssh' }
   | { type: 'folder'; folderId: string };
 
 export type SharePermission = 'view' | 'edit';
@@ -75,6 +76,19 @@ export interface AuthUser {
   id: string;
   name: string;
   email: string;
+  createdAt: number;
+}
+
+export type SshAuthType = 'password' | 'privateKey';
+
+export interface SshProfile {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: SshAuthType;
+  lastConnectedAt?: number | null;
   createdAt: number;
 }
 
