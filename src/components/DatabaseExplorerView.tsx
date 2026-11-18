@@ -56,6 +56,7 @@ interface DatabaseExplorerViewProps {
   snippets: Snippet[];
   sidebarOpen: boolean;
   onOpenSidebar: () => void;
+  onConnectionStateChange?: (connected: boolean) => void;
   onSaveToNote: (
     title: string,
     markdownContent: string,
@@ -82,6 +83,7 @@ export function DatabaseExplorerView({
   snippets,
   sidebarOpen,
   onOpenSidebar,
+  onConnectionStateChange,
   onSaveToNote,
 }: DatabaseExplorerViewProps) {
   const [profiles, setProfiles] = useState<DatabaseProfile[]>([]);
@@ -110,6 +112,8 @@ export function DatabaseExplorerView({
   const [schemaInfo, setSchemaInfo] = useState<DatabaseIntrospectionResponse | null>(null);
   const [tableFilter, setTableFilter] = useState('');
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+  const [tablesGroupOpen, setTablesGroupOpen] = useState(true);
+  const [collapsedSchemas, setCollapsedSchemas] = useState<Set<string>>(new Set());
 
   // Query editor & results
   const [sql, setSql] = useState('SELECT 1 AS status;');
@@ -126,6 +130,10 @@ export function DatabaseExplorerView({
 
   const snippetMenuRef = useRef<HTMLDivElement>(null);
   const passwordInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    onConnectionStateChange?.(status === 'connected');
+  }, [status, onConnectionStateChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -242,6 +250,8 @@ export function DatabaseExplorerView({
       setStatus('connected');
       setStatusMessage(`${info.version} · ${info.tables.length} tables`);
 
+      setTablesGroupOpen(true);
+      setCollapsedSchemas(new Set());
       if (info.tables.length > 0) {
         const first = info.tables[0];
         const firstKey = `${first.schema}.${first.name}`;
@@ -444,6 +454,20 @@ export function DatabaseExplorerView({
         t.columns.some((c) => c.name.toLowerCase().includes(q))
     );
   }, [schemaInfo, tableFilter]);
+
+  const groupedTablesBySchema = useMemo(() => {
+    const groups = new Map<string, DatabaseTableInfo[]>();
+    for (const tbl of filteredTables) {
+      const schemaName = tbl.schema || 'public';
+      const list = groups.get(schemaName) || [];
+      list.push(tbl);
+      groups.set(schemaName, list);
+    }
+    return Array.from(groups.entries()).map(([schema, tables]) => ({ schema, tables }));
+  }, [filteredTables]);
+
+  const isFilteringTables = tableFilter.trim().length > 0;
+  const isTablesGroupExpanded = isFilteringTables || tablesGroupOpen;
 
   const sqlSnippets = useMemo(
     () => snippets.filter((s) => /sql|postgres|mysql|db|query/i.test(`${s.language} ${s.category} ${s.title}`)),
@@ -954,82 +978,153 @@ export function DatabaseExplorerView({
                     No matching tables found.
                   </p>
                 ) : (
-                  <div className="space-y-1">
-                    {filteredTables.map((tbl) => {
-                      const key = `${tbl.schema}.${tbl.name}`;
-                      const expanded = expandedTables.has(key);
-                      return (
-                        <div
-                          key={key}
-                          className="rounded-lg border border-neutral-200/80 dark:border-white/[0.07] bg-white dark:bg-[#111115] overflow-hidden"
-                        >
-                          <div className="flex items-center justify-between gap-1 px-2.5 py-2 hover:bg-neutral-50 dark:hover:bg-white/[0.03] transition-colors">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setExpandedTables((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(key)) next.delete(key);
-                                  else next.add(key);
-                                  return next;
-                                });
-                              }}
-                              className="flex-1 min-w-0 flex items-center gap-1.5 text-left cursor-pointer"
-                            >
-                              {expanded ? (
-                                <ChevronDown className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                              ) : (
-                                <ChevronRight className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                              )}
-                              <Table2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
-                              <span className="text-[12.5px] font-medium text-neutral-900 dark:text-neutral-100 truncate">
-                                {tbl.schema !== 'public' && schemaInfo?.engine === 'postgres'
-                                  ? `${tbl.schema}.${tbl.name}`
-                                  : tbl.name}
-                              </span>
-                            </button>
+                  <div className="rounded-xl border border-neutral-200/90 dark:border-white/[0.08] bg-white/70 dark:bg-[#101014] overflow-hidden">
+                    {/* Tables Group Header */}
+                    <button
+                      type="button"
+                      onClick={() => setTablesGroupOpen((prev) => !prev)}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2 bg-neutral-100/70 dark:bg-white/[0.03] hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        {isTablesGroupExpanded ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                        )}
+                        <FolderOpen className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                        <span className="text-[12.5px] font-semibold text-neutral-900 dark:text-neutral-100">
+                          Tables
+                        </span>
+                      </span>
+                      <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400 tabular-nums shrink-0">
+                        {filteredTables.length}
+                      </span>
+                    </button>
 
-                            <div className="flex items-center gap-2 shrink-0">
-                              {tbl.estimatedRows !== null && (
-                                <span className="text-[11px] text-neutral-400 tabular-nums">
-                                  ~{tbl.estimatedRows.toLocaleString()}
-                                </span>
-                              )}
+                    {isTablesGroupExpanded && (
+                      <div className="border-t border-neutral-200/80 dark:border-white/[0.06] p-2 space-y-2">
+                        {groupedTablesBySchema.map((group) => {
+                          const showSchemaGroup = groupedTablesBySchema.length > 1;
+                          const schemaExpanded =
+                            isFilteringTables || !collapsedSchemas.has(group.schema);
+
+                          const renderTableList = (items: DatabaseTableInfo[]) => (
+                            <div className="space-y-1">
+                              {items.map((tbl) => {
+                                const key = `${tbl.schema}.${tbl.name}`;
+                                const expanded = expandedTables.has(key);
+                                return (
+                                  <div
+                                    key={key}
+                                    className="rounded-lg border border-neutral-200/80 dark:border-white/[0.07] bg-white dark:bg-[#15151a] overflow-hidden"
+                                  >
+                                    <div className="flex items-center justify-between gap-1 px-2.5 py-2 hover:bg-neutral-50 dark:hover:bg-white/[0.03] transition-colors">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setExpandedTables((prev) => {
+                                            const next = new Set(prev);
+                                            if (next.has(key)) next.delete(key);
+                                            else next.add(key);
+                                            return next;
+                                          });
+                                        }}
+                                        className="flex-1 min-w-0 flex items-center gap-1.5 text-left cursor-pointer"
+                                      >
+                                        {expanded ? (
+                                          <ChevronDown className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                                        ) : (
+                                          <ChevronRight className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                                        )}
+                                        <Table2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                                        <span className="text-[12.5px] font-medium text-neutral-900 dark:text-neutral-100 truncate">
+                                          {tbl.name}
+                                        </span>
+                                      </button>
+
+                                      <div className="flex items-center gap-2 shrink-0">
+                                        {tbl.estimatedRows !== null && (
+                                          <span className="text-[11px] text-neutral-400 tabular-nums">
+                                            ~{tbl.estimatedRows.toLocaleString()}
+                                          </span>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => handlePreviewTable(tbl)}
+                                          title={`Preview 50 rows from ${tbl.name}`}
+                                          className="px-1.5 py-0.5 rounded text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-600/10 cursor-pointer whitespace-nowrap"
+                                        >
+                                          Query
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    {expanded && tbl.columns.length > 0 && (
+                                      <div className="border-t border-neutral-100 dark:border-white/[0.06] px-2.5 py-1.5 space-y-1 bg-neutral-50/60 dark:bg-black/20">
+                                        {tbl.columns.map((col) => (
+                                          <div
+                                            key={col.name}
+                                            className="flex items-center justify-between gap-2 text-[11.5px] py-0.5"
+                                          >
+                                            <span className="flex items-center gap-1.5 min-w-0 font-mono-code text-neutral-800 dark:text-neutral-200 truncate">
+                                              {col.isPrimaryKey && (
+                                                <KeyRound className="w-3 h-3 text-amber-500 shrink-0" />
+                                              )}
+                                              <span className="truncate">{col.name}</span>
+                                            </span>
+                                            <span className="font-mono-code text-[11px] text-neutral-500 dark:text-neutral-400 shrink-0">
+                                              {col.type}
+                                              {col.foreignKey ? ` · FK` : ''}
+                                            </span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+
+                          if (!showSchemaGroup) {
+                            return <div key={group.schema}>{renderTableList(group.tables)}</div>;
+                          }
+
+                          return (
+                            <div key={group.schema} className="space-y-1">
                               <button
                                 type="button"
-                                onClick={() => handlePreviewTable(tbl)}
-                                title={`Preview 50 rows from ${tbl.name}`}
-                                className="px-1.5 py-0.5 rounded text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-600/10 cursor-pointer whitespace-nowrap"
+                                onClick={() => {
+                                  setCollapsedSchemas((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(group.schema)) next.delete(group.schema);
+                                    else next.add(group.schema);
+                                    return next;
+                                  });
+                                }}
+                                className="w-full flex items-center justify-between gap-2 px-2 py-1 rounded-md text-[11.5px] font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-white/[0.05] transition-colors cursor-pointer"
                               >
-                                Query
+                                <span className="flex items-center gap-1.5 min-w-0 truncate">
+                                  {schemaExpanded ? (
+                                    <ChevronDown className="w-3 h-3 text-neutral-400 shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="w-3 h-3 text-neutral-400 shrink-0" />
+                                  )}
+                                  <span className="font-mono-code truncate">{group.schema}</span>
+                                </span>
+                                <span className="text-[11px] text-neutral-400 tabular-nums shrink-0">
+                                  {group.tables.length}
+                                </span>
                               </button>
-                            </div>
-                          </div>
 
-                          {expanded && tbl.columns.length > 0 && (
-                            <div className="border-t border-neutral-100 dark:border-white/[0.06] px-2.5 py-1.5 space-y-1 bg-neutral-50/60 dark:bg-black/20">
-                              {tbl.columns.map((col) => (
-                                <div
-                                  key={col.name}
-                                  className="flex items-center justify-between gap-2 text-[11.5px] py-0.5"
-                                >
-                                  <span className="flex items-center gap-1.5 min-w-0 font-mono-code text-neutral-800 dark:text-neutral-200 truncate">
-                                    {col.isPrimaryKey && (
-                                      <KeyRound className="w-3 h-3 text-amber-500 shrink-0" />
-                                    )}
-                                    <span className="truncate">{col.name}</span>
-                                  </span>
-                                  <span className="font-mono-code text-[11px] text-neutral-500 dark:text-neutral-400 shrink-0">
-                                    {col.type}
-                                    {col.foreignKey ? ` · FK` : ''}
-                                  </span>
-                                </div>
-                              ))}
+                              {schemaExpanded && (
+                                <div className="pl-2">{renderTableList(group.tables)}</div>
+                              )}
                             </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

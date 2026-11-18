@@ -40,6 +40,7 @@ import {
 } from '../utils/sshClient';
 
 interface SshTerminalViewProps {
+  isActive?: boolean;
   storageMode: StorageBackendMode;
   currentUser: AuthUser;
   folders: Folder[];
@@ -47,6 +48,7 @@ interface SshTerminalViewProps {
   snippets: Snippet[];
   sidebarOpen: boolean;
   onOpenSidebar: () => void;
+  onConnectionStateChange?: (state: { connected: boolean; target: string | null }) => void;
   onSaveTranscriptToNote: (
     serverLabel: string,
     transcript: string,
@@ -81,6 +83,7 @@ const TERMINAL_THEME = {
 };
 
 export function SshTerminalView({
+  isActive = true,
   storageMode,
   currentUser,
   folders,
@@ -88,6 +91,7 @@ export function SshTerminalView({
   snippets,
   sidebarOpen,
   onOpenSidebar,
+  onConnectionStateChange,
   onSaveTranscriptToNote,
 }: SshTerminalViewProps) {
   const [profiles, setProfiles] = useState<SshProfile[]>([]);
@@ -129,6 +133,31 @@ export function SshTerminalView({
   selectedProfileIdRef.current = selectedProfileId;
   const profilesRef = useRef<SshProfile[]>(profiles);
   profilesRef.current = profiles;
+  const isActiveRef = useRef<boolean>(isActive);
+  isActiveRef.current = isActive;
+
+  useEffect(() => {
+    onConnectionStateChange?.({
+      connected: status === 'connected',
+      target: connectedTarget,
+    });
+  }, [status, connectedTarget, onConnectionStateChange]);
+
+  // Keep SSH WebSocket warm through reverse proxies while user switches to Database or Notes
+  useEffect(() => {
+    if (status !== 'connected' && status !== 'connecting') return;
+    const timer = window.setInterval(() => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        } catch {
+          // ignore
+        }
+      }
+    }, 25000);
+    return () => window.clearInterval(timer);
+  }, [status]);
 
   // Load saved server profiles
   useEffect(() => {
@@ -183,6 +212,8 @@ export function SshTerminalView({
     fitAddonRef.current = fitAddon;
 
     const safeFit = () => {
+      if (!isActiveRef.current) return;
+      if (container.clientWidth < 40 || container.clientHeight < 40) return;
       try {
         fitAddon.fit();
         const ws = wsRef.current;
@@ -237,22 +268,38 @@ export function SshTerminalView({
     };
   }, []);
 
-  // Re-fit terminal when connection panel collapses/expands
+  // Re-fit & refresh terminal when switching back to SSH tab or toggling panels
   useEffect(() => {
-    const timer = window.setTimeout(() => {
+    if (!isActive) return;
+    const runFit = () => {
+      const container = terminalContainerRef.current;
+      if (!container || container.clientWidth < 40 || container.clientHeight < 40) return;
       try {
         fitAddonRef.current?.fit();
         const term = termRef.current;
         const ws = wsRef.current;
-        if (term && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        if (term) {
+          term.refresh(0, Math.max(0, term.rows - 1));
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          }
         }
       } catch {
         // ignore
       }
+    };
+    const raf = window.requestAnimationFrame(runFit);
+    const timer = window.setTimeout(() => {
+      runFit();
+      if (status === 'connected') {
+        termRef.current?.focus();
+      }
     }, 80);
-    return () => window.clearTimeout(timer);
-  }, [panelOpen, sidebarOpen]);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.clearTimeout(timer);
+    };
+  }, [isActive, panelOpen, sidebarOpen, status]);
 
   const handleCommandInputChange = (raw: string) => {
     setCommandInput(raw);

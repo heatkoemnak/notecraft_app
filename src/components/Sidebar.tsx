@@ -37,6 +37,9 @@ interface SidebarProps {
   filter: SidebarFilter;
   theme: 'dark' | 'light';
   user: AuthUser;
+  sshConnected?: boolean;
+  sshTarget?: string | null;
+  dbConnected?: boolean;
   onLogout: () => void;
   onToggleTheme: () => void;
   onOpenSearch: () => void;
@@ -64,6 +67,9 @@ export function Sidebar({
   filter,
   theme,
   user,
+  sshConnected = false,
+  sshTarget = null,
+  dbConnected = false,
   onLogout,
   onToggleTheme,
   onOpenSearch,
@@ -223,6 +229,7 @@ export function Sidebar({
             <button
               type="button"
               onClick={() => onSelectFilter({ type: 'ssh' })}
+              title={sshConnected && sshTarget ? `SSH connected: ${sshTarget}` : undefined}
               className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-[13.5px] transition-colors cursor-pointer whitespace-nowrap ${
                 filter.type === 'ssh'
                   ? 'bg-neutral-200/90 dark:bg-[#212125] text-neutral-950 dark:text-white font-medium'
@@ -233,6 +240,12 @@ export function Sidebar({
                 <Terminal className="w-4 h-4 text-neutral-500 dark:text-neutral-400 shrink-0" />
                 <span className="truncate">SSH Terminal</span>
               </span>
+              {sshConnected && (
+                <span
+                  aria-label="SSH connected"
+                  className="w-2 h-2 rounded-full bg-emerald-500 shrink-0"
+                />
+              )}
             </button>
 
             <button
@@ -248,6 +261,12 @@ export function Sidebar({
                 <Database className="w-4 h-4 text-neutral-500 dark:text-neutral-400 shrink-0" />
                 <span className="truncate">Database</span>
               </span>
+              {dbConnected && (
+                <span
+                  aria-label="Database connected"
+                  className="w-2 h-2 rounded-full bg-emerald-500 shrink-0"
+                />
+              )}
             </button>
 
             <button

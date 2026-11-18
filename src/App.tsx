@@ -120,6 +120,24 @@ export default function App() {
     seq: number;
     preset?: 'explain-project' | null;
   } | null>(null);
+  const [sshSessionState, setSshSessionState] = useState<{
+    connected: boolean;
+    target: string | null;
+  }>({ connected: false, target: null });
+  const [dbConnected, setDbConnected] = useState(false);
+
+  const handleSshConnectionStateChange = useCallback(
+    (next: { connected: boolean; target: string | null }) => {
+      setSshSessionState((prev) =>
+        prev.connected === next.connected && prev.target === next.target ? prev : next
+      );
+    },
+    []
+  );
+
+  const handleDbConnectionStateChange = useCallback((connected: boolean) => {
+    setDbConnected((prev) => (prev === connected ? prev : connected));
+  }, []);
 
   const dbEnabledRef = useRef(false);
   const notePatchTimersRef = useRef<Map<string, number>>(new Map());
@@ -1114,6 +1132,8 @@ export default function App() {
     setShareModalOpen(false);
     setImportModalOpen(false);
     setSnippetModalState({ open: false });
+    setSshSessionState({ connected: false, target: null });
+    setDbConnected(false);
     setCurrentUser(null);
   };
 
@@ -1163,6 +1183,9 @@ export default function App() {
         filter={filter}
         theme={theme}
         user={currentUser}
+        sshConnected={sshSessionState.connected}
+        sshTarget={sshSessionState.target}
+        dbConnected={dbConnected}
         onLogout={handleLogout}
         onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
         onOpenSearch={() => setSearchOpen(true)}
@@ -1212,6 +1235,36 @@ export default function App() {
         }}
       />
 
+      {/* Persistent views: kept mounted so active SSH/DB sessions survive switching to Database, Snippets, or Notes */}
+      <div className={filter.type === 'ssh' ? 'flex-1 flex min-w-0 min-h-0' : 'hidden'}>
+        <SshTerminalView
+          isActive={filter.type === 'ssh'}
+          storageMode={storageMode}
+          currentUser={currentUser}
+          folders={folders}
+          defaultFolderId={folders[0]?.id ?? null}
+          snippets={snippets}
+          sidebarOpen={sidebarOpen}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onConnectionStateChange={handleSshConnectionStateChange}
+          onSaveTranscriptToNote={handleSaveSshTranscriptToNote}
+        />
+      </div>
+
+      <div className={filter.type === 'database' ? 'flex-1 flex min-w-0 min-h-0' : 'hidden'}>
+        <DatabaseExplorerView
+          storageMode={storageMode}
+          currentUser={currentUser}
+          folders={folders}
+          defaultFolderId={folders[0]?.id ?? null}
+          snippets={snippets}
+          sidebarOpen={sidebarOpen}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onConnectionStateChange={handleDbConnectionStateChange}
+          onSaveToNote={handleSaveDatabaseOutputToNote}
+        />
+      </div>
+
       {filter.type === 'snippets' ? (
         <SnippetsView
           snippets={snippets}
@@ -1223,29 +1276,7 @@ export default function App() {
           onDeleteSnippet={handleDeleteSnippet}
           onInsertIntoActiveNote={handleInsertSnippetIntoActiveNote}
         />
-      ) : filter.type === 'ssh' ? (
-        <SshTerminalView
-          storageMode={storageMode}
-          currentUser={currentUser}
-          folders={folders}
-          defaultFolderId={folders[0]?.id ?? null}
-          snippets={snippets}
-          sidebarOpen={sidebarOpen}
-          onOpenSidebar={() => setSidebarOpen(true)}
-          onSaveTranscriptToNote={handleSaveSshTranscriptToNote}
-        />
-      ) : filter.type === 'database' ? (
-        <DatabaseExplorerView
-          storageMode={storageMode}
-          currentUser={currentUser}
-          folders={folders}
-          defaultFolderId={folders[0]?.id ?? null}
-          snippets={snippets}
-          sidebarOpen={sidebarOpen}
-          onOpenSidebar={() => setSidebarOpen(true)}
-          onSaveToNote={handleSaveDatabaseOutputToNote}
-        />
-      ) : (
+      ) : filter.type !== 'ssh' && filter.type !== 'database' ? (
         <DocumentWorkspace
           note={activeNote}
           allNotes={[...notes, ...sharedNotes]}
@@ -1279,7 +1310,7 @@ export default function App() {
           }
           onOpenSnippetsLibrary={() => setFilter({ type: 'snippets' })}
         />
-      )}
+      ) : null}
 
       <CommandPalette
         isOpen={searchOpen}
