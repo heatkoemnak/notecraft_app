@@ -8,6 +8,8 @@ import {
   Cpu,
   Eye,
   FileCode2,
+  FilePlus2,
+  FolderTree,
   Loader2,
   RotateCw,
   Table2,
@@ -15,7 +17,9 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
+import { Folder, NoteDocument } from '../types/notes';
 import {
+  buildProjectContextPayload,
   FALLBACK_GROQ_MODELS,
   fetchGroqModels,
   GenerateDocLength,
@@ -23,6 +27,7 @@ import {
   GenerateDocumentResult,
   GroqModelOption,
   loadSavedGroqModel,
+  ProjectContextScope,
   requestAiGenerateDocument,
   savePreferredGroqModel,
 } from '../utils/aiDocumentClient';
@@ -30,17 +35,23 @@ import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface AiWriteDocumentModalProps {
   isOpen: boolean;
+  activeNoteId?: string;
+  activeFolderId?: string | null;
   currentTitle: string;
   currentContent: string;
+  folders?: Folder[];
+  allNotes?: NoteDocument[];
+  initialPreset?: 'explain-project' | null;
   onClose: () => void;
   onApply: (payload: {
     title?: string;
     content: string;
-    mode: 'replace' | 'append';
+    mode: 'replace' | 'append' | 'new';
   }) => void;
 }
 
 const DOC_TYPES: Array<{ id: GenerateDocType; label: string }> = [
+  { id: 'explain', label: 'Explain & Q&A' },
   { id: 'general', label: 'General Note' },
   { id: 'spec', label: 'Technical Spec' },
   { id: 'runbook', label: 'Runbook / SOP' },
@@ -64,6 +75,24 @@ const QUICK_PROMPTS: Array<{
   code: boolean;
 }> = [
   {
+    label: 'Explain Project & How It Works',
+    docType: 'explain',
+    prompt:
+      'Analyze the project folder structure, files, configuration, and terminal output in my notes. Explain what this project does, what each folder/file is responsible for, how components interact, and how to run or deploy it.',
+    tables: true,
+    diagrams: true,
+    code: true,
+  },
+  {
+    label: 'Summarize SSH / Terminal Output',
+    docType: 'explain',
+    prompt:
+      'Analyze the captured terminal/SSH output in my notes. Summarize the system state, project structure, running services or errors, and list recommended next steps.',
+    tables: true,
+    diagrams: false,
+    code: true,
+  },
+  {
     label: 'Auth & JWT API Spec',
     docType: 'api',
     prompt:
@@ -81,32 +110,42 @@ const QUICK_PROMPTS: Array<{
     diagrams: false,
     code: true,
   },
-  {
-    label: 'Sprint Planning Notes',
-    docType: 'meeting',
-    prompt:
-      'Draft structured engineering sprint planning meeting notes with goals, capacity table, key architecture decisions, risks, and action item checklists.',
-    tables: true,
-    diagrams: false,
-    code: false,
-  },
 ];
 
 export function AiWriteDocumentModal({
   isOpen,
+  activeNoteId = '',
+  activeFolderId = null,
   currentTitle,
   currentContent,
+  folders = [],
+  allNotes = [],
+  initialPreset = null,
   onClose,
   onApply,
 }: AiWriteDocumentModalProps) {
   const hasExistingContent = currentContent.trim().length > 0;
+  const folderSiblingNotes = allNotes.filter(
+    (n) =>
+      n.id !== activeNoteId &&
+      activeFolderId !== null &&
+      n.folderId === activeFolderId &&
+      n.content.trim().length > 0
+  );
+  const workspaceOtherNotes = allNotes.filter(
+    (n) => n.id !== activeNoteId && n.content.trim().length > 0
+  );
+  const activeFolderName = activeFolderId
+    ? folders.find((f) => f.id === activeFolderId)?.name || 'Project Folder'
+    : null;
+
   const [prompt, setPrompt] = useState('');
   const [docType, setDocType] = useState<GenerateDocType>('general');
   const [length, setLength] = useState<GenerateDocLength>('standard');
   const [includeTables, setIncludeTables] = useState(true);
   const [includeDiagrams, setIncludeDiagrams] = useState(false);
   const [includeCode, setIncludeCode] = useState(true);
-  const [useExistingContext, setUseExistingContext] = useState(false);
+  const [contextScope, setContextScope] = useState<ProjectContextScope>('note');
 
   const [models, setModels] = useState<GroqModelOption[]>(FALLBACK_GROQ_MODELS);
   const [selectedModel, setSelectedModel] = useState<string>(() => loadSavedGroqModel(''));
@@ -129,8 +168,34 @@ export function AiWriteDocumentModal({
     if (!isOpen) return;
     setError(null);
     setCopied(false);
-    setUseExistingContext(false);
-    setUpdateTitle(!currentTitle.trim() || currentTitle.trim().toLowerCase() === 'untitled note');
+
+    // Automatically attach note & project folder context whenever relevant notes exist
+    if (folderSiblingNotes.length > 0) {
+      setContextScope('folder');
+    } else if (hasExistingContent) {
+      setContextScope('note');
+    } else if (workspaceOtherNotes.length > 0) {
+      setContextScope('workspace');
+    } else {
+      setContextScope('none');
+    }
+
+    if (initialPreset === 'explain-project') {
+      setResult(null);
+      setDocType('explain');
+      setLength('detailed');
+      setIncludeTables(true);
+      setIncludeDiagrams(true);
+      setIncludeCode(true);
+      setPrompt(
+        'Explain the project folder structure, key files, dependencies, and how everything works together based on the captured output and project notes.'
+      );
+      setUpdateTitle(false);
+    } else {
+      setUpdateTitle(
+        !currentTitle.trim() || currentTitle.trim().toLowerCase() === 'untitled note'
+      );
+    }
 
     let cancelled = false;
     const saved = loadSavedGroqModel('');
@@ -155,7 +220,7 @@ export function AiWriteDocumentModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, currentTitle]);
+  }, [isOpen, activeNoteId, activeFolderId, initialPreset]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -170,6 +235,16 @@ export function AiWriteDocumentModal({
   }, [isOpen, onClose]);
 
   if (!isOpen) return null;
+
+  const contextPreview = buildProjectContextPayload({
+    scope: contextScope,
+    activeNoteId,
+    activeTitle: currentTitle,
+    activeContent: currentContent,
+    activeFolderId,
+    folders,
+    allNotes,
+  });
 
   const activeModelId = (useCustomModel ? customModelId.trim() : selectedModel.trim()) || selectedModel;
   const activeModelMeta = models.find((m) => m.id === activeModelId);
@@ -207,6 +282,16 @@ export function AiWriteDocumentModal({
     setError(null);
 
     try {
+      const ctx = buildProjectContextPayload({
+        scope: contextScope,
+        activeNoteId,
+        activeTitle: currentTitle,
+        activeContent: currentContent,
+        activeFolderId,
+        folders,
+        allNotes,
+      });
+
       const res = await requestAiGenerateDocument({
         prompt: prompt.trim(),
         model: activeModelId || undefined,
@@ -215,8 +300,10 @@ export function AiWriteDocumentModal({
         includeTables,
         includeDiagrams,
         includeCode,
-        existingTitle: useExistingContext ? currentTitle : undefined,
-        existingContent: useExistingContext && hasExistingContent ? currentContent : undefined,
+        existingTitle: ctx.existingTitle,
+        existingContent: ctx.existingContent,
+        projectFolderName: ctx.projectFolderName,
+        projectNotes: ctx.projectNotes,
       });
       if (reqSeqRef.current !== seq) return;
       setResult(res);
@@ -269,10 +356,10 @@ export function AiWriteDocumentModal({
                 id="ai-write-doc-title"
                 className="text-[15px] font-semibold text-neutral-950 dark:text-white truncate"
               >
-                Write Whole Document with Groq AI
+                Ask AI or Write Document
               </h2>
               <p className="text-[12px] text-neutral-500 dark:text-neutral-400 truncate">
-                Describe what you need and generate a complete structured Markdown note
+                Explain saved project folders/SSH output or draft structured Markdown notes
                 {result?.model ? ` · ${result.model}` : ''}
               </p>
             </div>
@@ -297,7 +384,7 @@ export function AiWriteDocumentModal({
                 htmlFor="ai-write-prompt"
                 className="text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200"
               >
-                What document do you want to write?
+                Ask about your project or describe what to write
               </label>
               <span className="text-[11.5px] text-neutral-400 tabular-nums">
                 Ctrl+Enter to generate
@@ -316,7 +403,7 @@ export function AiWriteDocumentModal({
                 }
               }}
               rows={3}
-              placeholder="e.g., Write a system architecture spec for a real-time notification service using Redis Pub/Sub and WebSockets, with an architecture diagram and API payload table..."
+              placeholder="e.g., Explain how this project works based on the folder structure and SSH output in my notes, or write a complete API spec..."
               className="w-full rounded-xl border border-neutral-200 dark:border-white/[0.1] bg-white dark:bg-[#111115] px-3.5 py-2.5 text-[13.5px] leading-relaxed text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 resize-y"
             />
 
@@ -440,6 +527,76 @@ export function AiWriteDocumentModal({
               </div>
             </div>
 
+            {/* Project & Note Context Row */}
+            <div className="pt-2 border-t border-neutral-200/80 dark:border-white/[0.07] flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <FolderTree className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                <span className="text-[12px] font-medium text-neutral-700 dark:text-neutral-200 whitespace-nowrap">
+                  Project context
+                </span>
+                <span className="text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate tabular-nums">
+                  {contextScope === 'none' || contextPreview.includedNoteCount === 0
+                    ? 'No notes attached'
+                    : `${contextPreview.includedNoteCount} ${
+                        contextPreview.includedNoteCount === 1 ? 'note' : 'notes'
+                      } · ${(contextPreview.totalChars / 1024).toFixed(1)} KB`}
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1 shrink-0">
+                {hasExistingContent && (
+                  <button
+                    type="button"
+                    onClick={() => setContextScope('note')}
+                    className={`px-2 py-1 rounded-md text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      contextScope === 'note'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white dark:bg-white/[0.05] text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-white/[0.08]'
+                    }`}
+                  >
+                    Current note
+                  </button>
+                )}
+                {activeFolderName && folderSiblingNotes.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setContextScope('folder')}
+                    className={`px-2 py-1 rounded-md text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      contextScope === 'folder'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white dark:bg-white/[0.05] text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-white/[0.08]'
+                    }`}
+                  >
+                    Folder: {activeFolderName} ({folderSiblingNotes.length + (hasExistingContent ? 1 : 0)})
+                  </button>
+                )}
+                {workspaceOtherNotes.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setContextScope('workspace')}
+                    className={`px-2 py-1 rounded-md text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                      contextScope === 'workspace'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white dark:bg-white/[0.05] text-neutral-600 dark:text-neutral-300 border border-neutral-200 dark:border-white/[0.08]'
+                    }`}
+                  >
+                    All notes ({workspaceOtherNotes.length + (hasExistingContent ? 1 : 0)})
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setContextScope('none')}
+                  className={`px-2 py-1 rounded-md text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    contextScope === 'none'
+                      ? 'bg-neutral-800 dark:bg-white/20 text-white'
+                      : 'bg-white dark:bg-white/[0.05] text-neutral-500 dark:text-neutral-400 border border-neutral-200 dark:border-white/[0.08]'
+                  }`}
+                >
+                  Off
+                </button>
+              </div>
+            </div>
+
             <div className="pt-2 border-t border-neutral-200/80 dark:border-white/[0.07] flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <OptionToggle
@@ -460,17 +617,6 @@ export function AiWriteDocumentModal({
                   icon={<Code2 className="w-3.5 h-3.5" />}
                   label="Code blocks"
                 />
-                {hasExistingContent && (
-                  <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-neutral-200 dark:border-white/[0.08] bg-white dark:bg-white/[0.04] text-[12px] text-neutral-700 dark:text-neutral-300 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={useExistingContext}
-                      onChange={(e) => setUseExistingContext(e.target.checked)}
-                      className="h-3.5 w-3.5 rounded accent-blue-600 cursor-pointer"
-                    />
-                    <span>Use current note as context</span>
-                  </label>
-                )}
               </div>
 
               <button
@@ -630,6 +776,24 @@ export function AiWriteDocumentModal({
                 className="px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium border border-neutral-200 dark:border-white/12 bg-white dark:bg-white/[0.05] text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-white/[0.09] disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap"
               >
                 Append to note
+              </button>
+            )}
+            {result && (
+              <button
+                type="button"
+                disabled={loading || !draftContent.trim()}
+                onClick={() => {
+                  onApply({
+                    title: draftTitle.trim() || 'AI Project Analysis',
+                    content: draftContent,
+                    mode: 'new',
+                  });
+                  onClose();
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-[12.5px] font-medium border border-neutral-200 dark:border-white/12 bg-white dark:bg-white/[0.05] text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-white/[0.09] disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <FilePlus2 className="w-3.5 h-3.5" />
+                <span>Save as new note</span>
               </button>
             )}
             <button

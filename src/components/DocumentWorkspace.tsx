@@ -57,6 +57,7 @@ import {
 
 interface DocumentWorkspaceProps {
   note: NoteDocument | null;
+  allNotes?: NoteDocument[];
   folders: Folder[];
   snippets: Snippet[];
   viewMode: ViewMode;
@@ -70,6 +71,8 @@ interface DocumentWorkspaceProps {
     seq: number;
   } | null;
   selectionReaderRef: React.MutableRefObject<() => NoteSelection | null>;
+  aiWriterRequest?: { seq: number; preset?: 'explain-project' | null } | null;
+  onConsumeAiWriterRequest?: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onOpenSidebar: () => void;
@@ -81,6 +84,7 @@ interface DocumentWorkspaceProps {
     meta?: NoteUpdateMeta
   ) => void;
   onCreateNote: () => void;
+  onCreateAiNote?: (title: string, content: string, folderId: string | null) => void;
   onDuplicateSharedNote: (note: NoteDocument) => void;
   onOpenShareModal: () => void;
   onOpenImportModal: () => void;
@@ -101,6 +105,7 @@ const EDITOR_FONTS: { id: EditorFontId; label: string }[] = [
 
 export function DocumentWorkspace({
   note,
+  allNotes = [],
   folders,
   snippets,
   viewMode,
@@ -110,6 +115,8 @@ export function DocumentWorkspace({
   canRedo,
   pendingSelection,
   selectionReaderRef,
+  aiWriterRequest = null,
+  onConsumeAiWriterRequest,
   onUndo,
   onRedo,
   onOpenSidebar,
@@ -117,6 +124,7 @@ export function DocumentWorkspace({
   onChangeViewMode,
   onUpdateNote,
   onCreateNote,
+  onCreateAiNote,
   onDuplicateSharedNote,
   onOpenShareModal,
   onOpenImportModal,
@@ -172,6 +180,14 @@ export function DocumentWorkspace({
     selectedText: string;
   }>({ open: false, selectedText: '' });
   const [aiWriteModalOpen, setAiWriteModalOpen] = useState(false);
+  const [aiWritePreset, setAiWritePreset] = useState<'explain-project' | null>(null);
+
+  useEffect(() => {
+    if (!aiWriterRequest || !aiWriterRequest.seq) return;
+    setAiWritePreset(aiWriterRequest.preset ?? null);
+    setAiWriteModalOpen(true);
+    onConsumeAiWriterRequest?.();
+  }, [aiWriterRequest, onConsumeAiWriterRequest]);
 
   useEffect(() => {
     try {
@@ -1235,12 +1251,15 @@ export function DocumentWorkspace({
               <>
             <button
               type="button"
-              onClick={() => setAiWriteModalOpen(true)}
-              title="Write a whole document with Groq AI"
+              onClick={() => {
+                setAiWritePreset(null);
+                setAiWriteModalOpen(true);
+              }}
+              title="Ask AI about your note/project folder or write a whole document"
               className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-white/[0.07] transition-colors cursor-pointer whitespace-nowrap"
             >
               <Wand2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-              <span>AI Write</span>
+              <span>AI Write / Ask</span>
             </button>
 
             <button
@@ -1849,10 +1868,22 @@ export function DocumentWorkspace({
 
       <AiWriteDocumentModal
         isOpen={aiWriteModalOpen}
+        activeNoteId={note.id}
+        activeFolderId={note.folderId}
         currentTitle={note.title}
         currentContent={note.content}
-        onClose={() => setAiWriteModalOpen(false)}
+        folders={folders}
+        allNotes={allNotes}
+        initialPreset={aiWritePreset}
+        onClose={() => {
+          setAiWriteModalOpen(false);
+          setAiWritePreset(null);
+        }}
         onApply={({ title, content, mode }) => {
+          if (mode === 'new' && onCreateAiNote) {
+            onCreateAiNote(title?.trim() || 'AI Project Analysis', content, note.folderId);
+            return;
+          }
           const nextContent =
             mode === 'append' && note.content.trim()
               ? `${note.content.trimEnd()}\n\n${content}`

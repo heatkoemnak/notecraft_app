@@ -115,6 +115,10 @@ export default function App() {
     open: boolean;
     initial?: Partial<Snippet> | null;
   }>({ open: false });
+  const [aiWriterRequest, setAiWriterRequest] = useState<{
+    seq: number;
+    preset?: 'explain-project' | null;
+  } | null>(null);
 
   const dbEnabledRef = useRef(false);
   const notePatchTimersRef = useRef<Map<string, number>>(new Map());
@@ -823,15 +827,15 @@ export default function App() {
     }
   };
 
-  const handleSaveSshTranscriptToNote = (serverLabel: string, transcript: string) => {
+  const handleCreateAiNote = (title: string, content: string, folderId: string | null) => {
     const now = Date.now();
-    const timestamp = new Date(now).toLocaleString();
-    const cleanTranscript = transcript.trimEnd();
+    const validFolder =
+      folderId && folders.some((f) => f.id === folderId) ? folderId : null;
     const newNote: NoteDocument = {
       id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
-      title: `SSH Session: ${serverLabel}`,
-      content: `## SSH Session — ${serverLabel}\n\nCaptured on ${timestamp}\n\n\`\`\`bash\n${cleanTranscript}\n\`\`\`\n`,
-      folderId: folders[0]?.id ?? null,
+      title: title.trim() || 'AI Project Analysis',
+      content,
+      folderId: validFolder,
       starred: false,
       createdAt: now,
       updatedAt: now,
@@ -841,11 +845,55 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     setActiveNoteId(newNote.id);
-    setFilter({ type: 'all' });
+    setFilter(validFolder ? { type: 'folder', folderId: validFolder } : { type: 'all' });
     setViewMode('read');
 
     if (dbEnabledRef.current) {
       void syncApi('/api/notes', 'POST', newNote);
+    }
+  };
+
+  const handleSaveSshTranscriptToNote = (
+    serverLabel: string,
+    transcript: string,
+    options?: { folderId?: string | null; openAiAfterSave?: boolean }
+  ) => {
+    const now = Date.now();
+    const timestamp = new Date(now).toLocaleString();
+    const cleanTranscript = transcript.trimEnd();
+    const requestedFolderId =
+      options?.folderId !== undefined ? options.folderId : folders[0]?.id ?? null;
+    const validFolderId =
+      requestedFolderId && folders.some((f) => f.id === requestedFolderId)
+        ? requestedFolderId
+        : null;
+
+    const newNote: NoteDocument = {
+      id: `note-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      title: `SSH Session: ${serverLabel}`,
+      content: `## SSH Session — ${serverLabel}\n\nCaptured on ${timestamp}\n\n\`\`\`bash\n${cleanTranscript}\n\`\`\`\n`,
+      folderId: validFolderId,
+      starred: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const nextNotes = [newNote, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    setActiveNoteId(newNote.id);
+    setFilter(validFolderId ? { type: 'folder', folderId: validFolderId } : { type: 'all' });
+    setViewMode('read');
+
+    if (dbEnabledRef.current) {
+      void syncApi('/api/notes', 'POST', newNote);
+    }
+
+    if (options?.openAiAfterSave) {
+      setAiWriterRequest((prev) => ({
+        seq: (prev?.seq ?? 0) + 1,
+        preset: 'explain-project',
+      }));
     }
   };
 
@@ -1113,6 +1161,8 @@ export default function App() {
         <SshTerminalView
           storageMode={storageMode}
           currentUser={currentUser}
+          folders={folders}
+          defaultFolderId={folders[0]?.id ?? null}
           snippets={snippets}
           sidebarOpen={sidebarOpen}
           onOpenSidebar={() => setSidebarOpen(true)}
@@ -1121,6 +1171,7 @@ export default function App() {
       ) : (
         <DocumentWorkspace
           note={activeNote}
+          allNotes={[...notes, ...sharedNotes]}
           folders={folders}
           snippets={snippets}
           viewMode={viewMode}
@@ -1130,6 +1181,8 @@ export default function App() {
           canRedo={canRedo}
           pendingSelection={pendingSelection}
           selectionReaderRef={selectionReaderRef}
+          aiWriterRequest={aiWriterRequest}
+          onConsumeAiWriterRequest={() => setAiWriterRequest(null)}
           onUndo={handleUndo}
           onRedo={handleRedo}
           onOpenSidebar={() => setSidebarOpen(true)}
@@ -1137,6 +1190,7 @@ export default function App() {
           onChangeViewMode={setViewMode}
           onUpdateNote={handleUpdateNote}
           onCreateNote={() => handleCreateNote()}
+          onCreateAiNote={handleCreateAiNote}
           onDuplicateSharedNote={handleDuplicateSharedNote}
           onOpenShareModal={() => setShareModalOpen(true)}
           onOpenImportModal={() => setImportModalOpen(true)}

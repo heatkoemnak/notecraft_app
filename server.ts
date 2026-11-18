@@ -1211,7 +1211,7 @@ async function startServer() {
     }
   });
 
-  // AI: write a whole document using Groq AI
+  // AI: write a whole document or explain project context using Groq AI
   app.post('/api/ai/generate-document', async (req, res) => {
     try {
       const {
@@ -1224,6 +1224,8 @@ async function startServer() {
         includeCode,
         existingTitle,
         existingContent,
+        projectFolderName,
+        projectNotes,
       } = (req.body || {}) as {
         prompt?: unknown;
         model?: unknown;
@@ -1234,10 +1236,12 @@ async function startServer() {
         includeCode?: unknown;
         existingTitle?: unknown;
         existingContent?: unknown;
+        projectFolderName?: unknown;
+        projectNotes?: unknown;
       };
 
       if (typeof prompt !== 'string' || !prompt.trim()) {
-        return res.status(400).json({ error: 'Describe what document you need first' });
+        return res.status(400).json({ error: 'Describe what document or question you need first' });
       }
       if (prompt.length > 8000) {
         return res.status(400).json({
@@ -1246,6 +1250,7 @@ async function startServer() {
       }
 
       const validDocType: GenerateDocType =
+        docType === 'explain' ||
         docType === 'spec' ||
         docType === 'runbook' ||
         docType === 'api' ||
@@ -1260,6 +1265,23 @@ async function startServer() {
           ? length
           : 'standard';
 
+      const sanitizedProjectNotes = Array.isArray(projectNotes)
+        ? projectNotes
+            .slice(0, 20)
+            .filter(
+              (item): item is { title?: unknown; folderName?: unknown; content?: unknown } =>
+                Boolean(item && typeof item === 'object')
+            )
+            .map((item) => ({
+              title: typeof item.title === 'string' ? item.title.slice(0, 200) : 'Untitled Note',
+              folderName:
+                typeof item.folderName === 'string' ? item.folderName.slice(0, 120) : undefined,
+              content:
+                typeof item.content === 'string' ? item.content.slice(0, 12000) : '',
+            }))
+            .filter((item) => item.content.trim().length > 0)
+        : undefined;
+
       const result = await generateDocumentWithGroq({
         prompt,
         model: typeof model === 'string' ? model : undefined,
@@ -1270,7 +1292,10 @@ async function startServer() {
         includeCode: Boolean(includeCode),
         existingTitle: typeof existingTitle === 'string' ? existingTitle : undefined,
         existingContent:
-          typeof existingContent === 'string' ? existingContent.slice(0, 15000) : undefined,
+          typeof existingContent === 'string' ? existingContent.slice(0, 30000) : undefined,
+        projectFolderName:
+          typeof projectFolderName === 'string' ? projectFolderName.slice(0, 120) : undefined,
+        projectNotes: sanitizedProjectNotes,
       });
       return res.json(result);
     } catch (err) {

@@ -7,6 +7,7 @@ import { GroqProofreadError } from './groqProofread.ts';
 
 export type GenerateDocType =
   | 'general'
+  | 'explain'
   | 'spec'
   | 'runbook'
   | 'api'
@@ -14,6 +15,12 @@ export type GenerateDocType =
   | 'guide';
 
 export type GenerateDocLength = 'concise' | 'standard' | 'detailed';
+
+export interface ProjectContextNote {
+  title: string;
+  folderName?: string;
+  content: string;
+}
 
 export interface GenerateDocumentInput {
   prompt: string;
@@ -25,6 +32,8 @@ export interface GenerateDocumentInput {
   includeCode?: boolean;
   existingTitle?: string;
   existingContent?: string;
+  projectFolderName?: string;
+  projectNotes?: ProjectContextNote[];
 }
 
 export interface GenerateDocumentResult {
@@ -40,6 +49,8 @@ const REQUEST_TIMEOUT_MS = 45000;
 const DOC_TYPE_GUIDANCE: Record<GenerateDocType, string> = {
   general:
     'Write a clear, well-organized technical note with logical sections, key takeaways, and practical details.',
+  explain:
+    'Analyze the provided project notes, directory trees, config files, source snippets, and SSH/terminal outputs to directly answer the user prompt and clearly explain how the project works: cover the folder and file structure, tech stack, entry points, component/service interactions, configuration, and execution/data flow.',
   spec:
     'Write a complete Technical Specification including Overview, Goals & Non-Goals, Architecture / Design, Data Model or Interfaces, Edge Cases, and Next Steps.',
   runbook:
@@ -80,8 +91,18 @@ function buildGenerateSystemPrompt(input: GenerateDocumentInput): string {
     );
   }
 
+  const hasProjectContext =
+    Boolean(input.existingContent?.trim()) ||
+    Boolean(input.projectNotes && input.projectNotes.length > 0);
+
+  if (hasProjectContext) {
+    extras.push(
+      'PROJECT CONTEXT GROUNDING: Use the attached note content, SSH/terminal outputs, directory trees (ls/tree/find), config files (package.json, docker-compose.yml, Dockerfile, tsconfig.json, etc.), and project folder notes as your primary source of truth. Reference exact folder names, file paths, commands, ports, dependencies, and behaviors shown in the context. If the user asks how the project works or asks about specific files/commands, answer directly and accurately without inventing unverified files.'
+    );
+  }
+
   return [
-    'You are an expert technical writer and software architect drafting complete, ready-to-use Markdown documents.',
+    'You are an expert technical writer, systems engineer, and software architect drafting complete, ready-to-use Markdown documents.',
     DOC_TYPE_GUIDANCE[docType],
     LENGTH_GUIDANCE[length],
     ...extras,
@@ -220,13 +241,50 @@ export async function generateDocumentWithGroq(
   const { apiKey, model } = resolveGroqConfig(input.model);
   const systemPrompt = buildGenerateSystemPrompt(input);
 
-  const userParts: string[] = [`Write a complete document for the following request:\n${input.prompt.trim()}`];
+  const userParts: string[] = [
+    `User prompt / request:\n${input.prompt.trim()}`,
+  ];
+
+  if (input.projectFolderName?.trim()) {
+    userParts.push(`Active Project Folder: "${input.projectFolderName.trim()}"`);
+  }
+
   if (input.existingContent?.trim()) {
-    const clippedContext = input.existingContent.trim().slice(0, 12000);
+    const clippedContext = input.existingContent.trim().slice(0, 26000);
     userParts.push(
-      `Existing note context${input.existingTitle ? ` (Title: "${input.existingTitle.trim()}")` : ''}:\n---\n${clippedContext}\n---\nIncorporate, expand, or restructure relevant details from this existing note as appropriate for the user's request.`
+      `Primary / Active Note Context${
+        input.existingTitle ? ` (Title: "${input.existingTitle.trim()}")` : ''
+      }:\n---\n${clippedContext}\n---`
     );
   }
+
+  if (Array.isArray(input.projectNotes) && input.projectNotes.length > 0) {
+    const relatedBlocks: string[] = [];
+    let remainingChars = 24000;
+    for (const item of input.projectNotes) {
+      if (remainingChars <= 200) break;
+      const cleanBody = (item.content || '').trim();
+      if (!cleanBody) continue;
+      const snippet = cleanBody.slice(0, Math.min(8000, remainingChars));
+      remainingChars -= snippet.length;
+      const folderTag = item.folderName ? ` [Folder: ${item.folderName}]` : '';
+      relatedBlocks.push(`### Note: ${item.title || 'Untitled Note'}${folderTag}\n${snippet}`);
+    }
+    if (relatedBlocks.length > 0) {
+      userParts.push(
+        `Additional Project Folder / Workspace Notes (${relatedBlocks.length}):\n---\n${relatedBlocks.join(
+          '\n\n'
+        )}\n---`
+      );
+    }
+  }
+
+  if (input.existingContent?.trim() || (input.projectNotes && input.projectNotes.length > 0)) {
+    userParts.push(
+      'Analyze all attached notes, terminal/SSH outputs, file trees, configs, and source snippets above to understand the full project structure and how it works, then produce a thorough response addressing the user prompt.'
+    );
+  }
+
   const userMessage = userParts.join('\n\n');
 
   let rawResponse: string;

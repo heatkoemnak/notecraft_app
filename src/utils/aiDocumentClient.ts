@@ -1,5 +1,8 @@
+import { Folder, NoteDocument } from '../types/notes';
+
 export type GenerateDocType =
   | 'general'
+  | 'explain'
   | 'spec'
   | 'runbook'
   | 'api'
@@ -7,6 +10,14 @@ export type GenerateDocType =
   | 'guide';
 
 export type GenerateDocLength = 'concise' | 'standard' | 'detailed';
+
+export type ProjectContextScope = 'none' | 'note' | 'folder' | 'workspace';
+
+export interface ProjectContextNote {
+  title: string;
+  folderName?: string;
+  content: string;
+}
 
 export interface GroqModelOption {
   id: string;
@@ -135,6 +146,8 @@ export interface GenerateDocumentRequest {
   includeCode: boolean;
   existingTitle?: string;
   existingContent?: string;
+  projectFolderName?: string;
+  projectNotes?: ProjectContextNote[];
 }
 
 export interface GenerateDocumentResult {
@@ -142,6 +155,86 @@ export interface GenerateDocumentResult {
   content: string;
   summary: string;
   model: string;
+}
+
+export function buildProjectContextPayload({
+  scope,
+  activeNoteId,
+  activeTitle,
+  activeContent,
+  activeFolderId,
+  folders,
+  allNotes,
+}: {
+  scope: ProjectContextScope;
+  activeNoteId: string;
+  activeTitle: string;
+  activeContent: string;
+  activeFolderId: string | null;
+  folders: Folder[];
+  allNotes: NoteDocument[];
+}): {
+  existingTitle?: string;
+  existingContent?: string;
+  projectFolderName?: string;
+  projectNotes?: ProjectContextNote[];
+  includedNoteCount: number;
+  totalChars: number;
+} {
+  if (scope === 'none') {
+    return { includedNoteCount: 0, totalChars: 0 };
+  }
+
+  const folderMap = new Map(folders.map((f) => [f.id, f.name]));
+  const activeFolderName = activeFolderId ? folderMap.get(activeFolderId) : undefined;
+  const trimmedActive = activeContent.trim();
+
+  if (scope === 'note') {
+    return {
+      existingTitle: activeTitle,
+      existingContent: trimmedActive ? activeContent.slice(0, 26000) : undefined,
+      projectFolderName: activeFolderName,
+      includedNoteCount: trimmedActive ? 1 : 0,
+      totalChars: trimmedActive ? Math.min(activeContent.length, 26000) : 0,
+    };
+  }
+
+  const candidates = allNotes
+    .filter((n) => n.id !== activeNoteId && n.content.trim().length > 0)
+    .filter((n) => (scope === 'folder' ? n.folderId === activeFolderId : true))
+    .sort((a, b) => {
+      // Prioritize notes in the same folder first when using workspace scope
+      const aSameFolder = a.folderId === activeFolderId ? 1 : 0;
+      const bSameFolder = b.folderId === activeFolderId ? 1 : 0;
+      if (aSameFolder !== bSameFolder) return bSameFolder - aSameFolder;
+      return b.updatedAt - a.updatedAt;
+    });
+
+  const projectNotes: ProjectContextNote[] = [];
+  let remainingBudget = 24000;
+  let totalChars = trimmedActive ? Math.min(activeContent.length, 26000) : 0;
+
+  for (const item of candidates) {
+    if (projectNotes.length >= 16 || remainingBudget < 200) break;
+    const clipped = item.content.trim().slice(0, Math.min(8000, remainingBudget));
+    if (!clipped) continue;
+    remainingBudget -= clipped.length;
+    totalChars += clipped.length;
+    projectNotes.push({
+      title: item.title || 'Untitled Note',
+      folderName: item.folderId ? folderMap.get(item.folderId) : 'Unfiled',
+      content: clipped,
+    });
+  }
+
+  return {
+    existingTitle: activeTitle,
+    existingContent: trimmedActive ? activeContent.slice(0, 26000) : undefined,
+    projectFolderName: activeFolderName,
+    projectNotes: projectNotes.length > 0 ? projectNotes : undefined,
+    includedNoteCount: (trimmedActive ? 1 : 0) + projectNotes.length,
+    totalChars,
+  };
 }
 
 export async function requestAiGenerateDocument(

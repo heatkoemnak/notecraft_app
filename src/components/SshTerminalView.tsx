@@ -13,6 +13,8 @@ import {
   Eye,
   EyeOff,
   FilePlus2,
+  FolderOpen,
+  FolderTree,
   KeyRound,
   Loader2,
   Lock,
@@ -23,8 +25,9 @@ import {
   Terminal,
   Trash2,
   Upload,
+  Wand2,
 } from 'lucide-react';
-import { AuthUser, Snippet, SshAuthType, SshProfile } from '../types/notes';
+import { AuthUser, Folder, Snippet, SshAuthType, SshProfile } from '../types/notes';
 import { StorageBackendMode } from '../utils/authClient';
 import { formatRelativeDate } from '../utils/markdown';
 import {
@@ -39,10 +42,16 @@ import {
 interface SshTerminalViewProps {
   storageMode: StorageBackendMode;
   currentUser: AuthUser;
+  folders: Folder[];
+  defaultFolderId?: string | null;
   snippets: Snippet[];
   sidebarOpen: boolean;
   onOpenSidebar: () => void;
-  onSaveTranscriptToNote: (serverLabel: string, transcript: string) => void;
+  onSaveTranscriptToNote: (
+    serverLabel: string,
+    transcript: string,
+    options?: { folderId?: string | null; openAiAfterSave?: boolean }
+  ) => void;
 }
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
@@ -74,6 +83,8 @@ const TERMINAL_THEME = {
 export function SshTerminalView({
   storageMode,
   currentUser,
+  folders,
+  defaultFolderId = null,
   snippets,
   sidebarOpen,
   onOpenSidebar,
@@ -83,6 +94,9 @@ export function SshTerminalView({
   const [loadingProfiles, setLoadingProfiles] = useState(true);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  const [targetFolderId, setTargetFolderId] = useState<string>(
+    defaultFolderId ?? folders[0]?.id ?? ''
+  );
 
   const [commandInput, setCommandInput] = useState('');
   const [label, setLabel] = useState('');
@@ -157,7 +171,7 @@ export function SshTerminalView({
         "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 13.5,
       lineHeight: 1.35,
-      scrollback: 4000,
+      scrollback: 5000,
       theme: TERMINAL_THEME,
       convertEol: false,
     });
@@ -518,13 +532,24 @@ export function SshTerminalView({
     setQuickCommand('');
   };
 
-  const handleSaveTranscript = () => {
+  const handleScanProject = () => {
+    if (status !== 'connected') return;
+    // Read-only POSIX inspection of current directory structure & key manifest files
+    const scanCmd = [
+      'echo "=== PWD ===" && pwd',
+      'echo "=== FOLDER STRUCTURE ===" && find . -maxdepth 4 \\( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name __pycache__ -o -name .venv -o -name venv \\) -prune -o -print | sort | head -n 250',
+      'for f in package.json docker-compose.yml docker-compose.yaml Dockerfile pyproject.toml requirements.txt go.mod Cargo.toml tsconfig.json README.md; do if [ -f "$f" ]; then echo "=== FILE: $f ==="; head -n 120 "$f"; fi; done',
+    ].join('; ');
+    sendRawInput(`${scanCmd}\n`);
+  };
+
+  const handleSaveTranscript = (openAiAfterSave = false) => {
     const term = termRef.current;
     if (!term) return;
     const buffer = term.buffer.active;
     const lines: string[] = [];
     const total = buffer.length;
-    const start = Math.max(0, total - 250);
+    const start = Math.max(0, total - 1500);
     for (let i = start; i < total; i += 1) {
       const line = buffer.getLine(i);
       if (line) {
@@ -540,7 +565,10 @@ export function SshTerminalView({
     const targetLabel =
       connectedTarget ||
       (host.trim() ? `${username.trim() || 'root'}@${host.trim()}` : 'Remote Server');
-    onSaveTranscriptToNote(targetLabel, transcript);
+    onSaveTranscriptToNote(targetLabel, transcript, {
+      folderId: targetFolderId || null,
+      openAiAfterSave,
+    });
     setCapturedNotice(true);
     window.setTimeout(() => setCapturedNotice(false), 1800);
   };
@@ -606,26 +634,58 @@ export function SshTerminalView({
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-neutral-200 dark:border-white/10 text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
           >
             <Server className="w-3.5 h-3.5 text-neutral-400" />
-            <span>{panelOpen ? 'Hide servers' : 'Servers'}</span>
+            <span className="hidden sm:inline">{panelOpen ? 'Hide servers' : 'Servers'}</span>
           </button>
+
+          {folders.length > 0 && (
+            <div className="hidden xl:flex items-center gap-1.5 px-2 py-1 rounded-lg border border-neutral-200 dark:border-white/10 bg-neutral-50 dark:bg-white/[0.03]">
+              <FolderOpen className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+              <select
+                value={targetFolderId}
+                onChange={(e) => setTargetFolderId(e.target.value)}
+                aria-label="Target project folder for saved output"
+                title="Target project folder for saved output"
+                className="bg-transparent text-[12px] font-medium text-neutral-700 dark:text-neutral-200 focus:outline-none cursor-pointer max-w-[130px]"
+              >
+                <option value="" className="bg-white dark:bg-[#17171c]">
+                  Unfiled
+                </option>
+                {folders.map((folder) => (
+                  <option key={folder.id} value={folder.id} className="bg-white dark:bg-[#17171c]">
+                    {folder.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <button
             type="button"
-            onClick={handleSaveTranscript}
-            title="Save terminal output to a new NoteCraft note"
-            className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-neutral-200 dark:border-white/10 text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
+            onClick={() => handleSaveTranscript(false)}
+            title="Save terminal output to a NoteCraft note"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-neutral-200 dark:border-white/10 text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-white/[0.06] transition-colors cursor-pointer whitespace-nowrap"
           >
             {capturedNotice ? (
               <>
                 <Check className="w-3.5 h-3.5 text-emerald-500" />
-                <span>Saved to note</span>
+                <span>Saved</span>
               </>
             ) : (
               <>
                 <FilePlus2 className="w-3.5 h-3.5 text-neutral-400" />
-                <span>Save output to note</span>
+                <span className="hidden sm:inline">Save to note</span>
               </>
             )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSaveTranscript(true)}
+            title="Save terminal output to a note and open AI to explain the project structure and how it works"
+            className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-blue-500/30 bg-blue-600/10 dark:bg-blue-500/15 text-[12.5px] font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-600/15 dark:hover:bg-blue-500/25 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            <Wand2 className="w-3.5 h-3.5" />
+            <span>Save & Ask AI</span>
           </button>
 
           <button
@@ -1018,6 +1078,17 @@ export function SshTerminalView({
             </form>
 
             <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={!isConnected}
+                onClick={handleScanProject}
+                title="Run a read-only project folder tree & manifest scan in the current directory"
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-white/10 text-[11.5px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <FolderTree className="w-3 h-3 text-emerald-400" />
+                <span>Scan project</span>
+              </button>
+
               <button
                 type="button"
                 disabled={!isConnected}
