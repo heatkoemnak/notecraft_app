@@ -103,6 +103,15 @@ function formatPgErrorMessage(err: unknown): string {
   if (e.code === '3D000') {
     return 'Target PostgreSQL database does not exist.';
   }
+  if (
+    e.code === 'ETIMEDOUT' ||
+    e.code === '57014' ||
+    /query read timeout|statement timeout|timeout expired|canceling statement due to statement timeout/i.test(
+      e.message
+    )
+  ) {
+    return 'PostgreSQL query timed out (60s limit). For large tables, add a WHERE filter or smaller LIMIT, or verify network/SSL settings if connecting to a remote server.';
+  }
   return e.message;
 }
 
@@ -121,7 +130,23 @@ function formatMysqlErrorMessage(err: unknown): string {
   if (e.code === 'ER_BAD_DB_ERROR') {
     return 'Target MySQL database does not exist.';
   }
+  if (
+    e.code === 'ETIMEDOUT' ||
+    e.code === 'PROTOCOL_SEQUENCE_TIMEOUT' ||
+    /timeout/i.test(e.message)
+  ) {
+    return 'MySQL query timed out (60s limit). For large tables, add a WHERE filter or smaller LIMIT, or verify network/SSL settings.';
+  }
   return e.message;
+}
+
+const DB_QUERY_TIMEOUT_MS = 60000;
+
+async function closePgClientQuietly(client: PgClient): Promise<void> {
+  await Promise.race([
+    client.end().catch(() => {}),
+    new Promise<void>((resolve) => setTimeout(resolve, 1000)),
+  ]);
 }
 
 async function createPgClient(cfg: DatabaseConnectionInput): Promise<PgClient> {
@@ -132,14 +157,15 @@ async function createPgClient(cfg: DatabaseConnectionInput): Promise<PgClient> {
     user: cfg.username,
     password: cfg.password ?? '',
     ssl: cfg.ssl ? { rejectUnauthorized: false } : false,
-    connectionTimeoutMillis: 10000,
-    query_timeout: 15000,
+    connectionTimeoutMillis: 15000,
+    query_timeout: DB_QUERY_TIMEOUT_MS,
+    keepAlive: true,
   });
   try {
     await client.connect();
     return client;
   } catch (err) {
-    await client.end().catch(() => {});
+    await closePgClientQuietly(client);
     throw new DatabaseGatewayError(formatPgErrorMessage(err), 400);
   }
 }
@@ -153,7 +179,7 @@ async function createMysqlConnection(cfg: DatabaseConnectionInput) {
       user: cfg.username,
       password: cfg.password ?? '',
       ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
-      connectTimeout: 10000,
+      connectTimeout: 15000,
       multipleStatements: false,
     });
     return conn;
@@ -178,96 +204,110 @@ export async function testAndIntrospectDatabase(
       const versionMatch = /PostgreSQL\s+([^\s,]+)/i.exec(rawVersion);
       const version = versionMatch ? `PostgreSQL ${versionMatch[1]}` : rawVersion.slice(0, 60);
 
+      // Query pg_catalog directly rather than information_schema views, which are
+      // notoriously slow on PostgreSQL databases with many schemas/tables/extensions.
       const tablesRes = await client.query<{
+        table_oid: string | number;
         table_schema: string;
         table_name: string;
         estimated_rows: string | number | null;
       }>(
-        `SELECT t.table_schema,
-                t.table_name,
+        `SELECT c.oid::bigint AS table_oid,
+                n.nspname AS table_schema,
+                c.relname AS table_name,
                 GREATEST(COALESCE(c.reltuples, 0), 0)::bigint AS estimated_rows
-         FROM information_schema.tables t
-         LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
-         LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid
-         WHERE t.table_type = 'BASE TABLE'
-           AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
-         ORDER BY t.table_schema, t.table_name
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p')
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+           AND n.nspname NOT LIKE 'pg_temp_%'
+           AND n.nspname NOT LIKE 'pg_toast_temp_%'
+         ORDER BY CASE WHEN n.nspname = 'public' THEN 0 ELSE 1 END,
+                  n.nspname,
+                  c.relname
          LIMIT 200`
       );
 
-      const colsRes = await client.query<{
-        table_schema: string;
-        table_name: string;
-        column_name: string;
-        data_type: string;
-        is_nullable: string;
-      }>(
-        `SELECT table_schema, table_name, column_name, data_type, is_nullable
-         FROM information_schema.columns
-         WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-         ORDER BY table_schema, table_name, ordinal_position`
-      );
+      const tableOids = tablesRes.rows
+        .map((t) => Number(t.table_oid))
+        .filter((oid) => Number.isFinite(oid) && oid > 0);
 
-      const pkRes = await client.query<{
-        table_schema: string;
-        table_name: string;
-        column_name: string;
-      }>(
-        `SELECT tc.table_schema, tc.table_name, kcu.column_name
-         FROM information_schema.table_constraints tc
-         JOIN information_schema.key_column_usage kcu
-           ON tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-         WHERE tc.constraint_type = 'PRIMARY KEY'
-           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')`
-      );
+      const colsByOid = new Map<string, DatabaseTableColumn[]>();
 
-      const fkRes = await client.query<{
-        table_schema: string;
-        table_name: string;
-        column_name: string;
-        foreign_table_name: string;
-        foreign_column_name: string;
-      }>(
-        `SELECT tc.table_schema,
-                tc.table_name,
-                kcu.column_name,
-                ccu.table_name AS foreign_table_name,
-                ccu.column_name AS foreign_column_name
-         FROM information_schema.table_constraints tc
-         JOIN information_schema.key_column_usage kcu
-           ON tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-         JOIN information_schema.constraint_column_usage ccu
-           ON ccu.constraint_name = tc.constraint_name
-          AND ccu.table_schema = tc.table_schema
-         WHERE tc.constraint_type = 'FOREIGN KEY'
-           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')`
-      );
+      if (tableOids.length > 0) {
+        const colsRes = await client.query<{
+          table_oid: string | number;
+          column_name: string;
+          data_type: string;
+          is_nullable: boolean;
+        }>(
+          `SELECT a.attrelid::bigint AS table_oid,
+                  a.attname AS column_name,
+                  pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                  (NOT a.attnotnull) AS is_nullable
+           FROM pg_catalog.pg_attribute a
+           WHERE a.attrelid = ANY($1::oid[])
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+           ORDER BY a.attrelid, a.attnum`,
+          [tableOids]
+        );
 
-      const pkSet = new Set(
-        pkRes.rows.map((r) => `${r.table_schema}.${r.table_name}.${r.column_name}`)
-      );
-      const fkMap = new Map(
-        fkRes.rows.map((r) => [
-          `${r.table_schema}.${r.table_name}.${r.column_name}`,
-          `${r.foreign_table_name}.${r.foreign_column_name}`,
-        ])
-      );
+        const constraintsRes = await client.query<{
+          table_oid: string | number;
+          constraint_type: string;
+          column_name: string;
+          foreign_table_name: string | null;
+          foreign_column_name: string | null;
+        }>(
+          `SELECT con.conrelid::bigint AS table_oid,
+                  con.contype::text AS constraint_type,
+                  a.attname AS column_name,
+                  fc.relname AS foreign_table_name,
+                  fa.attname AS foreign_column_name
+           FROM pg_catalog.pg_constraint con
+           CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+           JOIN pg_catalog.pg_attribute a
+             ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+           LEFT JOIN pg_catalog.pg_class fc
+             ON fc.oid = con.confrelid AND con.contype = 'f'
+           LEFT JOIN pg_catalog.pg_attribute fa
+             ON fa.attrelid = con.confrelid
+            AND con.contype = 'f'
+            AND fa.attnum = con.confkey[k.ord::int]
+           WHERE con.conrelid = ANY($1::oid[])
+             AND con.contype IN ('p', 'f')`,
+          [tableOids]
+        );
 
-      const colsByTable = new Map<string, DatabaseTableColumn[]>();
-      for (const col of colsRes.rows) {
-        const key = `${col.table_schema}.${col.table_name}`;
-        const list = colsByTable.get(key) || [];
-        const colKey = `${key}.${col.column_name}`;
-        list.push({
-          name: col.column_name,
-          type: col.data_type,
-          nullable: col.is_nullable === 'YES',
-          isPrimaryKey: pkSet.has(colKey),
-          foreignKey: fkMap.get(colKey) ?? null,
-        });
-        colsByTable.set(key, list);
+        const pkSet = new Set<string>();
+        const fkMap = new Map<string, string>();
+        for (const row of constraintsRes.rows) {
+          const colKey = `${String(row.table_oid)}.${row.column_name}`;
+          if (row.constraint_type === 'p') {
+            pkSet.add(colKey);
+          } else if (
+            row.constraint_type === 'f' &&
+            row.foreign_table_name &&
+            row.foreign_column_name
+          ) {
+            fkMap.set(colKey, `${row.foreign_table_name}.${row.foreign_column_name}`);
+          }
+        }
+
+        for (const col of colsRes.rows) {
+          const oidKey = String(col.table_oid);
+          const list = colsByOid.get(oidKey) || [];
+          const colKey = `${oidKey}.${col.column_name}`;
+          list.push({
+            name: col.column_name,
+            type: col.data_type,
+            nullable: Boolean(col.is_nullable),
+            isPrimaryKey: pkSet.has(colKey),
+            foreignKey: fkMap.get(colKey) ?? null,
+          });
+          colsByOid.set(oidKey, list);
+        }
       }
 
       const tables: DatabaseTableInfo[] = tablesRes.rows.map((t) => ({
@@ -277,7 +317,7 @@ export async function testAndIntrospectDatabase(
           t.estimated_rows !== null && t.estimated_rows !== undefined
             ? Number(t.estimated_rows)
             : null,
-        columns: colsByTable.get(`${t.table_schema}.${t.table_name}`) || [],
+        columns: colsByOid.get(String(t.table_oid)) || [],
       }));
 
       return {
@@ -290,7 +330,7 @@ export async function testAndIntrospectDatabase(
       if (err instanceof DatabaseGatewayError) throw err;
       throw new DatabaseGatewayError(formatPgErrorMessage(err), 400);
     } finally {
-      await client.end().catch(() => {});
+      await closePgClientQuietly(client);
     }
   }
 
@@ -456,13 +496,13 @@ export async function executeDatabaseQuery(
       if (err instanceof DatabaseGatewayError) throw err;
       throw new DatabaseGatewayError(formatPgErrorMessage(err), 400);
     } finally {
-      await client.end().catch(() => {});
+      await closePgClientQuietly(client);
     }
   }
 
   const conn = await createMysqlConnection(cfg);
   try {
-    const [rawRows, fields] = await conn.query({ sql: cleanSql, timeout: 15000 });
+    const [rawRows, fields] = await conn.query({ sql: cleanSql, timeout: DB_QUERY_TIMEOUT_MS });
     const durationMs = Date.now() - startedAt;
 
     if (Array.isArray(rawRows)) {

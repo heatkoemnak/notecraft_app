@@ -34,12 +34,17 @@ export function parseDatabaseUrl(raw: string): ParsedDatabaseUrl | null {
     const engine: DatabaseEngine = url.protocol.startsWith('mysql') ? 'mysql' : 'postgres';
     const defaultPort = engine === 'mysql' ? 3306 : 5432;
     const port = url.port ? Number(url.port) : defaultPort;
-    const sslMode = url.searchParams.get('sslmode')?.toLowerCase();
+    const sslMode = (
+      url.searchParams.get('sslmode') || url.searchParams.get('ssl-mode')
+    )?.toLowerCase();
     const sslParam = url.searchParams.get('ssl')?.toLowerCase();
     const ssl =
       sslParam === 'true' ||
       sslParam === '1' ||
       sslMode === 'require' ||
+      sslMode === 'required' ||
+      sslMode === 'no-verify' ||
+      sslMode === 'prefer' ||
       sslMode === 'verify-ca' ||
       sslMode === 'verify-full';
 
@@ -47,7 +52,7 @@ export function parseDatabaseUrl(raw: string): ParsedDatabaseUrl | null {
       engine,
       host: url.hostname || undefined,
       port: Number.isFinite(port) && port >= 1 && port <= 65535 ? port : defaultPort,
-      database: url.pathname.replace(/^\/+/, '') || undefined,
+      database: url.pathname.replace(/^\/+|\/+$/g, '') || undefined,
       username: url.username ? decodeURIComponent(url.username) : undefined,
       password: url.password ? decodeURIComponent(url.password) : undefined,
       ssl,
