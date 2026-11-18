@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Code2,
   Copy,
+  Eye,
   FileCode2,
   FilePlus2,
   Loader2,
@@ -22,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   buildLoadedProjectTreeSummary,
+  CodeAgentEditHunk,
   CodeAgentMessage,
   CodeAgentModelOption,
   CodeAgentTargetAction,
@@ -41,12 +43,21 @@ interface ChatTurn {
   content: string;
   taskMode?: CodeAgentTaskMode;
   summary?: string;
+  edits?: CodeAgentEditHunk[];
   proposedCode?: string | null;
   targetAction?: CodeAgentTargetAction;
   suggestedFileName?: string | null;
   model?: string;
   provider?: 'gemini' | 'groq';
   fileNameHint?: string;
+}
+
+export interface StagedDiffPayload {
+  edits?: CodeAgentEditHunk[];
+  proposedCode?: string | null;
+  targetAction: CodeAgentTargetAction;
+  summary?: string;
+  turnId: string;
 }
 
 export interface CodeAgentPanelProps {
@@ -62,6 +73,12 @@ export interface CodeAgentPanelProps {
   dirCache: Record<string, RemoteDirEntry[]>;
   expandedDirs: Record<string, boolean>;
   canUndo: boolean;
+  pendingHunkCount: number;
+  activeReviewTurnId: string | null;
+  onStageInlineDiff: (payload: StagedDiffPayload) => void;
+  onAcceptAllPendingDiffs: () => void;
+  onRejectAllPendingDiffs: () => void;
+  onFocusDiffReview: () => void;
   onApplyCode: (
     nextCode: string,
     mode: 'replace-file' | 'replace-selection' | 'insert-at-cursor'
@@ -86,18 +103,19 @@ const FILE_QUICK_ACTIONS: Array<{
     id: 'fix',
     label: 'Find Bugs',
     prompt:
-      'Find any bugs, edge cases, error-handling gaps, or race conditions and provide fixed code.',
+      'Find any bugs, edge cases, error-handling gaps, or race conditions and provide targeted edits for only the lines that need fixing.',
   },
   {
     id: 'refactor',
     label: 'Refactor',
     prompt:
-      'Refactor this code to be cleaner, safer, and more maintainable while keeping identical behavior.',
+      'Refactor this code to be cleaner and more maintainable using targeted edits without rewriting unchanged parts.',
   },
   {
     id: 'types',
     label: 'Add Types',
-    prompt: 'Add strict type annotations and concise doc comments/JSDoc where helpful.',
+    prompt:
+      'Add strict type annotations and concise doc comments using targeted edits where helpful.',
   },
   {
     id: 'tests',
@@ -133,6 +151,118 @@ function joinRemotePath(baseDir: string, childName: string): string {
   return cleanBase === '/' ? `/${cleanChild}` : `${cleanBase}/${cleanChild}`;
 }
 
+function EditHunksSummaryCard({
+  turnId,
+  edits,
+  summary,
+  isEditable,
+  isReviewingThisTurn,
+  pendingHunkCount,
+  onReviewInEditor,
+  onAcceptAll,
+  onRejectAll,
+}: {
+  turnId: string;
+  edits: CodeAgentEditHunk[];
+  summary?: string;
+  isEditable: boolean;
+  isReviewingThisTurn: boolean;
+  pendingHunkCount: number;
+  onReviewInEditor: () => void;
+  onAcceptAll: () => void;
+  onRejectAll: () => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const isActivePending = isReviewingThisTurn && pendingHunkCount > 0;
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-white/12 bg-[#0b0b0f] overflow-hidden">
+      <div className="px-2.5 py-1.5 bg-[#16161e] border-b border-white/[0.08] flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={() => setExpanded((p) => !p)}
+          className="min-w-0 flex items-center gap-1.5 text-left text-[11.5px] font-medium text-neutral-200 hover:text-white cursor-pointer"
+        >
+          {expanded ? (
+            <ChevronDown className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+          )}
+          <FileCode2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+          <span className="truncate">{summary || 'Targeted code changes'}</span>
+          <span className="text-[10.5px] text-neutral-500 tabular-nums shrink-0">
+            · {edits.length} {edits.length === 1 ? 'block' : 'blocks'}
+          </span>
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="max-h-56 overflow-auto divide-y divide-white/[0.06] font-mono-code text-[11px] leading-[17px]">
+          {edits.map((edit, idx) => (
+            <div key={`${turnId}-e-${idx}`} className="py-1.5">
+              {edit.description && (
+                <div className="px-2.5 pb-1 text-[10.5px] font-sans text-neutral-400">
+                  {edit.description}
+                </div>
+              )}
+              {edit.oldCode && (
+                <pre className="m-0 px-2.5 py-0.5 bg-red-500/12 border-l-2 border-red-400/80 text-red-200/90 whitespace-pre-wrap break-words">
+                  {edit.oldCode}
+                </pre>
+              )}
+              <pre className="m-0 px-2.5 py-0.5 bg-emerald-500/14 border-l-2 border-emerald-400 text-emerald-200 whitespace-pre-wrap break-words">
+                {edit.newCode}
+              </pre>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {isEditable && (
+        <div className="px-2.5 py-1.5 border-t border-white/[0.08] bg-[#13131a] flex flex-wrap items-center gap-1.5">
+          {isActivePending ? (
+            <>
+              <button
+                type="button"
+                onClick={onAcceptAll}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-medium cursor-pointer"
+              >
+                <Check className="w-3 h-3" />
+                <span>Accept All ({pendingHunkCount})</span>
+              </button>
+              <button
+                type="button"
+                onClick={onRejectAll}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-white/12 bg-white/5 hover:bg-white/10 text-neutral-200 text-[11px] font-medium cursor-pointer"
+              >
+                <X className="w-3 h-3" />
+                <span>Reject</span>
+              </button>
+              <button
+                type="button"
+                onClick={onReviewInEditor}
+                className="ml-auto inline-flex items-center gap-1 text-[11px] text-blue-300 hover:text-white cursor-pointer"
+              >
+                <Eye className="w-3 h-3" />
+                <span>Highlighted in Editor</span>
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={onReviewInEditor}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-blue-500/40 bg-blue-500/15 hover:bg-blue-500/25 text-blue-200 text-[11px] font-medium cursor-pointer"
+            >
+              <Eye className="w-3 h-3" />
+              <span>Show Inline Diff Again</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProposedCodeCard({
   turnId,
   code,
@@ -146,6 +276,7 @@ function ProposedCodeCard({
   currentRemotePath,
   isApplied,
   canUndo,
+  onReviewDiff,
   onApplyCode,
   onCreateFileWithCode,
   onUndoLastEdit,
@@ -163,6 +294,7 @@ function ProposedCodeCard({
   currentRemotePath: string;
   isApplied: boolean;
   canUndo: boolean;
+  onReviewDiff: () => void;
   onApplyCode: (
     nextCode: string,
     mode: 'replace-file' | 'replace-selection' | 'insert-at-cursor',
@@ -235,29 +367,18 @@ function ProposedCodeCard({
       )}
 
       <div className="px-2.5 py-1.5 border-t border-white/[0.08] bg-[#13131a] flex flex-wrap items-center gap-1.5">
-        {hasOpenFile && isEditable && (
+        {hasOpenFile && isEditable && targetAction !== 'create-file' && (
           <>
-            {hasSelection && targetAction === 'replace-selection' ? (
-              <button
-                type="button"
-                onClick={() => onApplyCode(code, 'replace-selection', turnId)}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
-              >
-                <Sparkles className="w-3 h-3" />
-                <span>Replace Selection</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => onApplyCode(code, 'replace-file', turnId)}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
-              >
-                <Sparkles className="w-3 h-3" />
-                <span>Apply to File</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={onReviewDiff}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
+            >
+              <Eye className="w-3 h-3" />
+              <span>Review in Editor</span>
+            </button>
 
-            {hasSelection && targetAction !== 'replace-selection' && (
+            {hasSelection && (
               <button
                 type="button"
                 onClick={() => onApplyCode(code, 'replace-selection', turnId)}
@@ -299,7 +420,7 @@ function ProposedCodeCard({
         {isApplied && (
           <div className="ml-auto flex items-center gap-1.5">
             <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
-              <Check className="w-3 h-3" />
+              <Sparkles className="w-3 h-3" />
               <span>Applied</span>
             </span>
             {canUndo && (
@@ -333,6 +454,12 @@ export function CodeAgentPanel({
   dirCache,
   expandedDirs,
   canUndo,
+  pendingHunkCount,
+  activeReviewTurnId,
+  onStageInlineDiff,
+  onAcceptAllPendingDiffs,
+  onRejectAllPendingDiffs,
+  onFocusDiffReview,
   onApplyCode,
   onCreateFileWithCode,
   onUndoLastEdit,
@@ -429,12 +556,14 @@ export function CodeAgentPanel({
           history: historyPayload,
         });
 
+        const turnId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const assistantTurn: ChatTurn = {
-          id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id: turnId,
           role: 'assistant',
           content: res.reply,
           taskMode,
           summary: res.summary,
+          edits: res.edits,
           proposedCode: res.proposedCode,
           targetAction: res.targetAction,
           suggestedFileName: res.suggestedFileName,
@@ -443,6 +572,25 @@ export function CodeAgentPanel({
           fileNameHint: file?.name,
         };
         setMessages((prev) => [...prev, assistantTurn]);
+
+        // Automatically stage targeted diff hunks or file edits into inline diff review
+        const hasEdits = Boolean(res.edits && res.edits.length > 0);
+        const isExistingFileEdit =
+          file &&
+          isEditable &&
+          res.targetAction !== 'create-file' &&
+          res.targetAction !== 'none' &&
+          (hasEdits || Boolean(res.proposedCode));
+
+        if (isExistingFileEdit) {
+          onStageInlineDiff({
+            edits: res.edits,
+            proposedCode: res.proposedCode,
+            targetAction: res.targetAction,
+            summary: res.summary,
+            turnId,
+          });
+        }
       } catch (err) {
         setErrorMsg(err instanceof Error ? err.message : 'AI Code Agent failed to respond.');
       } finally {
@@ -457,12 +605,14 @@ export function CodeAgentPanel({
       selectedText,
       selectedModel,
       file,
+      isEditable,
       languageLabel,
       draft,
       selectionRangeLabel,
       cursorLine,
       currentRemotePath,
       projectTreeSummary,
+      onStageInlineDiff,
     ]
   );
 
@@ -565,12 +715,9 @@ export function CodeAgentPanel({
               <span className="font-mono-code text-neutral-200">
                 {file ? file.name : currentRemotePath || 'this workspace'}
               </span>
-              , find bugs, refactor functions, write unit tests, or generate new files and apply edits
-              directly to the editor.
+              . When updating code, the agent highlights only the changed lines directly under the
+              old code so you can click to accept each line or block.
             </p>
-            <div className="text-[11px] text-neutral-500">
-              All applied AI edits record an undo snapshot so you can press Ctrl+Z anytime.
-            </div>
           </div>
         ) : (
           messages.map((msg) =>
@@ -607,10 +754,14 @@ export function CodeAgentPanel({
                         <ol className="my-1.5 pl-4 list-decimal space-y-1">{children}</ol>
                       ),
                       h1: ({ children }) => (
-                        <h3 className="text-[13.5px] font-semibold text-white mt-2 mb-1">{children}</h3>
+                        <h3 className="text-[13.5px] font-semibold text-white mt-2 mb-1">
+                          {children}
+                        </h3>
                       ),
                       h2: ({ children }) => (
-                        <h3 className="text-[13px] font-semibold text-white mt-2 mb-1">{children}</h3>
+                        <h3 className="text-[13px] font-semibold text-white mt-2 mb-1">
+                          {children}
+                        </h3>
                       ),
                       h3: ({ children }) => (
                         <h4 className="text-[12.5px] font-semibold text-white mt-1.5 mb-0.5">
@@ -643,7 +794,33 @@ export function CodeAgentPanel({
                   </ReactMarkdown>
                 </div>
 
-                {msg.proposedCode && (
+                {msg.edits && msg.edits.length > 0 && (
+                  <EditHunksSummaryCard
+                    turnId={msg.id}
+                    edits={msg.edits}
+                    summary={msg.summary}
+                    isEditable={isEditable}
+                    isReviewingThisTurn={activeReviewTurnId === msg.id}
+                    pendingHunkCount={pendingHunkCount}
+                    onReviewInEditor={() => {
+                      if (activeReviewTurnId === msg.id && pendingHunkCount > 0) {
+                        onFocusDiffReview();
+                      } else {
+                        onStageInlineDiff({
+                          edits: msg.edits,
+                          proposedCode: msg.proposedCode,
+                          targetAction: msg.targetAction || 'edit-hunks',
+                          summary: msg.summary,
+                          turnId: msg.id,
+                        });
+                      }
+                    }}
+                    onAcceptAll={onAcceptAllPendingDiffs}
+                    onRejectAll={onRejectAllPendingDiffs}
+                  />
+                )}
+
+                {msg.proposedCode && (!msg.edits || msg.edits.length === 0) && (
                   <ProposedCodeCard
                     turnId={msg.id}
                     code={msg.proposedCode}
@@ -657,6 +834,15 @@ export function CodeAgentPanel({
                     currentRemotePath={currentRemotePath}
                     isApplied={lastAppliedTurnId === msg.id}
                     canUndo={canUndo}
+                    onReviewDiff={() =>
+                      onStageInlineDiff({
+                        edits: msg.edits,
+                        proposedCode: msg.proposedCode,
+                        targetAction: msg.targetAction || 'replace-file',
+                        summary: msg.summary,
+                        turnId: msg.id,
+                      })
+                    }
                     onApplyCode={(nextCode, mode, tid) => {
                       setLastAppliedTurnId(tid);
                       onApplyCode(nextCode, mode);
@@ -674,7 +860,7 @@ export function CodeAgentPanel({
         {loading && (
           <div className="rounded-xl border border-white/[0.08] bg-[#16161d] px-3 py-2.5 flex items-center gap-2 text-[12px] text-neutral-300">
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
-            <span>Analyzing code and preparing response...</span>
+            <span>Analyzing code and preparing updates...</span>
           </div>
         )}
 

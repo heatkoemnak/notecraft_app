@@ -11,10 +11,17 @@ export type CodeAgentTaskMode =
 
 export type CodeAgentTargetAction =
   | 'none'
+  | 'edit-hunks'
   | 'replace-file'
   | 'replace-selection'
   | 'insert-at-cursor'
   | 'create-file';
+
+export interface CodeAgentEditHunk {
+  oldCode: string;
+  newCode: string;
+  description?: string;
+}
 
 export interface CodeAgentMessage {
   role: 'user' | 'assistant';
@@ -54,6 +61,7 @@ export interface CodeAgentRequest {
 
 export interface CodeAgentResponse {
   reply: string;
+  edits?: CodeAgentEditHunk[];
   proposedCode: string | null;
   summary: string;
   targetAction: CodeAgentTargetAction;

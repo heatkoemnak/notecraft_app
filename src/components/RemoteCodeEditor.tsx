@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
-  ArrowDown,
   ArrowLeft,
   ArrowUp,
   Bot,
@@ -9,9 +8,6 @@ import {
   ChevronDown,
   ChevronsDownUp,
   ChevronUp,
-  ClipboardPaste,
-  Copy,
-  CopyPlus,
   FilePlus2,
   FileText,
   FolderOpen,
@@ -21,20 +17,20 @@ import {
   Minimize2,
   PanelLeftOpen,
   Plus,
-  Redo2,
   RefreshCw,
   Replace,
-  RotateCcw,
   Save,
-  SaveAll,
-  Scissors,
   Search,
-  Sparkles,
-  Trash2,
-  Undo2,
-  WrapText,
   X,
 } from 'lucide-react';
+import {
+  acceptSingleLineInHunk,
+  applyAllDiffHunks,
+  applySingleDiffHunk,
+  buildHunksFromSearchReplace,
+  computeLineDiffHunks,
+  PendingDiffHunk,
+} from '../utils/codeDiff';
 import {
   deleteSelectedLines,
   duplicateSelectedLines,
@@ -48,7 +44,7 @@ import {
   toggleCommentLines,
 } from '../utils/codeEditing';
 import { highlightCodeToHtml } from '../utils/codeHighlight';
-import { CodeAgentPanel } from './CodeAgentPanel';
+import { CodeAgentPanel, StagedDiffPayload } from './CodeAgentPanel';
 import {
   getFileIconColorClass,
   ProjectTreeView,
@@ -171,8 +167,7 @@ export function RemoteCodeEditor({
   onSaveToNote,
 }: RemoteCodeEditorProps) {
   const [draft, setDraft] = useState(file?.content ?? '');
-  const [wordWrap, setWordWrap] = useState(false);
-  const [copiedNotice, setCopiedNotice] = useState(false);
+  const wordWrap = false;
   const [savedBannerVisible, setSavedBannerVisible] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [explorerOpen, setExplorerOpen] = useState(true);
@@ -235,9 +230,13 @@ export function RemoteCodeEditor({
     | null
   >(null);
 
+  const [pendingHunks, setPendingHunks] = useState<PendingDiffHunk[]>([]);
+  const [activeReviewTurnId, setActiveReviewTurnId] = useState<string | null>(null);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
+  const diffScrollRef = useRef<HTMLDivElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const gotoInputRef = useRef<HTMLInputElement>(null);
   const saveAsInputRef = useRef<HTMLInputElement>(null);
@@ -253,11 +252,13 @@ export function RemoteCodeEditor({
     setExplorerPathInput(currentRemotePath || '');
   }, [currentRemotePath]);
 
-  // Reset draft & history when switching files or reloading from server
+  // Reset draft, pending diffs & history when switching files or reloading from server
   useEffect(() => {
     const initial = file?.content ?? '';
     setDraft(initial);
     setPendingAction(null);
+    setPendingHunks([]);
+    setActiveReviewTurnId(null);
     setSaveAsOpen(false);
     setSaveAsPath(file?.path ?? '');
     setCursorPos({ line: 1, col: 1 });
@@ -469,6 +470,190 @@ export function RemoteCodeEditor({
     [pushHistory, updateCursorStatsFromOffsets]
   );
 
+  const focusFirstDiffHunk = useCallback((firstHunkId?: string) => {
+    window.requestAnimationFrame(() => {
+      const container = diffScrollRef.current;
+      if (!container) return;
+      if (firstHunkId) {
+        const el = container.querySelector(
+          `[data-diff-hunk-id="${firstHunkId}"]`
+        ) as HTMLElement | null;
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return;
+        }
+      }
+      const firstEl = container.querySelector('[data-diff-hunk-id]') as HTMLElement | null;
+      firstEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, []);
+
+  const handleStageInlineDiff = useCallback(
+    (payload: StagedDiffPayload) => {
+      if (!file || !isEditable) return;
+
+      let hunks: PendingDiffHunk[] = [];
+      let unmatched = 0;
+
+      if (payload.edits && payload.edits.length > 0) {
+        const res = buildHunksFromSearchReplace(
+          draft,
+          payload.edits,
+          cursorPos.line,
+          payload.turnId
+        );
+        hunks = res.hunks;
+        unmatched = res.unmatchedEdits.length;
+      }
+
+      if (hunks.length === 0 && payload.proposedCode) {
+        const cleanProposed = payload.proposedCode.replace(/\r\n/g, '\n');
+        if (payload.targetAction === 'replace-selection' && selectionRange.end > selectionRange.start) {
+          const selStartLine = draft.slice(0, selectionRange.start).split('\n').length;
+          const selEndLine = draft.slice(0, selectionRange.end).split('\n').length;
+          const draftLines = draft.replace(/\r\n/g, '\n').split('\n');
+          const oldBlock = draftLines.slice(selStartLine - 1, selEndLine).join('\n');
+          hunks = computeLineDiffHunks(
+            oldBlock,
+            cleanProposed,
+            selStartLine,
+            payload.summary,
+            payload.turnId
+          );
+        } else if (payload.targetAction === 'insert-at-cursor') {
+          hunks = [
+            {
+              id: `hunk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              startLine: cursorPos.line,
+              endLine: cursorPos.line - 1,
+              oldLines: [],
+              newLines: cleanProposed.split('\n'),
+              description: payload.summary,
+              sourceTurnId: payload.turnId,
+            },
+          ];
+        } else {
+          hunks = computeLineDiffHunks(
+            draft,
+            cleanProposed,
+            1,
+            payload.summary,
+            payload.turnId
+          );
+        }
+      }
+
+      if (hunks.length === 0) {
+        showNotice(
+          unmatched > 0
+            ? 'Could not match AI edit snippet against current file lines.'
+            : 'No code changes to review against the current file.'
+        );
+        return;
+      }
+
+      setPendingHunks(hunks);
+      setActiveReviewTurnId(payload.turnId);
+      focusFirstDiffHunk(hunks[0]?.id);
+    },
+    [file, isEditable, draft, cursorPos.line, selectionRange, showNotice, focusFirstDiffHunk]
+  );
+
+  const handleAcceptHunk = useCallback(
+    (hunkId: string) => {
+      const target = pendingHunks.find((h) => h.id === hunkId);
+      if (!target) return;
+
+      const res = applySingleDiffHunk(draft, target);
+      applyEdit(
+        {
+          value: res.nextDraft,
+          selectionStart: res.nextCursorOffset,
+          selectionEnd: res.nextCursorOffset,
+        },
+        { focus: false }
+      );
+
+      setPendingHunks((prev) =>
+        prev
+          .filter((h) => h.id !== hunkId)
+          .map((h) =>
+            h.startLine > target.startLine
+              ? {
+                  ...h,
+                  startLine: h.startLine + res.lineDelta,
+                  endLine: h.endLine + res.lineDelta,
+                }
+              : h
+          )
+      );
+      showNotice('Accepted change (Ctrl+Z to undo)');
+    },
+    [pendingHunks, draft, applyEdit, showNotice]
+  );
+
+  const handleAcceptSingleLine = useCallback(
+    (hunkId: string, newLineIdx: number) => {
+      const target = pendingHunks.find((h) => h.id === hunkId);
+      if (!target) return;
+
+      const res = acceptSingleLineInHunk(draft, target, newLineIdx);
+      applyEdit(
+        {
+          value: res.nextDraft,
+          selectionStart: res.nextCursorOffset,
+          selectionEnd: res.nextCursorOffset,
+        },
+        { focus: false }
+      );
+
+      setPendingHunks((prev) => {
+        const next: PendingDiffHunk[] = [];
+        for (const h of prev) {
+          if (h.id === hunkId) {
+            next.push(...res.remainingHunks);
+          } else if (h.startLine > target.startLine) {
+            next.push({
+              ...h,
+              startLine: h.startLine + res.lineDelta,
+              endLine: h.endLine + res.lineDelta,
+            });
+          } else {
+            next.push(h);
+          }
+        }
+        return next;
+      });
+      showNotice('Accepted line (Ctrl+Z to undo)');
+    },
+    [pendingHunks, draft, applyEdit, showNotice]
+  );
+
+  const handleRejectHunk = useCallback((hunkId: string) => {
+    setPendingHunks((prev) => prev.filter((h) => h.id !== hunkId));
+  }, []);
+
+  const handleAcceptAllPendingDiffs = useCallback(() => {
+    if (pendingHunks.length === 0) return;
+    const res = applyAllDiffHunks(draft, pendingHunks);
+    applyEdit(
+      {
+        value: res.nextDraft,
+        selectionStart: res.nextCursorOffset,
+        selectionEnd: res.nextCursorOffset,
+      },
+      { focus: false }
+    );
+    setPendingHunks([]);
+    setActiveReviewTurnId(null);
+    showNotice('Accepted all AI changes (Ctrl+Z to undo)');
+  }, [pendingHunks, draft, applyEdit, showNotice]);
+
+  const handleRejectAllPendingDiffs = useCallback(() => {
+    setPendingHunks([]);
+    setActiveReviewTurnId(null);
+  }, []);
+
   const handleApplyAgentCode = useCallback(
     (nextCode: string, mode: 'replace-file' | 'replace-selection' | 'insert-at-cursor') => {
       if (!file || !isEditable) return;
@@ -479,6 +664,7 @@ export function RemoteCodeEditor({
           { value: normalized, selectionStart: 0, selectionEnd: 0 },
           { focus: false }
         );
+        setPendingHunks([]);
         showNotice('AI edit applied to file (Ctrl+Z to undo)');
         return;
       }
@@ -497,6 +683,7 @@ export function RemoteCodeEditor({
           },
           { focus: false }
         );
+        setPendingHunks([]);
         showNotice('AI snippet replaced selection (Ctrl+Z to undo)');
         return;
       }
@@ -511,6 +698,7 @@ export function RemoteCodeEditor({
         },
         { focus: false }
       );
+      setPendingHunks([]);
       showNotice('AI snippet inserted at cursor (Ctrl+Z to undo)');
     },
     [file, isEditable, draft, selectionRange, applyEdit, showNotice]
@@ -626,89 +814,6 @@ export function RemoteCodeEditor({
     });
   }, [file]);
 
-  const handleCopyAction = useCallback(async () => {
-    if (!file || file.isBinary) return;
-    const el = textareaRef.current;
-    const start = el?.selectionStart ?? 0;
-    const end = el?.selectionEnd ?? 0;
-    const textToCopy = start !== end ? draft.slice(start, end) : draft;
-    const ok = await onCopyText(textToCopy);
-    if (ok) {
-      setCopiedNotice(true);
-      window.setTimeout(() => setCopiedNotice(false), 1500);
-    }
-  }, [file, draft, onCopyText]);
-
-  const handleCutAction = useCallback(async () => {
-    if (!isEditable) return;
-    const el = textareaRef.current;
-    if (!el) return;
-    const start = el.selectionStart ?? 0;
-    const end = el.selectionEnd ?? 0;
-    if (start === end) {
-      // Cut current line when no selection (VS Code style!)
-      const lineStart = draft.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
-      const nl = draft.indexOf('\n', start);
-      const lineEnd = nl === -1 ? draft.length : nl + 1;
-      await onCopyText(draft.slice(lineStart, lineEnd));
-      applyEdit(deleteSelectedLines(draft, start, end));
-      return;
-    }
-    const ok = await onCopyText(draft.slice(start, end));
-    if (ok) {
-      applyEdit({
-        value: `${draft.slice(0, start)}${draft.slice(end)}`,
-        selectionStart: start,
-        selectionEnd: start,
-      });
-    }
-  }, [isEditable, draft, onCopyText, applyEdit]);
-
-  const handlePasteAction = useCallback(async () => {
-    if (!isEditable) return;
-    if (!navigator.clipboard?.readText) {
-      showNotice('Use Ctrl+V inside editor to paste.');
-      textareaRef.current?.focus();
-      return;
-    }
-    try {
-      const clipText = await navigator.clipboard.readText();
-      if (!clipText) return;
-      const el = textareaRef.current;
-      const start = el?.selectionStart ?? draft.length;
-      const end = el?.selectionEnd ?? draft.length;
-      const nextValue = `${draft.slice(0, start)}${clipText}${draft.slice(end)}`;
-      const nextPos = start + clipText.length;
-      applyEdit({ value: nextValue, selectionStart: nextPos, selectionEnd: nextPos });
-    } catch {
-      showNotice('Browser blocked clipboard button; press Ctrl+V directly in the code.');
-      textareaRef.current?.focus();
-    }
-  }, [isEditable, draft, applyEdit, showNotice]);
-
-  const handleSelectAll = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.focus();
-    el.setSelectionRange(0, el.value.length);
-  }, []);
-
-  const handleFormatDocument = useCallback(() => {
-    if (!file || !isEditable) return;
-    const formatted = formatSourceDocument(draft, file.name);
-    if (!formatted.ok) {
-      if (formatted.notice) showNotice(formatted.notice);
-      return;
-    }
-    if (formatted.value === draft) {
-      showNotice('Already formatted');
-      return;
-    }
-    const prevPos = Math.min(formatted.value.length, textareaRef.current?.selectionStart ?? 0);
-    applyEdit({ value: formatted.value, selectionStart: prevPos, selectionEnd: prevPos });
-    showNotice('Document formatted');
-  }, [file, isEditable, draft, applyEdit, showNotice]);
-
   const handleReplaceOne = useCallback(() => {
     if (!isEditable || matches.length === 0) return;
     const idx = activeMatchIdx % matches.length;
@@ -734,6 +839,22 @@ export function RemoteCodeEditor({
     applyEdit({ value: rebuilt, selectionStart: 0, selectionEnd: 0 }, { focus: false });
     showNotice(`Replaced ${count} occurrence${count === 1 ? '' : 's'}`);
   }, [isEditable, matches, draft, replaceQuery, applyEdit, showNotice]);
+
+  const handleFormatDocument = useCallback(() => {
+    if (!file || !isEditable) return;
+    const formatted = formatSourceDocument(draft, file.name);
+    if (!formatted.ok) {
+      if (formatted.notice) showNotice(formatted.notice);
+      return;
+    }
+    if (formatted.value === draft) {
+      showNotice('Already formatted');
+      return;
+    }
+    const prevPos = Math.min(formatted.value.length, textareaRef.current?.selectionStart ?? 0);
+    applyEdit({ value: formatted.value, selectionStart: prevPos, selectionEnd: prevPos });
+    showNotice('Document formatted');
+  }, [file, isEditable, draft, applyEdit, showNotice]);
 
   // Global keyboard shortcuts when Full-Screen IDE is open
   useEffect(() => {
@@ -1316,99 +1437,292 @@ export function RemoteCodeEditor({
           </div>
         )}
 
-        <div className="flex-1 min-h-0 flex overflow-hidden relative">
-          {/* Synchronized Line Numbers Gutter */}
-          <div
-            ref={gutterRef}
-            aria-hidden="true"
-            className={`shrink-0 select-none overflow-hidden bg-[#101016] border-r border-white/[0.06] text-right font-mono-code tabular-nums py-3 ${
-              isFull ? 'w-14 text-[13px] leading-[21px]' : 'w-10 text-[11.5px] leading-[19px]'
-            }`}
-          >
-            {Array.from({ length: lineCount }, (_, idx) => {
-              const isActiveLine = idx + 1 === cursorPos.line;
-              return (
-                <div
-                  key={idx}
-                  className={`${isFull ? 'pr-3' : 'pr-2'} ${
-                    isActiveLine ? 'text-blue-400 bg-white/[0.04]' : 'text-neutral-600'
-                  }`}
+        {pendingHunks.length > 0 && isEditable ? (
+          <>
+            <div className="shrink-0 px-3 py-1.5 border-b border-emerald-500/25 bg-[#121820] flex flex-wrap items-center justify-between gap-2 text-[12px]">
+              <div className="flex items-center gap-2 min-w-0">
+                <Bot className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="font-medium text-neutral-100">
+                  {pendingHunks.length} {pendingHunks.length === 1 ? 'change' : 'changes'} to review
+                </span>
+                <span className="font-mono-code text-[11px] text-emerald-300">
+                  +{pendingHunks.reduce((acc, h) => acc + h.newLines.length, 0)}
+                </span>
+                <span className="font-mono-code text-[11px] text-red-300">
+                  -{pendingHunks.reduce((acc, h) => acc + h.oldLines.length, 0)}
+                </span>
+                <span className="hidden md:inline text-[11px] text-neutral-400">
+                  · Highlighted under old code — click any line or change to accept
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleAcceptAllPendingDiffs}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11.5px] font-medium cursor-pointer"
                 >
-                  {idx + 1}
-                </div>
-              );
-            })}
-          </div>
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Accept All</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRejectAllPendingDiffs}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-white/15 bg-white/5 hover:bg-white/10 text-neutral-200 text-[11.5px] font-medium cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  <span>Reject All</span>
+                </button>
+              </div>
+            </div>
 
-          {/* Syntax-Highlighted <pre> Overlay + Editable Transparent <textarea> */}
-          <div className="flex-1 min-w-0 min-h-0 relative overflow-hidden bg-[#0c0c10]">
-            {!wordWrap && (
-              <div
-                aria-hidden="true"
-                className="absolute left-0 right-0 bg-white/[0.035] pointer-events-none"
-                style={{
-                  top: `${12 + (cursorPos.line - 1) * (isFull ? 21 : 19) - editorScrollTop}px`,
-                  height: `${isFull ? 21 : 19}px`,
-                }}
-              />
-            )}
+            <div
+              ref={diffScrollRef}
+              className={`flex-1 min-h-0 overflow-auto bg-[#0c0c10] py-2 font-mono-code ${
+                isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+              }`}
+            >
+              {(() => {
+                const draftLines = draft.replace(/\r\n/g, '\n').split('\n');
+                const sorted = [...pendingHunks].sort((a, b) => a.startLine - b.startLine);
+                const segments: Array<
+                  | { kind: 'context'; startLine: number; lines: string[] }
+                  | { kind: 'hunk'; hunk: PendingDiffHunk }
+                > = [];
 
-            <pre
-              ref={preRef}
+                let cursorIdx = 0;
+                for (const h of sorted) {
+                  const hunkStartIdx = Math.max(
+                    cursorIdx,
+                    Math.min(draftLines.length, h.startLine - 1)
+                  );
+                  if (hunkStartIdx > cursorIdx) {
+                    segments.push({
+                      kind: 'context',
+                      startLine: cursorIdx + 1,
+                      lines: draftLines.slice(cursorIdx, hunkStartIdx),
+                    });
+                  }
+                  segments.push({ kind: 'hunk', hunk: h });
+                  cursorIdx = Math.min(draftLines.length, hunkStartIdx + h.oldLines.length);
+                }
+                if (cursorIdx < draftLines.length) {
+                  segments.push({
+                    kind: 'context',
+                    startLine: cursorIdx + 1,
+                    lines: draftLines.slice(cursorIdx),
+                  });
+                }
+
+                const gutterWidthClass = isFull ? 'w-14 pr-3' : 'w-10 pr-2';
+
+                return segments.map((seg, sIdx) => {
+                  if (seg.kind === 'context') {
+                    return (
+                      <div key={`ctx-${sIdx}`}>
+                        {seg.lines.map((lineText, lIdx) => (
+                          <div key={`cl-${seg.startLine + lIdx}`} className="flex min-w-max">
+                            <div
+                              className={`${gutterWidthClass} shrink-0 select-none text-right bg-[#101016] border-r border-white/[0.06] text-neutral-600 tabular-nums`}
+                            >
+                              {seg.startLine + lIdx}
+                            </div>
+                            <div
+                              className="code-highlight-layer flex-1 px-3.5 whitespace-pre"
+                              dangerouslySetInnerHTML={{
+                                __html: highlightCodeToHtml(lineText || ' ', file.name),
+                              }}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  }
+
+                  const { hunk } = seg;
+                  return (
+                    <div
+                      key={hunk.id}
+                      data-diff-hunk-id={hunk.id}
+                      className="my-1 border-y border-white/12 bg-[#10131b]"
+                    >
+                      {/* Inline Hunk Header Bar */}
+                      <div className="px-3 py-1 bg-[#161a24] border-b border-white/[0.08] flex flex-wrap items-center justify-between gap-2 font-sans text-[11px]">
+                        <div className="flex items-center gap-2 min-w-0 text-neutral-300">
+                          <span className="font-mono-code text-neutral-400">
+                            Ln {hunk.startLine}
+                          </span>
+                          {hunk.description && (
+                            <span className="truncate text-neutral-300">{hunk.description}</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleAcceptHunk(hunk.id)}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-medium cursor-pointer"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>
+                              {hunk.newLines.length === 0 ? 'Accept Delete' : 'Accept Change'}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRejectHunk(hunk.id)}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-white/15 bg-white/5 hover:bg-white/10 text-neutral-300 text-[11px] font-medium cursor-pointer"
+                          >
+                            <X className="w-3 h-3" />
+                            <span>Reject</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Old Code Highlighted Above */}
+                      {hunk.oldLines.map((oldLine, oIdx) => (
+                        <div
+                          key={`${hunk.id}-old-${oIdx}`}
+                          className="flex min-w-max bg-red-500/14 border-l-2 border-red-400/85"
+                        >
+                          <div
+                            className={`${gutterWidthClass} shrink-0 select-none text-right bg-red-950/35 border-r border-red-500/20 text-red-300/80 tabular-nums`}
+                          >
+                            - {hunk.startLine + oIdx}
+                          </div>
+                          <div className="flex-1 px-3.5 whitespace-pre text-red-200/85">
+                            {oldLine || ' '}
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* Updated New Code Highlighted Directly Under Old Code (Click Any Line to Accept) */}
+                      {hunk.newLines.map((newLine, nIdx) => (
+                        <div
+                          key={`${hunk.id}-new-${nIdx}`}
+                          className="group flex items-center min-w-max bg-emerald-500/18 hover:bg-emerald-500/26 border-l-2 border-emerald-400 transition-colors"
+                        >
+                          <div
+                            className={`${gutterWidthClass} shrink-0 select-none text-right bg-emerald-950/35 border-r border-emerald-500/25 text-emerald-300 tabular-nums`}
+                          >
+                            + {hunk.startLine + nIdx}
+                          </div>
+                          <div
+                            className="code-highlight-layer flex-1 px-3.5 whitespace-pre"
+                            dangerouslySetInnerHTML={{
+                              __html: highlightCodeToHtml(newLine || ' ', file.name),
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleAcceptSingleLine(hunk.id, nIdx)}
+                            title="Click to accept this changed line"
+                            className="sticky right-2 mr-2 ml-3 shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-600/90 hover:bg-emerald-500 text-white font-sans text-[10.5px] font-medium opacity-85 group-hover:opacity-100 cursor-pointer shadow-sm"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>Accept line</span>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 min-h-0 flex overflow-hidden relative">
+            {/* Synchronized Line Numbers Gutter */}
+            <div
+              ref={gutterRef}
               aria-hidden="true"
-              style={{ tabSize: 2 }}
-              className={`code-highlight-layer sync-scroll-ghost absolute inset-0 m-0 py-3 px-3.5 overflow-auto pointer-events-none select-none font-mono-code ${
-                isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
-              } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
-              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
-            />
-
-            <textarea
-              ref={textareaRef}
-              value={draft}
-              readOnly={file.truncated}
-              spellCheck={false}
-              autoCapitalize="off"
-              autoComplete="off"
-              autoCorrect="off"
-              style={{ tabSize: 2, caretColor: '#60a5fa' }}
-              onChange={(e) => {
-                const val = e.target.value;
-                const pos = e.target.selectionStart ?? 0;
-                const endPos = e.target.selectionEnd ?? pos;
-                setDraft(val);
-                const lastChar = val[Math.max(0, pos - 1)] ?? '';
-                const boundaryChar = lastChar === '\n' || lastChar === ' ';
-                pushHistory(
-                  { value: val, selectionStart: pos, selectionEnd: endPos },
-                  !boundaryChar
+              className={`shrink-0 select-none overflow-hidden bg-[#101016] border-r border-white/[0.06] text-right font-mono-code tabular-nums py-3 ${
+                isFull ? 'w-14 text-[13px] leading-[21px]' : 'w-10 text-[11.5px] leading-[19px]'
+              }`}
+            >
+              {Array.from({ length: lineCount }, (_, idx) => {
+                const isActiveLine = idx + 1 === cursorPos.line;
+                return (
+                  <div
+                    key={idx}
+                    className={`${isFull ? 'pr-3' : 'pr-2'} ${
+                      isActiveLine ? 'text-blue-400 bg-white/[0.04]' : 'text-neutral-600'
+                    }`}
+                  >
+                    {idx + 1}
+                  </div>
                 );
-                updateCursorStatsFromOffsets(val, pos, endPos);
-              }}
-              onClick={updateCursorStats}
-              onKeyUp={updateCursorStats}
-              onSelect={updateCursorStats}
-              onScroll={(e) => {
-                const top = e.currentTarget.scrollTop;
-                const left = e.currentTarget.scrollLeft;
-                setEditorScrollTop(top);
-                if (gutterRef.current) {
-                  gutterRef.current.scrollTop = top;
-                }
-                if (preRef.current) {
-                  preRef.current.scrollTop = top;
-                  preRef.current.scrollLeft = left;
-                }
-              }}
-              onKeyDown={handleEditorKeyDown}
-              wrap={wordWrap ? 'soft' : 'off'}
-              aria-label={`Source code editor for ${file.name}`}
-              className={`relative z-10 block w-full h-full m-0 resize-none overflow-auto bg-transparent text-transparent selection:bg-blue-500/35 font-mono-code focus:outline-none py-3 px-3.5 ${
-                isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
-              } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
-            />
+              })}
+            </div>
+
+            {/* Syntax-Highlighted <pre> Overlay + Editable Transparent <textarea> */}
+            <div className="flex-1 min-w-0 min-h-0 relative overflow-hidden bg-[#0c0c10]">
+              {!wordWrap && (
+                <div
+                  aria-hidden="true"
+                  className="absolute left-0 right-0 bg-white/[0.035] pointer-events-none"
+                  style={{
+                    top: `${12 + (cursorPos.line - 1) * (isFull ? 21 : 19) - editorScrollTop}px`,
+                    height: `${isFull ? 21 : 19}px`,
+                  }}
+                />
+              )}
+
+              <pre
+                ref={preRef}
+                aria-hidden="true"
+                style={{ tabSize: 2 }}
+                className={`code-highlight-layer sync-scroll-ghost absolute inset-0 m-0 py-3 px-3.5 overflow-auto pointer-events-none select-none font-mono-code ${
+                  isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+                } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+                dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+              />
+
+              <textarea
+                ref={textareaRef}
+                value={draft}
+                readOnly={file.truncated}
+                spellCheck={false}
+                autoCapitalize="off"
+                autoComplete="off"
+                autoCorrect="off"
+                style={{ tabSize: 2, caretColor: '#60a5fa' }}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const pos = e.target.selectionStart ?? 0;
+                  const endPos = e.target.selectionEnd ?? pos;
+                  setDraft(val);
+                  const lastChar = val[Math.max(0, pos - 1)] ?? '';
+                  const boundaryChar = lastChar === '\n' || lastChar === ' ';
+                  pushHistory(
+                    { value: val, selectionStart: pos, selectionEnd: endPos },
+                    !boundaryChar
+                  );
+                  updateCursorStatsFromOffsets(val, pos, endPos);
+                }}
+                onClick={updateCursorStats}
+                onKeyUp={updateCursorStats}
+                onSelect={updateCursorStats}
+                onScroll={(e) => {
+                  const top = e.currentTarget.scrollTop;
+                  const left = e.currentTarget.scrollLeft;
+                  setEditorScrollTop(top);
+                  if (gutterRef.current) {
+                    gutterRef.current.scrollTop = top;
+                  }
+                  if (preRef.current) {
+                    preRef.current.scrollTop = top;
+                    preRef.current.scrollLeft = left;
+                  }
+                }}
+                onKeyDown={handleEditorKeyDown}
+                wrap={wordWrap ? 'soft' : 'off'}
+                aria-label={`Source code editor for ${file.name}`}
+                className={`relative z-10 block w-full h-full m-0 resize-none overflow-auto bg-transparent text-transparent selection:bg-blue-500/35 font-mono-code focus:outline-none py-3 px-3.5 ${
+                  isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+                } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+              />
+            </div>
           </div>
-        </div>
+        )}
       </div>
     );
   };
@@ -1466,17 +1780,6 @@ export function RemoteCodeEditor({
               </button>
             )}
 
-            {file && !file.isBinary && (
-              <button
-                type="button"
-                onClick={() => openFindBar(false)}
-                title="Find (Ctrl+F)"
-                className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-              >
-                <Search className="w-3.5 h-3.5" />
-              </button>
-            )}
-
             <button
               type="button"
               onClick={() => onToggleFullScreen(true)}
@@ -1485,21 +1788,6 @@ export function RemoteCodeEditor({
             >
               <Maximize2 className="w-3.5 h-3.5" />
             </button>
-
-            {file && !file.isBinary && (
-              <button
-                type="button"
-                onClick={() => void handleCopyAction()}
-                title="Copy code"
-                className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-              >
-                {copiedNotice ? (
-                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                ) : (
-                  <Copy className="w-3.5 h-3.5" />
-                )}
-              </button>
-            )}
 
             {file && !file.isBinary && (
               <button
@@ -1580,87 +1868,21 @@ export function RemoteCodeEditor({
             </span>
           )}
 
-          {file && (
-            <button
-              type="button"
-              onClick={() => setWordWrap((p) => !p)}
-              title="Toggle word wrap"
-              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                wordWrap
-                  ? 'border-blue-500/40 bg-blue-500/15 text-blue-300'
-                  : 'border-white/10 text-neutral-300 hover:bg-white/10'
-              }`}
-            >
-              <WrapText className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Wrap</span>
-            </button>
-          )}
-
-          {file && (
-            <button
-              type="button"
-              onClick={() => onReloadFile(file.path)}
-              title="Reload latest file from remote server"
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-300 hover:bg-white/10 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Reload</span>
-            </button>
-          )}
-
-          {isDirty && file && (
-            <button
-              type="button"
-              onClick={() =>
-                applyEdit({ value: file.content, selectionStart: 0, selectionEnd: 0 })
-              }
-              title="Discard unsaved changes"
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-300 hover:bg-white/10 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Discard</span>
-            </button>
-          )}
-
-          {file && !file.isBinary && (
-            <button
-              type="button"
-              onClick={() => onSaveToNote(file, draft)}
-              title="Save source code snapshot to NoteCraft note"
-              className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-200 hover:bg-white/10 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <FilePlus2 className="w-3.5 h-3.5 text-neutral-400" />
-              <span>Save to note</span>
-            </button>
-          )}
-
           {file && isEditable && (
-            <>
-              <button
-                type="button"
-                onClick={openSaveAsBar}
-                title="Save As new path (Ctrl+Shift+S)"
-                className="hidden sm:inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-200 hover:bg-white/10 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <SaveAll className="w-3.5 h-3.5 text-neutral-400" />
-                <span>Save As</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={saving || !isDirty}
-                onClick={() => onSaveFile(file.path, draft)}
-                title="Save changes to remote server (Ctrl+S)"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-45 text-white text-[12.5px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                {saving ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Save className="w-3.5 h-3.5" />
-                )}
-                <span>{saving ? 'Saving...' : 'Save'}</span>
-              </button>
-            </>
+            <button
+              type="button"
+              disabled={saving || !isDirty}
+              onClick={() => onSaveFile(file.path, draft)}
+              title="Save changes to remote server (Ctrl+S)"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-45 text-white text-[12.5px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {saving ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5" />
+              )}
+              <span>{saving ? 'Saving...' : 'Save'}</span>
+            </button>
           )}
 
           <button
@@ -1694,201 +1916,6 @@ export function RemoteCodeEditor({
           </button>
         </div>
       </header>
-
-      {/* Secondary Edit Actions Bar (Full Screen + Active File) */}
-      {file && !file.isBinary && (
-        <div className="shrink-0 px-3 py-1.5 border-b border-white/[0.07] bg-[#111116] flex items-center gap-1 overflow-x-auto text-[11.5px] text-neutral-300">
-          <button
-            type="button"
-            disabled={!isEditable || !historyMeta.canUndo}
-            onClick={performUndo}
-            title="Undo (Ctrl+Z)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Undo</span>
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable || !historyMeta.canRedo}
-            onClick={performRedo}
-            title="Redo (Ctrl+Y)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Redo</span>
-          </button>
-
-          <span className="h-3.5 w-px bg-white/10 mx-1 shrink-0" />
-
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => void handleCutAction()}
-            title="Cut selection or line (Ctrl+X)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <Scissors className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">Cut</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleCopyAction()}
-            title="Copy selection or file (Ctrl+C)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 cursor-pointer whitespace-nowrap"
-          >
-            {copiedNotice ? (
-              <Check className="w-3.5 h-3.5 text-emerald-400" />
-            ) : (
-              <Copy className="w-3.5 h-3.5" />
-            )}
-            <span className="hidden lg:inline">{copiedNotice ? 'Copied' : 'Copy'}</span>
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => void handlePasteAction()}
-            title="Paste (Ctrl+V)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <ClipboardPaste className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">Paste</span>
-          </button>
-          <button
-            type="button"
-            onClick={handleSelectAll}
-            title="Select All (Ctrl+A)"
-            className="px-2 py-1 rounded hover:bg-white/10 cursor-pointer whitespace-nowrap"
-          >
-            Select All
-          </button>
-
-          <span className="h-3.5 w-px bg-white/10 mx-1 shrink-0" />
-
-          <button
-            type="button"
-            onClick={() => openFindBar(false)}
-            title="Find (Ctrl+F)"
-            className={`inline-flex items-center gap-1 px-2 py-1 rounded cursor-pointer whitespace-nowrap ${
-              findOpen && !replaceOpen ? 'bg-blue-500/20 text-blue-300' : 'hover:bg-white/10'
-            }`}
-          >
-            <Search className="w-3.5 h-3.5" />
-            <span>Find</span>
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => openFindBar(true)}
-            title="Find & Replace (Ctrl+H)"
-            className={`inline-flex items-center gap-1 px-2 py-1 rounded disabled:opacity-35 cursor-pointer whitespace-nowrap ${
-              findOpen && replaceOpen ? 'bg-blue-500/20 text-blue-300' : 'hover:bg-white/10'
-            }`}
-          >
-            <Replace className="w-3.5 h-3.5" />
-            <span>Replace</span>
-          </button>
-          <button
-            type="button"
-            onClick={openGotoLineBar}
-            title="Go to Line (Ctrl+G)"
-            className={`inline-flex items-center gap-1 px-2 py-1 rounded cursor-pointer whitespace-nowrap ${
-              gotoOpen ? 'bg-blue-500/20 text-blue-300' : 'hover:bg-white/10'
-            }`}
-          >
-            <Hash className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Go to Line</span>
-          </button>
-
-          <span className="h-3.5 w-px bg-white/10 mx-1 shrink-0" />
-
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => {
-              const el = textareaRef.current;
-              if (!el || !file) return;
-              applyEdit(
-                toggleCommentLines(draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, file.name)
-              );
-            }}
-            title="Toggle Line Comment (Ctrl+/)"
-            className="px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 font-mono-code cursor-pointer whitespace-nowrap"
-          >
-            // Comment
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => {
-              const el = textareaRef.current;
-              if (!el) return;
-              applyEdit(
-                moveSelectedLines(draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, 'up')
-              );
-            }}
-            title="Move Line Up (Alt+↑)"
-            className="p-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer shrink-0"
-          >
-            <ArrowUp className="w-3.5 h-3.5" />
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => {
-              const el = textareaRef.current;
-              if (!el) return;
-              applyEdit(
-                moveSelectedLines(draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, 'down')
-              );
-            }}
-            title="Move Line Down (Alt+↓)"
-            className="p-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer shrink-0"
-          >
-            <ArrowDown className="w-3.5 h-3.5" />
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => {
-              const el = textareaRef.current;
-              if (!el) return;
-              applyEdit(
-                duplicateSelectedLines(draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, 'down')
-              );
-            }}
-            title="Duplicate Line (Shift+Alt+↓)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <CopyPlus className="w-3.5 h-3.5" />
-            <span className="hidden xl:inline">Duplicate</span>
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={() => {
-              const el = textareaRef.current;
-              if (!el) return;
-              applyEdit(deleteSelectedLines(draft, el.selectionStart ?? 0, el.selectionEnd ?? 0));
-            }}
-            title="Delete Line (Ctrl+Shift+K)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 hover:text-red-300 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span className="hidden xl:inline">Delete Line</span>
-          </button>
-          <button
-            type="button"
-            disabled={!isEditable}
-            onClick={handleFormatDocument}
-            title="Format Document (Shift+Alt+F)"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 text-blue-300 disabled:opacity-35 cursor-pointer whitespace-nowrap"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Format</span>
-          </button>
-        </div>
-      )}
 
       {/* Main Split: Resizable VS Code Project Explorer + Code Canvas + Resizable AI Agent */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
@@ -2091,6 +2118,12 @@ export function RemoteCodeEditor({
               dirCache={dirCache}
               expandedDirs={expandedDirs}
               canUndo={historyMeta.canUndo}
+              pendingHunkCount={pendingHunks.length}
+              activeReviewTurnId={activeReviewTurnId}
+              onStageInlineDiff={handleStageInlineDiff}
+              onAcceptAllPendingDiffs={handleAcceptAllPendingDiffs}
+              onRejectAllPendingDiffs={handleRejectAllPendingDiffs}
+              onFocusDiffReview={() => focusFirstDiffHunk(pendingHunks[0]?.id)}
               onApplyCode={handleApplyAgentCode}
               onCreateFileWithCode={(fullPath, content) => onCreateNewFile(fullPath, content)}
               onUndoLastEdit={performUndo}
@@ -2113,7 +2146,7 @@ export function RemoteCodeEditor({
           <span>{languageLabel}</span>
         </div>
         <div className="hidden sm:block text-neutral-500">
-          Ctrl+S Save · Ctrl+F Find · Ctrl+H Replace · Ctrl+G Go to Line · Esc Exit Full Screen
+          Ctrl+S Save · Ctrl+Shift+S Save As · Ctrl+F Find · Ctrl+H Replace · Ctrl+G Line · Ctrl+/ Comment · Shift+Alt+F Format
         </div>
       </footer>
     </div>

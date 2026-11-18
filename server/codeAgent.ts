@@ -19,10 +19,17 @@ export type CodeAgentTaskMode =
 
 export type CodeAgentTargetAction =
   | 'none'
+  | 'edit-hunks'
   | 'replace-file'
   | 'replace-selection'
   | 'insert-at-cursor'
   | 'create-file';
+
+export interface CodeAgentEditHunk {
+  oldCode: string;
+  newCode: string;
+  description?: string;
+}
 
 export interface CodeAgentMessage {
   role: 'user' | 'assistant';
@@ -55,6 +62,7 @@ export interface CodeAgentInput {
 
 export interface CodeAgentResult {
   reply: string;
+  edits: CodeAgentEditHunk[];
   proposedCode: string | null;
   summary: string;
   targetAction: CodeAgentTargetAction;
@@ -132,13 +140,13 @@ const TASK_GUIDANCE: Record<CodeAgentTaskMode, string> = {
   chat: 'Answer the developer question clearly and provide ready-to-apply code edits whenever code changes or new code are requested.',
   explain:
     'Explain how the code works step-by-step: control flow, data structures, side effects, dependencies, and any gotchas. Only propose code if the user explicitly asks for edits.',
-  fix: 'Identify bugs, race conditions, null/edge-case crashes, security flaws, or type errors, explain each issue clearly, and provide corrected complete code in proposedCode.',
+  fix: 'Identify bugs, race conditions, null/edge-case crashes, security flaws, or type errors, explain each issue clearly, and provide targeted fixes in edits (targetAction: "edit-hunks").',
   refactor:
-    'Refactor the code for better readability, modularity, error handling, and idiomatic style while preserving exact external behavior. Put the complete updated code in proposedCode.',
+    'Refactor the code for better readability, modularity, error handling, and idiomatic style while preserving exact external behavior. Provide targeted search-and-replace blocks in edits (targetAction: "edit-hunks") rather than rewriting unchanged code.',
   tests:
     'Write thorough, practical unit/integration tests covering happy paths and edge cases matching the language and testing idioms of this project.',
   types:
-    'Add strong type annotations, interfaces/types, and concise JSDoc/docstrings without changing runtime logic. Put the updated code in proposedCode.',
+    'Add strong type annotations, interfaces/types, and concise JSDoc/docstrings without changing runtime logic. Provide targeted updates in edits (targetAction: "edit-hunks").',
   implement:
     'Implement the requested feature or new file cleanly, following the architecture and conventions of the open workspace.',
 };
@@ -155,15 +163,24 @@ function buildSystemInstruction(input: CodeAgentInput): string {
     'RULES FOR CODE GENERATION & EDITS:',
     '1. Ground every answer in the active file, highlighted selection, and loaded remote directory tree provided in the context. Do not invent non-existent project files or APIs.',
     '2. Respond ONLY with a valid JSON object matching this exact schema:',
-    '   {"reply": string, "proposedCode": string | null, "summary": string, "targetAction": "none" | "replace-file" | "replace-selection" | "insert-at-cursor" | "create-file", "suggestedFileName": string | null}',
-    '3. Keep "reply" concise, technical Markdown explaining the reasoning, findings, or changes. Do NOT duplicate an entire massive file inside "reply" when you already put it in "proposedCode" — summarize changes concisely in "reply" instead.',
-    '4. When proposing an edit to the open file:',
+    '   {"reply": string, "edits": [{"oldCode": string, "newCode": string, "description": string}], "proposedCode": string | null, "summary": string, "targetAction": "none" | "edit-hunks" | "replace-selection" | "replace-file" | "insert-at-cursor" | "create-file", "suggestedFileName": string | null}',
+    '3. Keep "reply" concise, technical Markdown explaining the reasoning, findings, or changes. Do NOT paste unchanged file sections inside "reply".',
+    '4. CRITICAL — DO NOT REWRITE THE WHOLE FILE when editing existing code:',
     hasFile
       ? hasSelection
-        ? '   - If the request targets ONLY the highlighted selection, set "targetAction": "replace-selection" and put ONLY the replacement snippet in "proposedCode". If rewriting the whole file, set "targetAction": "replace-file" and put the COMPLETE updated file content in "proposedCode".'
-        : '   - When modifying the open file, set "targetAction": "replace-file" and put the COMPLETE, runnable updated file content in "proposedCode". NEVER use placeholders like "// ... rest of file unchanged".'
-      : '   - Since no file is currently open in the editor, if creating a new file or script helps, set "targetAction": "create-file", set "suggestedFileName" (relative to the project root, e.g. "src/utils/helper.ts"), and put the complete file content in "proposedCode".',
-    '5. If the user is only asking a question / explanation that does not require changing code, set "targetAction": "none", "proposedCode": null, and "suggestedFileName": null.',
+        ? [
+            '   - When changing the active file or highlighted selection, PREFER "targetAction": "edit-hunks" with targeted items in "edits" (and set "proposedCode": null).',
+            '   - Each item in "edits" MUST copy the exact verbatim existing lines into "oldCode" (include 1–2 surrounding lines if needed so it matches uniquely) and put ONLY the updated replacement lines into "newCode".',
+            '   - If creating a separate test/helper file (e.g. Write Tests), set "targetAction": "create-file", set "suggestedFileName", "edits": [], and put the new file content in "proposedCode".',
+          ].join('\n')
+        : [
+            '   - When updating an open file, ALWAYS prefer "targetAction": "edit-hunks" with small, targeted items in "edits" (and set "proposedCode": null). NEVER rewrite unchanged lines of the whole file!',
+            '   - Each item in "edits" MUST have "oldCode" copied verbatim from the active file (with enough exact lines to match uniquely) and "newCode" with only the changed block.',
+            '   - To insert brand new code at the cursor without replacing existing lines, set "oldCode": "" in an edit OR use "targetAction": "insert-at-cursor" with "proposedCode".',
+            '   - Only set "targetAction": "create-file" (with "proposedCode" and "suggestedFileName") when generating a separate file such as unit tests or a new module.',
+          ].join('\n')
+      : '   - Since no file is open in the editor, when generating code or a new file, set "targetAction": "create-file", set "edits": [], set "suggestedFileName" (e.g. "src/utils/helper.ts"), and put the complete file content in "proposedCode".',
+    '5. If the user is only asking a question or explanation with no code edits, set "targetAction": "none", "edits": [], "proposedCode": null, and "suggestedFileName": null.',
     '6. "summary" should be a short phrase (< 12 words) describing what was answered or changed.',
   ].join('\n');
 }
@@ -237,11 +254,17 @@ function extractJsonObject(raw: string): Record<string, unknown> {
 
 function normalizeTargetAction(
   candidate: unknown,
+  hasEdits: boolean,
   hasProposedCode: boolean,
   hasFile: boolean
 ): CodeAgentTargetAction {
+  if (hasEdits) {
+    if (candidate === 'create-file' && hasProposedCode) return 'create-file';
+    return 'edit-hunks';
+  }
   if (!hasProposedCode) return 'none';
   if (
+    candidate === 'edit-hunks' ||
     candidate === 'replace-file' ||
     candidate === 'replace-selection' ||
     candidate === 'insert-at-cursor' ||
@@ -251,6 +274,25 @@ function normalizeTargetAction(
     return candidate === 'none' ? (hasFile ? 'replace-file' : 'create-file') : candidate;
   }
   return hasFile ? 'replace-file' : 'create-file';
+}
+
+function sanitizeEditHunks(rawEdits: unknown): CodeAgentEditHunk[] {
+  if (!Array.isArray(rawEdits)) return [];
+  const result: CodeAgentEditHunk[] = [];
+  for (const item of rawEdits) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const oldCode = typeof obj.oldCode === 'string' ? obj.oldCode.replace(/\r\n/g, '\n') : '';
+    const newCode = typeof obj.newCode === 'string' ? obj.newCode.replace(/\r\n/g, '\n') : '';
+    if (!oldCode && !newCode) continue;
+    if (oldCode === newCode) continue;
+    const description =
+      typeof obj.description === 'string' && obj.description.trim()
+        ? obj.description.trim().slice(0, 120)
+        : undefined;
+    result.push({ oldCode, newCode, description });
+  }
+  return result.slice(0, 30);
 }
 
 function parseAgentPayload(
@@ -267,6 +309,7 @@ function parseAgentPayload(
     const clean = rawText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     return {
       reply: clean || 'Completed.',
+      edits: [],
       proposedCode: null,
       summary: 'AI response',
       targetAction: 'none',
@@ -281,17 +324,26 @@ function parseAgentPayload(
       ? parsed.reply.trim()
       : 'Completed.';
 
+  const edits = sanitizeEditHunks(parsed.edits);
+
   const rawCode =
     typeof parsed.proposedCode === 'string' && parsed.proposedCode.trim().length > 0
       ? parsed.proposedCode.replace(/\r\n/g, '\n')
       : null;
 
-  const targetAction = normalizeTargetAction(parsed.targetAction, Boolean(rawCode), hasFile);
-  const proposedCode = targetAction === 'none' ? null : rawCode;
+  const targetAction = normalizeTargetAction(
+    parsed.targetAction,
+    edits.length > 0,
+    Boolean(rawCode),
+    hasFile
+  );
+  const proposedCode = targetAction === 'none' || targetAction === 'edit-hunks' ? null : rawCode;
 
   const summary =
     typeof parsed.summary === 'string' && parsed.summary.trim()
       ? parsed.summary.trim().slice(0, 120)
+      : edits.length > 0
+      ? `Proposed ${edits.length} targeted update${edits.length === 1 ? '' : 's'}`
       : proposedCode
       ? 'Prepared code update'
       : 'Answered coding question';
@@ -303,6 +355,7 @@ function parseAgentPayload(
 
   return {
     reply,
+    edits,
     proposedCode,
     summary,
     targetAction,
@@ -357,11 +410,30 @@ async function runWithGemini(input: CodeAgentInput): Promise<CodeAgentResult> {
           type: Type.OBJECT,
           properties: {
             reply: { type: Type.STRING },
+            edits: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  oldCode: { type: Type.STRING },
+                  newCode: { type: Type.STRING },
+                  description: { type: Type.STRING },
+                },
+                required: ['oldCode', 'newCode'],
+              },
+            },
             proposedCode: { type: Type.STRING, nullable: true },
             summary: { type: Type.STRING },
             targetAction: {
               type: Type.STRING,
-              enum: ['none', 'replace-file', 'replace-selection', 'insert-at-cursor', 'create-file'],
+              enum: [
+                'none',
+                'edit-hunks',
+                'replace-selection',
+                'replace-file',
+                'insert-at-cursor',
+                'create-file',
+              ],
             },
             suggestedFileName: { type: Type.STRING, nullable: true },
           },
