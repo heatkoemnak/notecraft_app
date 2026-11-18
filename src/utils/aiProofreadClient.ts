@@ -15,13 +15,14 @@ export interface ProofreadResult {
 
 export async function requestAiProofread(
   text: string,
-  mode: ProofreadMode = 'proofread'
+  mode: ProofreadMode = 'proofread',
+  model?: string
 ): Promise<ProofreadResult> {
   const res = await fetch('/api/ai/proofread', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, mode }),
+    body: JSON.stringify({ text, mode, model }),
   });
 
   const payload = (await res.json().catch(() => null)) as

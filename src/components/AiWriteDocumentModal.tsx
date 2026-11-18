@@ -5,6 +5,7 @@ import {
   Check,
   Code2,
   Copy,
+  Cpu,
   Eye,
   FileCode2,
   Loader2,
@@ -15,10 +16,15 @@ import {
   X,
 } from 'lucide-react';
 import {
+  FALLBACK_GROQ_MODELS,
+  fetchGroqModels,
   GenerateDocLength,
   GenerateDocType,
   GenerateDocumentResult,
+  GroqModelOption,
+  loadSavedGroqModel,
   requestAiGenerateDocument,
+  savePreferredGroqModel,
 } from '../utils/aiDocumentClient';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
@@ -102,6 +108,11 @@ export function AiWriteDocumentModal({
   const [includeCode, setIncludeCode] = useState(true);
   const [useExistingContext, setUseExistingContext] = useState(false);
 
+  const [models, setModels] = useState<GroqModelOption[]>(FALLBACK_GROQ_MODELS);
+  const [selectedModel, setSelectedModel] = useState<string>(() => loadSavedGroqModel(''));
+  const [useCustomModel, setUseCustomModel] = useState(false);
+  const [customModelId, setCustomModelId] = useState('');
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GenerateDocumentResult | null>(null);
@@ -120,9 +131,30 @@ export function AiWriteDocumentModal({
     setCopied(false);
     setUseExistingContext(false);
     setUpdateTitle(!currentTitle.trim() || currentTitle.trim().toLowerCase() === 'untitled note');
+
+    let cancelled = false;
+    const saved = loadSavedGroqModel('');
+    fetchGroqModels().then((catalog) => {
+      if (cancelled) return;
+      setModels(catalog.models);
+      const preferred = saved || catalog.defaultModel;
+      const inList = catalog.models.some((m) => m.id === preferred);
+      if (inList) {
+        setUseCustomModel(false);
+        setSelectedModel(preferred);
+      } else if (preferred) {
+        setUseCustomModel(true);
+        setCustomModelId(preferred);
+        setSelectedModel(preferred);
+      }
+    });
+
     window.requestAnimationFrame(() => {
       promptInputRef.current?.focus();
     });
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen, currentTitle]);
 
   useEffect(() => {
@@ -139,8 +171,37 @@ export function AiWriteDocumentModal({
 
   if (!isOpen) return null;
 
+  const activeModelId = (useCustomModel ? customModelId.trim() : selectedModel.trim()) || selectedModel;
+  const activeModelMeta = models.find((m) => m.id === activeModelId);
+
+  const handleModelSelectChange = (value: string) => {
+    if (value === '__custom__') {
+      setUseCustomModel(true);
+      if (!customModelId) {
+        setCustomModelId(selectedModel);
+      }
+      return;
+    }
+    setUseCustomModel(false);
+    setSelectedModel(value);
+    savePreferredGroqModel(value);
+  };
+
+  const handleCustomModelChange = (value: string) => {
+    setCustomModelId(value);
+    if (value.trim()) {
+      setSelectedModel(value.trim());
+      savePreferredGroqModel(value.trim());
+    }
+  };
+
   const handleGenerate = async () => {
     if (!prompt.trim() || loading) return;
+    if (useCustomModel && !customModelId.trim()) {
+      setError('Enter a Groq model ID or choose a model from the list.');
+      return;
+    }
+
     const seq = ++reqSeqRef.current;
     setLoading(true);
     setError(null);
@@ -148,6 +209,7 @@ export function AiWriteDocumentModal({
     try {
       const res = await requestAiGenerateDocument({
         prompt: prompt.trim(),
+        model: activeModelId || undefined,
         docType,
         length,
         includeTables,
@@ -285,6 +347,53 @@ export function AiWriteDocumentModal({
 
           {/* Configuration Grid */}
           <div className="rounded-xl border border-neutral-200 dark:border-white/[0.08] bg-neutral-50/70 dark:bg-white/[0.02] p-3.5 space-y-3">
+            {/* AI Model Selector Row */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-neutral-200/80 dark:border-white/[0.07]">
+              <div className="min-w-0">
+                <label
+                  htmlFor="ai-write-model-select"
+                  className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-neutral-600 dark:text-neutral-300"
+                >
+                  <Cpu className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                  <span>AI Model</span>
+                </label>
+                <p className="text-[11.5px] text-neutral-500 dark:text-neutral-400 truncate mt-0.5">
+                  {useCustomModel
+                    ? 'Enter any active Groq model identifier'
+                    : activeModelMeta?.description || 'Selected Groq language model'}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <select
+                  id="ai-write-model-select"
+                  value={useCustomModel ? '__custom__' : selectedModel}
+                  disabled={loading}
+                  onChange={(e) => handleModelSelectChange(e.target.value)}
+                  className="max-w-full sm:max-w-[270px] px-2.5 py-1.5 rounded-lg border border-neutral-200 dark:border-white/[0.1] bg-white dark:bg-[#111115] text-[12.5px] font-medium text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer disabled:opacity-55"
+                >
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label} ({m.id})
+                    </option>
+                  ))}
+                  <option value="__custom__">Custom model ID...</option>
+                </select>
+
+                {useCustomModel && (
+                  <input
+                    type="text"
+                    value={customModelId}
+                    disabled={loading}
+                    onChange={(e) => handleCustomModelChange(e.target.value)}
+                    placeholder="e.g. llama-3.3-70b-versatile"
+                    aria-label="Custom Groq model ID"
+                    className="w-52 px-2.5 py-1.5 rounded-lg border border-neutral-200 dark:border-white/[0.1] bg-white dark:bg-[#111115] text-[12.5px] font-mono-code text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+                  />
+                )}
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-1">
                 <span className="text-[11.5px] font-medium text-neutral-500 dark:text-neutral-400 block">
@@ -403,7 +512,7 @@ export function AiWriteDocumentModal({
             <div className="py-10 flex flex-col items-center justify-center gap-3 text-neutral-500 dark:text-neutral-400">
               <Loader2 className="w-6 h-6 animate-spin text-blue-600 dark:text-blue-400" />
               <span className="text-[13px] font-medium">
-                Drafting your full document with Groq AI...
+                Drafting your full document with {activeModelMeta?.label || activeModelId}...
               </span>
             </div>
           )}

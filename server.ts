@@ -25,6 +25,7 @@ import {
   type GenerateDocType,
   generateDocumentWithGroq,
 } from './server/groqGenerate.ts';
+import { listAvailableGroqModels } from './server/groqModels.ts';
 import { registerOAuthRoutes } from './server/oauth.ts';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -1160,10 +1161,25 @@ async function startServer() {
     }
   });
 
+  // AI: list available Groq models
+  app.get('/api/ai/models', async (_req, res) => {
+    try {
+      const catalog = await listAvailableGroqModels();
+      return res.json(catalog);
+    } catch (err) {
+      console.error('Failed to list Groq models:', err);
+      return res.status(500).json({ error: 'Failed to load AI models' });
+    }
+  });
+
   // AI: improve spelling & grammar using Groq AI
   app.post('/api/ai/proofread', async (req, res) => {
     try {
-      const { text, mode } = (req.body || {}) as { text?: unknown; mode?: unknown };
+      const { text, mode, model } = (req.body || {}) as {
+        text?: unknown;
+        mode?: unknown;
+        model?: unknown;
+      };
       if (typeof text !== 'string' || !text.trim()) {
         return res.status(400).json({ error: 'Text to proofread is required' });
       }
@@ -1178,7 +1194,11 @@ async function startServer() {
           ? mode
           : 'proofread';
 
-      const result = await proofreadWithGroq({ text, mode: validMode });
+      const result = await proofreadWithGroq({
+        text,
+        mode: validMode,
+        model: typeof model === 'string' ? model : undefined,
+      });
       return res.json(result);
     } catch (err) {
       if (err instanceof GroqProofreadError) {
@@ -1194,6 +1214,7 @@ async function startServer() {
     try {
       const {
         prompt,
+        model,
         docType,
         length,
         includeTables,
@@ -1203,6 +1224,7 @@ async function startServer() {
         existingContent,
       } = (req.body || {}) as {
         prompt?: unknown;
+        model?: unknown;
         docType?: unknown;
         length?: unknown;
         includeTables?: unknown;
@@ -1238,6 +1260,7 @@ async function startServer() {
 
       const result = await generateDocumentWithGroq({
         prompt,
+        model: typeof model === 'string' ? model : undefined,
         docType: validDocType,
         length: validLength,
         includeTables: Boolean(includeTables),

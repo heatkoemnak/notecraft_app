@@ -5,11 +5,19 @@ import {
   ArrowRight,
   Check,
   Copy,
+  Cpu,
   Loader2,
   RotateCw,
   Sparkles,
   X,
 } from 'lucide-react';
+import {
+  FALLBACK_GROQ_MODELS,
+  fetchGroqModels,
+  GroqModelOption,
+  loadSavedGroqModel,
+  savePreferredGroqModel,
+} from '../utils/aiDocumentClient';
 import {
   ProofreadMode,
   ProofreadResult,
@@ -56,6 +64,8 @@ export function AiProofreadModal({
     hasSelection ? 'selection' : 'document'
   );
   const [mode, setMode] = useState<ProofreadMode>('proofread');
+  const [models, setModels] = useState<GroqModelOption[]>(FALLBACK_GROQ_MODELS);
+  const [selectedModel, setSelectedModel] = useState<string>(() => loadSavedGroqModel(''));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ProofreadResult | null>(null);
@@ -66,14 +76,15 @@ export function AiProofreadModal({
   const sourceText = scope === 'selection' && hasSelection ? selectedText : fullText;
 
   const runProofread = useCallback(
-    async (targetText: string, targetMode: ProofreadMode) => {
+    async (targetText: string, targetMode: ProofreadMode, targetModel?: string) => {
       const seq = ++requestSeqRef.current;
+      const modelToUse = targetModel !== undefined ? targetModel : selectedModel;
       if (!targetText.trim()) {
         setResult({
           correctedText: targetText,
           summary: 'Nothing to proofread yet — add some text first.',
           changes: [],
-          model: 'groq',
+          model: modelToUse || 'groq',
         });
         setEditedText(targetText);
         setError(null);
@@ -84,7 +95,11 @@ export function AiProofreadModal({
       setLoading(true);
       setError(null);
       try {
-        const res = await requestAiProofread(targetText, targetMode);
+        const res = await requestAiProofread(
+          targetText,
+          targetMode,
+          modelToUse || undefined
+        );
         if (requestSeqRef.current !== seq) return;
         setResult(res);
         setEditedText(res.correctedText);
@@ -98,16 +113,29 @@ export function AiProofreadModal({
         }
       }
     },
-    []
+    [selectedModel]
   );
 
   useEffect(() => {
     if (!isOpen) return;
+    let cancelled = false;
+    const saved = loadSavedGroqModel('');
+    fetchGroqModels().then((catalog) => {
+      if (cancelled) return;
+      setModels(catalog.models);
+      if (!saved && catalog.defaultModel) {
+        setSelectedModel(catalog.defaultModel);
+      }
+    });
+
     const initialScope = selectedText.trim().length > 0 ? 'selection' : 'document';
     setScope(initialScope);
     setCopied(false);
     const target = initialScope === 'selection' ? selectedText : fullText;
-    void runProofread(target, mode);
+    void runProofread(target, mode, saved || '');
+    return () => {
+      cancelled = true;
+    };
     // Only trigger automatic initial run when modal opens
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -135,6 +163,12 @@ export function AiProofreadModal({
     setScope(nextScope);
     const target = nextScope === 'selection' && hasSelection ? selectedText : fullText;
     void runProofread(target, mode);
+  };
+
+  const handleModelChange = (nextModel: string) => {
+    setSelectedModel(nextModel);
+    savePreferredGroqModel(nextModel);
+    void runProofread(sourceText, mode, nextModel);
   };
 
   const handleCopy = async () => {
@@ -215,7 +249,7 @@ export function AiProofreadModal({
             })}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {hasSelection && (
               <div className="inline-flex items-center rounded-lg bg-neutral-200/70 dark:bg-white/[0.06] p-0.5">
                 <button
@@ -242,6 +276,32 @@ export function AiProofreadModal({
                 </button>
               </div>
             )}
+
+            <div className="inline-flex items-center gap-1.5">
+              <Cpu className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+              <select
+                value={
+                  models.some((m) => m.id === selectedModel) ? selectedModel : '__custom__'
+                }
+                disabled={loading}
+                aria-label="Groq AI model"
+                onChange={(e) => {
+                  if (e.target.value !== '__custom__') {
+                    handleModelChange(e.target.value);
+                  }
+                }}
+                className="max-w-[180px] px-2 py-1 rounded-lg border border-neutral-200 dark:border-white/10 bg-white dark:bg-[#111115] text-[12px] font-medium text-neutral-800 dark:text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer disabled:opacity-50"
+              >
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+                {!models.some((m) => m.id === selectedModel) && (
+                  <option value="__custom__">{selectedModel}</option>
+                )}
+              </select>
+            </div>
 
             <button
               type="button"

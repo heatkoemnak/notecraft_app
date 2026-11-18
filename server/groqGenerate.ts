@@ -1,3 +1,8 @@
+import {
+  getConfiguredGroqApiKey,
+  getDefaultGroqModel,
+  sanitizeGroqModelId,
+} from './groqModels.ts';
 import { GroqProofreadError } from './groqProofread.ts';
 
 export type GenerateDocType =
@@ -12,6 +17,7 @@ export type GenerateDocLength = 'concise' | 'standard' | 'detailed';
 
 export interface GenerateDocumentInput {
   prompt: string;
+  model?: string;
   docType?: GenerateDocType;
   length?: GenerateDocLength;
   includeTables?: boolean;
@@ -29,7 +35,6 @@ export interface GenerateDocumentResult {
 }
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_GROQ_MODEL = 'llama-3.3-70b-versatile';
 const REQUEST_TIMEOUT_MS = 45000;
 
 const DOC_TYPE_GUIDANCE: Record<GenerateDocType, string> = {
@@ -91,7 +96,8 @@ function buildGenerateSystemPrompt(input: GenerateDocumentInput): string {
 }
 
 function extractJsonObject(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
+  const withoutThink = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const trimmed = withoutThink || raw.trim();
   try {
     return JSON.parse(trimmed) as Record<string, unknown>;
   } catch {
@@ -138,7 +144,7 @@ async function callGroqGenerate(
     const body: Record<string, unknown> = {
       model,
       temperature: 0.35,
-      max_tokens: 4096,
+      max_tokens: 6144,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
@@ -196,25 +202,22 @@ async function callGroqGenerate(
   }
 }
 
-function resolveGroqConfig(): { apiKey: string; model: string } {
-  const rawKey = process.env.GROQ_API_KEY ?? process.env.GROQ_KEY ?? '';
-  const apiKey = rawKey.trim().replace(/^['"]|['"]$/g, '').trim();
+function resolveGroqConfig(requestedModel?: string): { apiKey: string; model: string } {
+  const apiKey = getConfiguredGroqApiKey();
   if (!apiKey || apiKey === 'MY_GROQ_API_KEY') {
     throw new GroqProofreadError(
       'GROQ_API_KEY is not configured on the server. Add GROQ_API_KEY to your environment secrets or Docker/Portainer stack environment variables and restart the server.',
       503
     );
   }
-  const rawModel = process.env.GROQ_MODEL ?? '';
-  const model =
-    rawModel.trim().replace(/^['"]|['"]$/g, '').trim() || DEFAULT_GROQ_MODEL;
+  const model = sanitizeGroqModelId(requestedModel, getDefaultGroqModel());
   return { apiKey, model };
 }
 
 export async function generateDocumentWithGroq(
   input: GenerateDocumentInput
 ): Promise<GenerateDocumentResult> {
-  const { apiKey, model } = resolveGroqConfig();
+  const { apiKey, model } = resolveGroqConfig(input.model);
   const systemPrompt = buildGenerateSystemPrompt(input);
 
   const userParts: string[] = [`Write a complete document for the following request:\n${input.prompt.trim()}`];

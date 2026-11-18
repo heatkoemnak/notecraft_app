@@ -1,3 +1,9 @@
+import {
+  getConfiguredGroqApiKey,
+  getDefaultGroqModel,
+  sanitizeGroqModelId,
+} from './groqModels.ts';
+
 export type ProofreadMode = 'proofread' | 'spelling' | 'clarity';
 
 export interface ProofreadChange {
@@ -24,7 +30,6 @@ export class GroqProofreadError extends Error {
 }
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_GROQ_MODEL = 'llama-3.3-70b-versatile';
 const REQUEST_TIMEOUT_MS = 25000;
 
 interface ProtectedSegment {
@@ -122,7 +127,8 @@ function buildSystemPrompt(mode: ProofreadMode): string {
 }
 
 function extractJsonObject(raw: string): Record<string, unknown> {
-  const trimmed = raw.trim();
+  const withoutThink = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const trimmed = withoutThink || raw.trim();
   try {
     return JSON.parse(trimmed) as Record<string, unknown>;
   } catch {
@@ -210,29 +216,28 @@ async function callGroqChat(
   }
 }
 
-function resolveGroqConfig(): { apiKey: string; model: string } {
-  const rawKey = process.env.GROQ_API_KEY ?? process.env.GROQ_KEY ?? '';
-  const apiKey = rawKey.trim().replace(/^['"]|['"]$/g, '').trim();
+function resolveGroqConfig(requestedModel?: string): { apiKey: string; model: string } {
+  const apiKey = getConfiguredGroqApiKey();
   if (!apiKey || apiKey === 'MY_GROQ_API_KEY') {
     throw new GroqProofreadError(
       'GROQ_API_KEY is not configured on the server. Add GROQ_API_KEY to your environment secrets or Docker/Portainer stack environment variables and restart the server.',
       503
     );
   }
-  const rawModel = process.env.GROQ_MODEL ?? '';
-  const model =
-    rawModel.trim().replace(/^['"]|['"]$/g, '').trim() || DEFAULT_GROQ_MODEL;
+  const model = sanitizeGroqModelId(requestedModel, getDefaultGroqModel());
   return { apiKey, model };
 }
 
 export async function proofreadWithGroq({
   text,
   mode = 'proofread',
+  model: requestedModel,
 }: {
   text: string;
   mode?: ProofreadMode;
+  model?: string;
 }): Promise<ProofreadResult> {
-  const { apiKey, model } = resolveGroqConfig();
+  const { apiKey, model } = resolveGroqConfig(requestedModel);
   const systemPrompt = buildSystemPrompt(mode);
   const { maskedText, restore } = protectNonProseSegments(text);
 
