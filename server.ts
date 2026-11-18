@@ -27,6 +27,13 @@ import {
   generateDocumentWithGroq,
 } from './server/groqGenerate.ts';
 import { listAvailableGroqModels } from './server/groqModels.ts';
+import {
+  CodeAgentError,
+  type CodeAgentMessage,
+  type CodeAgentTaskMode,
+  listCodeAgentModels,
+  runCodeAgent,
+} from './server/codeAgent.ts';
 import { registerOAuthRoutes } from './server/oauth.ts';
 import { attachSshWebSocketServer } from './server/sshGateway.ts';
 import {
@@ -1310,6 +1317,110 @@ async function startServer() {
       }
       console.error('Groq AI document generation failed:', err);
       return res.status(500).json({ error: 'Failed to generate document with Groq AI' });
+    }
+  });
+
+  // AI Coding Agent: list available Gemini & Groq models
+  app.get('/api/ai/code-agent/models', async (_req, res) => {
+    try {
+      const catalog = await listCodeAgentModels();
+      return res.json(catalog);
+    } catch (err) {
+      console.error('Failed to list code agent models:', err);
+      return res.status(500).json({ error: 'Failed to load AI Code Agent models' });
+    }
+  });
+
+  // AI Coding Agent: multi-turn coding assistant for remote files & workspace
+  app.post('/api/ai/code-agent', async (req, res) => {
+    try {
+      const {
+        prompt,
+        model,
+        taskMode,
+        filePath,
+        fileName,
+        language,
+        fileContent,
+        selectedCode,
+        selectionLineRange,
+        cursorLine,
+        rootPath,
+        projectTree,
+        history,
+      } = (req.body || {}) as {
+        prompt?: unknown;
+        model?: unknown;
+        taskMode?: unknown;
+        filePath?: unknown;
+        fileName?: unknown;
+        language?: unknown;
+        fileContent?: unknown;
+        selectedCode?: unknown;
+        selectionLineRange?: unknown;
+        cursorLine?: unknown;
+        rootPath?: unknown;
+        projectTree?: unknown;
+        history?: unknown;
+      };
+
+      if (typeof prompt !== 'string' || !prompt.trim()) {
+        return res.status(400).json({ error: 'Enter a coding question or instruction first' });
+      }
+      if (prompt.length > 8000) {
+        return res.status(400).json({ error: 'Prompt exceeds the 8,000 character limit.' });
+      }
+
+      const validTaskMode: CodeAgentTaskMode =
+        taskMode === 'explain' ||
+        taskMode === 'fix' ||
+        taskMode === 'refactor' ||
+        taskMode === 'tests' ||
+        taskMode === 'types' ||
+        taskMode === 'implement' ||
+        taskMode === 'chat'
+          ? taskMode
+          : 'chat';
+
+      const sanitizedHistory: CodeAgentMessage[] = Array.isArray(history)
+        ? history
+            .slice(-10)
+            .filter(
+              (item): item is { role?: unknown; content?: unknown } =>
+                Boolean(item && typeof item === 'object')
+            )
+            .map((item) => ({
+              role: item.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+              content: typeof item.content === 'string' ? item.content.slice(0, 6000) : '',
+            }))
+            .filter((item) => item.content.trim().length > 0)
+        : [];
+
+      const result = await runCodeAgent({
+        prompt,
+        model: typeof model === 'string' ? model : undefined,
+        taskMode: validTaskMode,
+        filePath: typeof filePath === 'string' ? filePath.slice(0, 500) : undefined,
+        fileName: typeof fileName === 'string' ? fileName.slice(0, 200) : undefined,
+        language: typeof language === 'string' ? language.slice(0, 80) : undefined,
+        fileContent: typeof fileContent === 'string' ? fileContent.slice(0, 36000) : undefined,
+        selectedCode: typeof selectedCode === 'string' ? selectedCode.slice(0, 14000) : undefined,
+        selectionLineRange:
+          typeof selectionLineRange === 'string' ? selectionLineRange.slice(0, 80) : undefined,
+        cursorLine:
+          typeof cursorLine === 'number' && Number.isFinite(cursorLine) ? cursorLine : undefined,
+        rootPath: typeof rootPath === 'string' ? rootPath.slice(0, 500) : undefined,
+        projectTree: typeof projectTree === 'string' ? projectTree.slice(0, 10000) : undefined,
+        history: sanitizedHistory,
+      });
+
+      return res.json(result);
+    } catch (err) {
+      if (err instanceof CodeAgentError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('AI Code Agent failed:', err);
+      return res.status(500).json({ error: 'Failed to run AI Code Agent' });
     }
   });
 

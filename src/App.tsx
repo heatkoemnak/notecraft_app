@@ -436,7 +436,7 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!currentUser) return;
       const target = e.target as HTMLElement | null;
-      if (target?.closest('.xterm')) {
+      if (target?.closest('.xterm') || target?.closest('[data-remote-code-editor="true"]')) {
         return;
       }
       const mod = (e.ctrlKey || e.metaKey) && !e.altKey;

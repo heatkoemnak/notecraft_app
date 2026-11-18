@@ -23,6 +23,7 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Maximize2,
   PanelLeftOpen,
   Plug,
   PlugZap,
@@ -200,6 +201,19 @@ export function SshTerminalView({
   const [saveFileError, setSaveFileError] = useState<string | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [creatingInDir, setCreatingInDir] = useState<string | null>(null);
+  const [dirDrawerWidth, setDirDrawerWidth] = useState<number>(() => {
+    try {
+      const saved = Number(window.localStorage.getItem('notecraft.ssh.dirDrawerWidth.v1'));
+      if (Number.isFinite(saved) && saved >= 240 && saved <= 620) return saved;
+    } catch {
+      // ignore storage errors
+    }
+    return 340;
+  });
+  const [resizingDirDrawer, setResizingDirDrawer] = useState(false);
+  const [isDesktopLg, setIsDesktopLg] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 1024 : true
+  );
 
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -234,6 +248,14 @@ export function SshTerminalView({
   isActiveRef.current = isActive;
   const copySelectionRef = useRef<() => Promise<boolean>>(async () => false);
   const pasteClipboardRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const sync = () => setIsDesktopLg(mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
 
   useEffect(() => {
     onConnectionStateChange?.({
@@ -521,7 +543,7 @@ export function SshTerminalView({
       window.cancelAnimationFrame(raf);
       window.clearTimeout(timer);
     };
-  }, [isActive, panelOpen, sidebarOpen, dirBrowserOpen, status]);
+  }, [isActive, panelOpen, sidebarOpen, dirBrowserOpen, dirDrawerWidth, status]);
 
   const handleCommandInputChange = (raw: string) => {
     setCommandInput(raw);
@@ -581,7 +603,7 @@ export function SshTerminalView({
   const requestListDir = useCallback(
     (
       targetPath?: string,
-      options?: { mode?: 'root' | 'expand'; keepPreview?: boolean }
+      options?: { mode?: 'root' | 'expand'; keepPreview?: boolean; openFullScreen?: boolean }
     ) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -592,7 +614,11 @@ export function SshTerminalView({
       pendingDirReqRef.current.set(reqId, { requestedPath: loadKey, mode });
       setLoadingDirs((prev) => ({ ...prev, [loadKey]: true }));
       setDirError(null);
-      if (mode === 'root' && !options?.keepPreview) {
+      if (options?.openFullScreen) {
+        setPreviewFile(null);
+        setCreatingInDir(null);
+        setEditorFullScreen(true);
+      } else if (mode === 'root' && !options?.keepPreview) {
         setPreviewFile(null);
         setEditorFullScreen(false);
         setCreatingInDir(null);
@@ -688,10 +714,49 @@ export function SshTerminalView({
   );
 
   const handleCreateNewRemoteFile = useCallback(
-    (fullPath: string) => {
-      requestWriteFile(fullPath, '', true);
+    (fullPath: string, initialContent = '') => {
+      requestWriteFile(fullPath, initialContent, true);
     },
     [requestWriteFile]
+  );
+
+  const handleStartResizeDirDrawer = useCallback(
+    (startEvent: React.MouseEvent) => {
+      startEvent.preventDefault();
+      const startX = startEvent.clientX;
+      const startWidth = dirDrawerWidth;
+      let latestWidth = startWidth;
+      setResizingDirDrawer(true);
+
+      const prevCursor = document.body.style.cursor;
+      const prevSelect = document.body.style.userSelect;
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        const delta = startX - moveEvent.clientX;
+        const maxWidth = Math.max(300, Math.min(640, Math.floor(window.innerWidth * 0.55)));
+        latestWidth = Math.max(240, Math.min(maxWidth, startWidth + delta));
+        setDirDrawerWidth(latestWidth);
+      };
+
+      const handleMouseUp = () => {
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+        document.body.style.cursor = prevCursor;
+        document.body.style.userSelect = prevSelect;
+        setResizingDirDrawer(false);
+        try {
+          window.localStorage.setItem('notecraft.ssh.dirDrawerWidth.v1', String(latestWidth));
+        } catch {
+          // ignore storage errors
+        }
+      };
+
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+    },
+    [dirDrawerWidth]
   );
 
   const handleToggleDirBrowser = () => {
@@ -1871,7 +1936,32 @@ export function SshTerminalView({
 
             {/* Remote Project Directory Browser */}
             {dirBrowserOpen && isConnected && (
-              <aside className="w-full lg:w-[330px] h-[270px] lg:h-auto shrink-0 border-t lg:border-t-0 lg:border-l border-white/[0.08] bg-[#141418] flex flex-col min-h-0">
+              <>
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize project directory drawer"
+                  title="Drag to resize project directory (double-click to reset)"
+                  onMouseDown={handleStartResizeDirDrawer}
+                  onDoubleClick={() => {
+                    setDirDrawerWidth(340);
+                    try {
+                      window.localStorage.setItem('notecraft.ssh.dirDrawerWidth.v1', '340');
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                  className={`hidden lg:flex w-1.5 shrink-0 border-l border-white/[0.08] cursor-col-resize items-center justify-center transition-colors group ${
+                    resizingDirDrawer ? 'bg-blue-500/50' : 'hover:bg-blue-500/35'
+                  }`}
+                >
+                  <span className="w-px h-8 rounded-full bg-white/15 group-hover:bg-blue-300/80" />
+                </div>
+
+                <aside
+                  style={isDesktopLg ? { width: `${dirDrawerWidth}px` } : undefined}
+                  className="w-full h-[270px] lg:h-auto shrink-0 border-t lg:border-t-0 bg-[#141418] flex flex-col min-h-0"
+                >
                 <div className="shrink-0 px-3 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <FolderOpen className="w-3.5 h-3.5 text-blue-400 shrink-0" />
@@ -1918,6 +2008,15 @@ export function SshTerminalView({
                     </button>
                     <button
                       type="button"
+                      onClick={() => setEditorFullScreen(true)}
+                      disabled={!currentRemotePath}
+                      title="Open project explorer & editor in Full Screen"
+                      className="p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 disabled:opacity-35 cursor-pointer"
+                    >
+                      <Maximize2 className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => {
                         setEditorFullScreen(false);
                         setDirBrowserOpen(false);
@@ -1934,7 +2033,7 @@ export function SshTerminalView({
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
-                    requestListDir(pathInput, { mode: 'root' });
+                    requestListDir(pathInput, { mode: 'root', openFullScreen: true });
                   }}
                   className="shrink-0 p-2.5 border-b border-white/[0.08] space-y-2"
                 >
@@ -2014,12 +2113,14 @@ export function SshTerminalView({
                 )}
 
                 {/* Remote Source Code Editor (Inline or Full-Screen) OR Collapsible Project Tree */}
-                {previewFile ? (
+                {previewFile || editorFullScreen ? (
                   <RemoteCodeEditor
                     file={previewFile}
                     fullScreen={editorFullScreen}
                     saving={savingFile}
                     saveError={saveFileError}
+                    dirError={dirError}
+                    fileLoading={fileLoading}
                     lastSavedAt={lastSavedAt}
                     currentRemotePath={currentRemotePath}
                     dirCache={dirCache}
@@ -2033,6 +2134,9 @@ export function SshTerminalView({
                       setSaveFileError(null);
                     }}
                     onSaveFile={(filePath, nextContent) => requestWriteFile(filePath, nextContent)}
+                    onSaveAsFile={(targetPath, nextContent) =>
+                      requestWriteFile(targetPath, nextContent, true)
+                    }
                     onReloadFile={(filePath) => requestReadFile(filePath)}
                     onToggleDir={handleToggleTreeDir}
                     onNavigateRootDir={(dirPath) =>
@@ -2085,6 +2189,7 @@ export function SshTerminalView({
                   </div>
                 )}
               </aside>
+              </>
             )}
           </div>
         </div>
