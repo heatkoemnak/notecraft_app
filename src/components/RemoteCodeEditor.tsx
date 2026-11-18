@@ -20,6 +20,53 @@ import {
   WrapText,
   X,
 } from 'lucide-react';
+import { highlightCodeToHtml } from '../utils/codeHighlight';
+
+function getFileIconColorClass(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower === 'dockerfile' || lower.startsWith('dockerfile.')) return 'text-sky-400';
+  if (lower === '.env' || lower.startsWith('.env.')) return 'text-amber-400';
+  const ext = lower.includes('.') ? lower.split('.').pop() || '' : '';
+  switch (ext) {
+    case 'ts':
+    case 'tsx':
+      return 'text-blue-400';
+    case 'js':
+    case 'jsx':
+    case 'mjs':
+    case 'cjs':
+      return 'text-amber-400';
+    case 'json':
+      return 'text-emerald-400';
+    case 'py':
+      return 'text-sky-400';
+    case 'go':
+      return 'text-cyan-400';
+    case 'rs':
+      return 'text-orange-400';
+    case 'sh':
+    case 'bash':
+    case 'zsh':
+      return 'text-green-400';
+    case 'yml':
+    case 'yaml':
+    case 'toml':
+      return 'text-purple-400';
+    case 'css':
+    case 'scss':
+      return 'text-pink-400';
+    case 'html':
+    case 'xml':
+    case 'svg':
+      return 'text-rose-400';
+    case 'sql':
+      return 'text-orange-300';
+    case 'md':
+      return 'text-teal-400';
+    default:
+      return 'text-neutral-400';
+  }
+}
 
 export interface RemoteDirEntry {
   name: string;
@@ -134,6 +181,7 @@ export function RemoteCodeEditor({
   const [creatingFile, setCreatingFile] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
+  const [editorScrollTop, setEditorScrollTop] = useState(0);
   const [pendingAction, setPendingAction] = useState<
     | { type: 'switch-file'; path: string }
     | { type: 'close-file' }
@@ -143,12 +191,25 @@ export function RemoteCodeEditor({
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
+  const preRef = useRef<HTMLPreElement>(null);
 
   // Sync draft when switching files or reloading from server
   useEffect(() => {
     setDraft(file.content);
     setPendingAction(null);
     setCursorPos({ line: 1, col: 1 });
+    setEditorScrollTop(0);
+    if (textareaRef.current) {
+      textareaRef.current.scrollTop = 0;
+      textareaRef.current.scrollLeft = 0;
+    }
+    if (preRef.current) {
+      preRef.current.scrollTop = 0;
+      preRef.current.scrollLeft = 0;
+    }
+    if (gutterRef.current) {
+      gutterRef.current.scrollTop = 0;
+    }
   }, [file.path, file.content]);
 
   useEffect(() => {
@@ -161,6 +222,10 @@ export function RemoteCodeEditor({
   const isDirty = !file.isBinary && !file.truncated && draft !== file.content;
   const lineCount = useMemo(() => Math.max(1, draft.split('\n').length), [draft]);
   const languageLabel = useMemo(() => detectLanguageLabel(file.name), [file.name]);
+  const highlightedHtml = useMemo(
+    () => (file.isBinary ? '' : highlightCodeToHtml(draft, file.name)),
+    [draft, file.name, file.isBinary]
+  );
 
   const updateCursorStats = () => {
     const el = textareaRef.current;
@@ -399,41 +464,83 @@ export function RemoteCodeEditor({
           <div
             ref={gutterRef}
             aria-hidden="true"
-            className={`shrink-0 select-none overflow-hidden bg-[#101016] border-r border-white/[0.06] text-right font-mono-code text-neutral-600 tabular-nums py-3 ${
-              isFull ? 'w-14 pr-3 text-[13px] leading-[21px]' : 'w-10 pr-2 text-[11.5px] leading-[19px]'
+            className={`shrink-0 select-none overflow-hidden bg-[#101016] border-r border-white/[0.06] text-right font-mono-code tabular-nums py-3 ${
+              isFull ? 'w-14 text-[13px] leading-[21px]' : 'w-10 text-[11.5px] leading-[19px]'
             }`}
           >
-            {Array.from({ length: lineCount }, (_, idx) => (
-              <div key={idx}>{idx + 1}</div>
-            ))}
+            {Array.from({ length: lineCount }, (_, idx) => {
+              const isActiveLine = idx + 1 === cursorPos.line;
+              return (
+                <div
+                  key={idx}
+                  className={`${isFull ? 'pr-3' : 'pr-2'} ${
+                    isActiveLine ? 'text-blue-400 bg-white/[0.04]' : 'text-neutral-600'
+                  }`}
+                >
+                  {idx + 1}
+                </div>
+              );
+            })}
           </div>
 
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            readOnly={file.truncated}
-            spellCheck={false}
-            autoCapitalize="off"
-            autoComplete="off"
-            autoCorrect="off"
-            onChange={(e) => {
-              setDraft(e.target.value);
-              updateCursorStats();
-            }}
-            onClick={updateCursorStats}
-            onKeyUp={updateCursorStats}
-            onScroll={(e) => {
-              if (gutterRef.current) {
-                gutterRef.current.scrollTop = e.currentTarget.scrollTop;
-              }
-            }}
-            onKeyDown={handleEditorKeyDown}
-            wrap={wordWrap ? 'soft' : 'off'}
-            aria-label={`Source code editor for ${file.name}`}
-            className={`flex-1 min-w-0 min-h-0 resize-none bg-transparent text-neutral-100 font-mono-code focus:outline-none py-3 px-3.5 ${
-              isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
-            } ${wordWrap ? 'whitespace-pre-wrap' : 'whitespace-pre overflow-x-auto'}`}
-          />
+          {/* Syntax-Highlighted <pre> Overlay + Editable Transparent <textarea> */}
+          <div className="flex-1 min-w-0 min-h-0 relative overflow-hidden bg-[#0c0c10]">
+            {!wordWrap && (
+              <div
+                aria-hidden="true"
+                className="absolute left-0 right-0 bg-white/[0.035] pointer-events-none"
+                style={{
+                  top: `${12 + (cursorPos.line - 1) * (isFull ? 21 : 19) - editorScrollTop}px`,
+                  height: `${isFull ? 21 : 19}px`,
+                }}
+              />
+            )}
+
+            <pre
+              ref={preRef}
+              aria-hidden="true"
+              style={{ tabSize: 2 }}
+              className={`code-highlight-layer sync-scroll-ghost absolute inset-0 m-0 py-3 px-3.5 overflow-auto pointer-events-none select-none font-mono-code ${
+                isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+              } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+            />
+
+            <textarea
+              ref={textareaRef}
+              value={draft}
+              readOnly={file.truncated}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoComplete="off"
+              autoCorrect="off"
+              style={{ tabSize: 2, caretColor: '#60a5fa' }}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                updateCursorStats();
+              }}
+              onClick={updateCursorStats}
+              onKeyUp={updateCursorStats}
+              onScroll={(e) => {
+                const top = e.currentTarget.scrollTop;
+                const left = e.currentTarget.scrollLeft;
+                setEditorScrollTop(top);
+                if (gutterRef.current) {
+                  gutterRef.current.scrollTop = top;
+                }
+                if (preRef.current) {
+                  preRef.current.scrollTop = top;
+                  preRef.current.scrollLeft = left;
+                }
+              }}
+              onKeyDown={handleEditorKeyDown}
+              wrap={wordWrap ? 'soft' : 'off'}
+              aria-label={`Source code editor for ${file.name}`}
+              className={`relative z-10 block w-full h-full m-0 resize-none overflow-auto bg-transparent text-transparent selection:bg-blue-500/35 font-mono-code focus:outline-none py-3 px-3.5 ${
+                isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+              } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+            />
+          </div>
         </div>
       </div>
     );
@@ -554,7 +661,7 @@ export function RemoteCodeEditor({
             <PanelLeftOpen className="w-4 h-4" />
           </button>
 
-          <FileText className="w-4 h-4 text-blue-400 shrink-0" />
+          <FileText className={`w-4 h-4 shrink-0 ${getFileIconColorClass(file.name)}`} />
           <div className="min-w-0 flex items-center gap-2">
             <span className="text-[14px] font-semibold text-white truncate">{file.name}</span>
             <span className="hidden md:inline font-mono-code text-[12px] text-neutral-500 truncate max-w-[360px]">
@@ -782,7 +889,9 @@ export function RemoteCodeEditor({
                     {entry.isDirectory ? (
                       <FolderIcon className="w-3.5 h-3.5 text-blue-400 shrink-0" />
                     ) : (
-                      <FileText className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                      <FileText
+                        className={`w-3.5 h-3.5 shrink-0 ${getFileIconColorClass(entry.name)}`}
+                      />
                     )}
                     <span className="font-mono-code text-[12px] truncate">{entry.name}</span>
                   </button>

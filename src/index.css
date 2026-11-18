@@ -116,3 +116,90 @@ html.dark .live-editable[data-placeholder^="Start writing"]:empty::before {
   color: rgba(161, 161, 170, 0.48);
 }
 
+/* Remote Code Editor syntax highlighting (strictly uniform metrics so textarea caret never drifts) */
+.sync-scroll-ghost {
+  scrollbar-color: transparent transparent;
+}
+
+.sync-scroll-ghost::-webkit-scrollbar-thumb,
+.sync-scroll-ghost::-webkit-scrollbar-thumb:hover {
+  background: transparent;
+}
+
+.code-highlight-layer {
+  color: #e4e4e7;
+}
+
+.code-highlight-layer .token {
+  font-weight: 400;
+  font-style: normal;
+  background: transparent;
+}
+
+.code-highlight-layer .token.comment,
+.code-highlight-layer .token.prolog,
+.code-highlight-layer .token.doctype,
+.code-highlight-layer .token.cdata {
+  color: #6b7280;
+}
+
+.code-highlight-layer .token.punctuation {
+  color: #94a3b8;
+}
+
+.code-highlight-layer .token.namespace {
+  color: #2dd4bf;
+}
+
+.code-highlight-layer .token.property,
+.code-highlight-layer .token.tag,
+.code-highlight-layer .token.constant,
+.code-highlight-layer .token.symbol,
+.code-highlight-layer .token.deleted {
+  color: #f472b6;
+}
+
+.code-highlight-layer .token.boolean,
+.code-highlight-layer .token.number {
+  color: #fb923c;
+}
+
+.code-highlight-layer .token.selector,
+.code-highlight-layer .token.attr-name,
+.code-highlight-layer .token.string,
+.code-highlight-layer .token.char,
+.code-highlight-layer .token.builtin,
+.code-highlight-layer .token.inserted {
+  color: #4ade80;
+}
+
+.code-highlight-layer .token.operator,
+.code-highlight-layer .token.entity,
+.code-highlight-layer .token.url,
+.code-highlight-layer .token.variable {
+  color: #38bdf8;
+}
+
+.code-highlight-layer .token.atrule,
+.code-highlight-layer .token.attr-value,
+.code-highlight-layer .token.function {
+  color: #60a5fa;
+}
+
+.code-highlight-layer .token.class-name,
+.code-highlight-layer .token.maybe-class-name {
+  color: #fbbf24;
+}
+
+.code-highlight-layer .token.keyword {
+  color: #c084fc;
+}
+
+.code-highlight-layer .token.regex,
+.code-highlight-layer .token.important {
+  color: #f59e0b;
+}
+
+.code-highlight-layer .token.key {
+  color: #38bdf8;
+}
