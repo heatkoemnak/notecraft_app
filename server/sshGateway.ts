@@ -45,6 +45,12 @@ type ClientMessage =
       path?: unknown;
     }
   | {
+      type: 'writeFile';
+      requestId?: unknown;
+      path?: unknown;
+      content?: unknown;
+    }
+  | {
       type: 'disconnect';
     }
   | {
@@ -402,7 +408,7 @@ export function attachSshWebSocketServer(
               return;
             }
 
-            const MAX_BYTES = 65536;
+            const MAX_BYTES = 524288;
             const buffer = await new Promise<Buffer>((resolve, reject) => {
               const chunks: Buffer[] = [];
               let total = 0;
@@ -434,6 +440,78 @@ export function attachSshWebSocketServer(
               type: 'fileError',
               requestId,
               error: err instanceof Error ? err.message : 'Unable to read file.',
+            });
+          }
+        })();
+        return;
+      }
+
+      if (msg.type === 'writeFile') {
+        const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+        const requestedPath = typeof msg.path === 'string' ? msg.path.trim() : '';
+        const content = typeof msg.content === 'string' ? msg.content : null;
+        void (async () => {
+          try {
+            if (!requestedPath) {
+              throw new Error('Missing target file path.');
+            }
+            if (content === null) {
+              throw new Error('Missing file content.');
+            }
+            const buf = Buffer.from(content, 'utf8');
+            if (buf.length > 2 * 1024 * 1024) {
+              throw new Error('File content exceeds 2 MB save limit.');
+            }
+
+            const sftp = await getSftp();
+            let targetPath: string;
+            try {
+              targetPath = await resolveSftpPath(sftp, requestedPath);
+              const existingStats = await new Promise<{ mode: number }>((resolve, reject) => {
+                sftp.stat(targetPath, (err, st) => {
+                  if (err || !st) reject(err || new Error('Stat failed.'));
+                  else resolve({ mode: st.mode });
+                });
+              });
+              if ((existingStats.mode & 0o170000) === 0o040000) {
+                throw new Error('Cannot overwrite a directory.');
+              }
+            } catch (err) {
+              // If target doesn't exist yet, resolve its parent directory to support creating new files
+              if (err instanceof Error && err.message === 'Cannot overwrite a directory.') {
+                throw err;
+              }
+              const baseName = path.posix.basename(requestedPath);
+              const dirPart = path.posix.dirname(requestedPath);
+              if (!baseName || baseName === '.' || baseName === '..') {
+                throw new Error('Invalid file name.');
+              }
+              const resolvedParent = await resolveSftpPath(
+                sftp,
+                dirPart === '.' ? '~' : dirPart
+              );
+              targetPath = path.posix.join(resolvedParent, baseName);
+            }
+
+            await new Promise<void>((resolve, reject) => {
+              sftp.writeFile(targetPath, buf, (err) => {
+                if (err) reject(err);
+                else resolve();
+              });
+            });
+
+            sendJson(ws, {
+              type: 'writeFileResult',
+              requestId,
+              path: targetPath,
+              size: buf.length,
+              savedAt: Date.now(),
+            });
+          } catch (err) {
+            sendJson(ws, {
+              type: 'writeFileError',
+              requestId,
+              error: err instanceof Error ? err.message : 'Unable to save remote file.',
             });
           }
         })();

@@ -4,7 +4,6 @@ import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import {
   AlertCircle,
-  ArrowLeft,
   ArrowUp,
   BookmarkPlus,
   Braces,
@@ -25,9 +24,11 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Maximize2,
   PanelLeftOpen,
   Plug,
   PlugZap,
+  Plus,
   RefreshCw,
   Server,
   Terminal,
@@ -47,6 +48,11 @@ import {
   parseSshCommand,
   saveSshProfile,
 } from '../utils/sshClient';
+import {
+  RemoteCodeEditor,
+  RemoteDirEntry,
+  RemoteFilePreview,
+} from './RemoteCodeEditor';
 
 interface SshTerminalViewProps {
   isActive?: boolean;
@@ -66,23 +72,6 @@ interface SshTerminalViewProps {
 }
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
-
-interface RemoteDirEntry {
-  name: string;
-  path: string;
-  isDirectory: boolean;
-  size: number;
-  modifiedAt: number | null;
-}
-
-interface RemoteFilePreview {
-  path: string;
-  name: string;
-  content: string;
-  size: number;
-  truncated: boolean;
-  isBinary: boolean;
-}
 
 function quotePosixPath(p: string): string {
   return `'${p.replace(/'/g, `'"'"'`)}'`;
@@ -206,6 +195,12 @@ export function SshTerminalView({
   const [dirTruncated, setDirTruncated] = useState(false);
   const [previewFile, setPreviewFile] = useState<RemoteFilePreview | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
+  const [editorFullScreen, setEditorFullScreen] = useState(false);
+  const [savingFile, setSavingFile] = useState(false);
+  const [saveFileError, setSaveFileError] = useState<string | null>(null);
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
+  const [creatingDirFile, setCreatingDirFile] = useState(false);
+  const [newDirFileName, setNewDirFileName] = useState('');
 
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -217,6 +212,15 @@ export function SshTerminalView({
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const dirReqIdRef = useRef<string>('');
   const fileReqIdRef = useRef<string>('');
+  const writeReqIdRef = useRef<string>('');
+  const openFullScreenOnLoadRef = useRef<boolean>(false);
+  const pendingSaveDraftRef = useRef<{
+    path: string;
+    content: string;
+    isNewFile?: boolean;
+  } | null>(null);
+  const currentRemotePathRef = useRef<string>('');
+  currentRemotePathRef.current = currentRemotePath;
   const selectedProfileIdRef = useRef<string | null>(null);
   selectedProfileIdRef.current = selectedProfileId;
   const profilesRef = useRef<SshProfile[]>(profiles);
@@ -555,41 +559,91 @@ export function SshTerminalView({
     setPathInput('');
     setDirEntries([]);
     setPreviewFile(null);
+    setEditorFullScreen(false);
+    setSavingFile(false);
+    setSaveFileError(null);
+    setLastSavedAt(null);
+    setCreatingDirFile(false);
+    setNewDirFileName('');
+    pendingSaveDraftRef.current = null;
+    openFullScreenOnLoadRef.current = false;
     setDirError(null);
   };
 
-  const requestListDir = useCallback((targetPath?: string) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const reqId = `dir-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    dirReqIdRef.current = reqId;
-    setDirLoading(true);
-    setDirError(null);
-    setPreviewFile(null);
-    ws.send(
-      JSON.stringify({
-        type: 'listDir',
-        requestId: reqId,
-        path: targetPath ?? '',
-      })
-    );
-  }, []);
+  const requestListDir = useCallback(
+    (targetPath?: string, options?: { keepPreview?: boolean }) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const reqId = `dir-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      dirReqIdRef.current = reqId;
+      setDirLoading(true);
+      setDirError(null);
+      if (!options?.keepPreview) {
+        setPreviewFile(null);
+        setEditorFullScreen(false);
+      }
+      ws.send(
+        JSON.stringify({
+          type: 'listDir',
+          requestId: reqId,
+          path: targetPath ?? '',
+        })
+      );
+    },
+    []
+  );
 
-  const requestReadFile = useCallback((filePath: string) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const reqId = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    fileReqIdRef.current = reqId;
-    setFileLoading(true);
-    setDirError(null);
-    ws.send(
-      JSON.stringify({
-        type: 'readFile',
-        requestId: reqId,
-        path: filePath,
-      })
-    );
-  }, []);
+  const requestReadFile = useCallback(
+    (filePath: string, options?: { openFullScreen?: boolean }) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const reqId = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      fileReqIdRef.current = reqId;
+      openFullScreenOnLoadRef.current = Boolean(options?.openFullScreen);
+      setFileLoading(true);
+      setDirError(null);
+      setSaveFileError(null);
+      ws.send(
+        JSON.stringify({
+          type: 'readFile',
+          requestId: reqId,
+          path: filePath,
+        })
+      );
+    },
+    []
+  );
+
+  const requestWriteFile = useCallback(
+    (filePath: string, nextContent: string, isNewFile = false) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setSaveFileError('SSH is not connected.');
+        return;
+      }
+      const reqId = `write-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      writeReqIdRef.current = reqId;
+      pendingSaveDraftRef.current = { path: filePath, content: nextContent, isNewFile };
+      setSavingFile(true);
+      setSaveFileError(null);
+      ws.send(
+        JSON.stringify({
+          type: 'writeFile',
+          requestId: reqId,
+          path: filePath,
+          content: nextContent,
+        })
+      );
+    },
+    []
+  );
+
+  const handleCreateNewRemoteFile = useCallback(
+    (fullPath: string) => {
+      requestWriteFile(fullPath, '', true);
+    },
+    [requestWriteFile]
+  );
 
   const handleToggleDirBrowser = () => {
     if (status !== 'connected') return;
@@ -641,6 +695,14 @@ export function SshTerminalView({
     setPathInput('');
     setDirEntries([]);
     setPreviewFile(null);
+    setEditorFullScreen(false);
+    setSavingFile(false);
+    setSaveFileError(null);
+    setLastSavedAt(null);
+    setCreatingDirFile(false);
+    setNewDirFileName('');
+    pendingSaveDraftRef.current = null;
+    openFullScreenOnLoadRef.current = false;
     setDirError(null);
 
     const term = termRef.current;
@@ -695,6 +757,7 @@ export function SshTerminalView({
         content?: string;
         size?: number;
         isBinary?: boolean;
+        savedAt?: number;
       };
       try {
         msg = JSON.parse(String(event.data));
@@ -728,6 +791,8 @@ export function SshTerminalView({
       if (msg.type === 'fileContent') {
         if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
         setFileLoading(false);
+        setSaveFileError(null);
+        setLastSavedAt(null);
         setPreviewFile({
           path: msg.path || '',
           name: msg.name || 'file',
@@ -736,13 +801,58 @@ export function SshTerminalView({
           truncated: Boolean(msg.truncated),
           isBinary: Boolean(msg.isBinary),
         });
+        if (openFullScreenOnLoadRef.current) {
+          openFullScreenOnLoadRef.current = false;
+          setEditorFullScreen(true);
+        }
         return;
       }
 
       if (msg.type === 'fileError') {
         if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
+        openFullScreenOnLoadRef.current = false;
         setFileLoading(false);
         setDirError(msg.error || 'Unable to read remote file.');
+        return;
+      }
+
+      if (msg.type === 'writeFileResult') {
+        if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
+        setSavingFile(false);
+        setSaveFileError(null);
+        const pending = pendingSaveDraftRef.current;
+        pendingSaveDraftRef.current = null;
+        const savedPath = msg.path || pending?.path || '';
+        const savedContent = pending?.content ?? '';
+        const savedSize = Number(msg.size ?? new Blob([savedContent]).size);
+        setLastSavedAt(Number(msg.savedAt || Date.now()));
+
+        const fileName = savedPath.split('/').pop() || 'file';
+        setPreviewFile((prev) => {
+          if (pending?.isNewFile || !prev || prev.path === savedPath) {
+            return {
+              path: savedPath,
+              name: fileName,
+              content: savedContent,
+              size: savedSize,
+              truncated: false,
+              isBinary: false,
+            };
+          }
+          return prev;
+        });
+
+        if (currentRemotePathRef.current) {
+          requestListDir(currentRemotePathRef.current, { keepPreview: true });
+        }
+        return;
+      }
+
+      if (msg.type === 'writeFileError') {
+        if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
+        setSavingFile(false);
+        pendingSaveDraftRef.current = null;
+        setSaveFileError(msg.error || 'Unable to save remote file.');
         return;
       }
 
@@ -780,6 +890,8 @@ export function SshTerminalView({
         } else if (msg.status === 'disconnected') {
           setConnectedTarget(null);
           setDirBrowserOpen(false);
+          setEditorFullScreen(false);
+          setPreviewFile(null);
           if (msg.message) {
             termRef.current?.writeln(`\r\n\x1b[90m[${msg.message}]\x1b[0m`);
           }
@@ -912,12 +1024,13 @@ export function SshTerminalView({
     sendRawInput(`cd ${quotePosixPath(dirPath.trim())} && ls -la\n`);
   };
 
-  const handleSaveRemoteFileToNote = (file: RemoteFilePreview) => {
+  const handleSaveRemoteFileToNote = (file: RemoteFilePreview, contentOverride?: string) => {
+    const bodyContent = contentOverride !== undefined ? contentOverride : file.content;
     const ext = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() || '' : '';
     const lang = /^[a-z0-9]+$/i.test(ext) ? ext : '';
-    const content = `## ${file.name}\n\n- **Path**: \`${file.path}\`\n- **Size**: ${formatBytes(file.size)}${
-      file.truncated ? ' (first 64 KB)' : ''
-    }\n\n\`\`\`${lang}\n${file.content}\n\`\`\`\n`;
+    const content = `## ${file.name}\n\n- **Path**: \`${file.path}\`\n- **Size**: ${formatBytes(
+      new Blob([bodyContent]).size
+    )}${file.truncated && contentOverride === undefined ? ' (first 512 KB)' : ''}\n\n\`\`\`${lang}\n${bodyContent}\n\`\`\`\n`;
     onSaveTranscriptToNote(`${file.name} (${file.path})`, content, {
       folderId: targetFolderId || null,
       openAiAfterSave: false,
@@ -1684,7 +1797,18 @@ export function SshTerminalView({
                   <div className="flex items-center gap-1 shrink-0">
                     <button
                       type="button"
-                      onClick={() => requestListDir(currentRemotePath || '')}
+                      onClick={() => setCreatingDirFile((p) => !p)}
+                      disabled={!currentRemotePath || dirLoading}
+                      title="New file in current directory"
+                      className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        requestListDir(currentRemotePath || '', { keepPreview: Boolean(previewFile) })
+                      }
                       disabled={dirLoading}
                       title="Refresh directory"
                       className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
@@ -1693,7 +1817,10 @@ export function SshTerminalView({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setDirBrowserOpen(false)}
+                      onClick={() => {
+                        setEditorFullScreen(false);
+                        setDirBrowserOpen(false);
+                      }}
                       title="Close directory browser"
                       className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
                     >
@@ -1771,6 +1898,46 @@ export function SshTerminalView({
                   )}
                 </form>
 
+                {creatingDirFile && currentRemotePath && !previewFile && (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const clean = newDirFileName.trim().replace(/^\/+/, '');
+                      if (!clean) return;
+                      const fullPath = `${currentRemotePath.replace(/\/+$/, '')}/${clean}`;
+                      setCreatingDirFile(false);
+                      setNewDirFileName('');
+                      handleCreateNewRemoteFile(fullPath);
+                    }}
+                    className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1.5 bg-[#111115]"
+                  >
+                    <input
+                      type="text"
+                      autoFocus
+                      value={newDirFileName}
+                      onChange={(e) => setNewDirFileName(e.target.value)}
+                      placeholder="new-file.ts"
+                      className="font-mono-code flex-1 min-w-0 px-2 py-1 text-[12px] rounded border border-white/15 bg-[#0c0c10] text-white placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer"
+                    >
+                      Create
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCreatingDirFile(false);
+                        setNewDirFileName('');
+                      }}
+                      className="p-1 text-neutral-400 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </form>
+                )}
+
                 {dirError && (
                   <div className="m-2.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-[11.5px] text-red-300 flex items-start gap-2">
                     <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
@@ -1778,64 +1945,31 @@ export function SshTerminalView({
                   </div>
                 )}
 
-                {/* File Preview OR Directory Entries */}
+                {/* Remote Source Code Editor (Inline or Full-Screen) OR Directory Entries */}
                 {previewFile ? (
-                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-                    <div className="shrink-0 px-2.5 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2 bg-[#111115]">
-                      <button
-                        type="button"
-                        onClick={() => setPreviewFile(null)}
-                        className="inline-flex items-center gap-1 text-[11.5px] font-medium text-neutral-300 hover:text-white cursor-pointer whitespace-nowrap"
-                      >
-                        <ArrowLeft className="w-3.5 h-3.5" />
-                        <span>Back</span>
-                      </button>
-                      <span className="font-mono-code text-[11.5px] text-neutral-200 truncate">
-                        {previewFile.name}
-                      </span>
-                      <div className="flex items-center gap-1 shrink-0">
-                        {!previewFile.isBinary && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => void copyTextToClipboard(previewFile.content)}
-                              title="Copy file content"
-                              className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-                            >
-                              <Copy className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleSaveRemoteFileToNote(previewFile)}
-                              title="Save file to NoteCraft note"
-                              className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-                            >
-                              <FilePlus2 className="w-3.5 h-3.5" />
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="flex-1 min-h-0 overflow-auto p-2.5 bg-[#0c0c0f]">
-                      {previewFile.isBinary ? (
-                        <p className="text-[12px] text-neutral-400 p-2">
-                          Binary file ({formatBytes(previewFile.size)}). Preview unavailable.
-                        </p>
-                      ) : (
-                        <>
-                          {previewFile.truncated && (
-                            <p className="text-[11px] text-amber-300 mb-2">
-                              Showing first 64 KB of {formatBytes(previewFile.size)}.
-                            </p>
-                          )}
-                          <pre className="font-mono-code text-[11.5px] leading-relaxed text-neutral-200 whitespace-pre-wrap break-all">
-                            {previewFile.content}
-                          </pre>
-                        </>
-                      )}
-                    </div>
-                  </div>
+                  <RemoteCodeEditor
+                    file={previewFile}
+                    fullScreen={editorFullScreen}
+                    saving={savingFile}
+                    saveError={saveFileError}
+                    lastSavedAt={lastSavedAt}
+                    currentRemotePath={currentRemotePath}
+                    dirEntries={dirEntries}
+                    dirLoading={dirLoading}
+                    onToggleFullScreen={setEditorFullScreen}
+                    onCloseFile={() => {
+                      setEditorFullScreen(false);
+                      setPreviewFile(null);
+                      setSaveFileError(null);
+                    }}
+                    onSaveFile={(filePath, nextContent) => requestWriteFile(filePath, nextContent)}
+                    onReloadFile={(filePath) => requestReadFile(filePath)}
+                    onNavigateDir={(dirPath) => requestListDir(dirPath, { keepPreview: true })}
+                    onOpenFile={(filePath) => requestReadFile(filePath)}
+                    onCreateNewFile={handleCreateNewRemoteFile}
+                    onCopyText={copyTextToClipboard}
+                    onSaveToNote={handleSaveRemoteFileToNote}
+                  />
                 ) : (
                   <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-0.5">
                     {(dirLoading || fileLoading) && (
@@ -1887,9 +2021,19 @@ export function SshTerminalView({
                             cd
                           </button>
                         ) : (
-                          <span className="text-[10.5px] font-mono-code text-neutral-500 tabular-nums shrink-0">
-                            {formatBytes(entry.size)}
-                          </span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => requestReadFile(entry.path, { openFullScreen: true })}
+                              title="Open in Full Screen Code Editor"
+                              className="opacity-0 group-hover:opacity-100 p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 transition-opacity cursor-pointer"
+                            >
+                              <Maximize2 className="w-3 h-3" />
+                            </button>
+                            <span className="text-[10.5px] font-mono-code text-neutral-500 tabular-nums">
+                              {formatBytes(entry.size)}
+                            </span>
+                          </div>
                         )}
                       </div>
                     ))}
