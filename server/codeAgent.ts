@@ -913,3 +913,63 @@ export async function runCodeAgent(input: CodeAgentInput): Promise<CodeAgentResu
 
   return runWithGroq(input, requested);
 }
+
+export async function generateGitCommitMessage(input: {
+  diffText: string;
+  changedFiles?: string[];
+  branch?: string;
+}): Promise<{ message: string; provider: 'gemini' | 'groq' }> {
+  const diffText = (input.diffText || '').slice(0, 18000).trim();
+  const filesList = (input.changedFiles || []).slice(0, 30).join('\n');
+  const userContent = [
+    input.branch ? `Branch: ${input.branch}` : '',
+    filesList ? `Changed files:\n${filesList}` : '',
+    diffText ? `Git diff:\n${diffText}` : 'No diff snippet available; infer from file names.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const systemInstruction =
+    'Write a single concise Git commit message (imperative mood, <= 72 chars on the first line, conventional prefix like feat:, fix:, refactor:, chore:, docs: when appropriate). Output ONLY the commit message text with no markdown quotes or code fences.';
+
+  const geminiKey = getConfiguredGeminiApiKey();
+  const groqKey = getConfiguredGroqApiKey();
+
+  if (geminiKey) {
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: geminiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
+      const response = await ai.models.generateContent({
+        model: GEMINI_CODE_AGENT_MODEL,
+        contents: [{ role: 'user', parts: [{ text: userContent }] }],
+        config: { systemInstruction },
+      });
+      const text = (response.text || '').replace(/^```[\s\S]*?\n|```$/g, '').trim();
+      if (text) {
+        return { message: text.replace(/^["']|["']$/g, '').trim(), provider: 'gemini' };
+      }
+    } catch {
+      // Fall through to Groq if configured
+    }
+  }
+
+  if (groqKey && groqKey !== 'MY_GROQ_API_KEY') {
+    const raw = await callGroqChat(
+      groqKey,
+      getDefaultGroqModel(),
+      [
+        { role: 'system', content: systemInstruction },
+        { role: 'user', content: userContent },
+      ],
+      false
+    );
+    const cleaned = raw.replace(/^```[\s\S]*?\n|```$/g, '').replace(/^["']|["']$/g, '').trim();
+    if (cleaned) {
+      return { message: cleaned, provider: 'groq' };
+    }
+  }
+
+  throw new CodeAgentError('AI commit message generation is unavailable right now.', 503);
+}

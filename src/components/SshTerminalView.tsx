@@ -19,6 +19,7 @@ import {
   FilePlus2,
   FolderOpen,
   FolderTree,
+  GitBranch,
   Home,
   KeyRound,
   Loader2,
@@ -47,6 +48,12 @@ import {
   parseSshCommand,
   saveSshProfile,
 } from '../utils/sshClient';
+import {
+  getGitBadgeMeta,
+  GitCommandAction,
+  GitCommandRunner,
+  GitStatusSnapshot,
+} from '../utils/gitClient';
 import { ProjectTreeView } from './ProjectTreeView';
 import {
   RemoteCodeEditor,
@@ -163,8 +170,8 @@ export function SshTerminalView({
   const [commandInput, setCommandInput] = useState('');
   const [label, setLabel] = useState('');
   const [host, setHost] = useState('');
-  const [port, setPort] = useState<string>('22');
-  const [username, setUsername] = useState('root');
+  const [port, setPort] = useState<string>('');
+  const [username, setUsername] = useState('');
   const [authType, setAuthType] = useState<SshAuthType>('password');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -202,6 +209,18 @@ export function SshTerminalView({
   const [saveFileError, setSaveFileError] = useState<string | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [creatingInDir, setCreatingInDir] = useState<string | null>(null);
+  const [openDirPromptOpen, setOpenDirPromptOpen] = useState(false);
+  const [openDirPromptInput, setOpenDirPromptInput] = useState('~');
+  const [openDirPromptBusy, setOpenDirPromptBusy] = useState(false);
+  const [openDirPromptError, setOpenDirPromptError] = useState<string | null>(null);
+  const [homeQuickDirs, setHomeQuickDirs] = useState<RemoteDirEntry[]>([]);
+  const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
+  const [gitLoading, setGitLoading] = useState(false);
+  const [gitError, setGitError] = useState<string | null>(null);
+  const [requestedIdeTab, setRequestedIdeTab] = useState<{
+    tab: 'explorer' | 'git';
+    seq: number;
+  } | null>(null);
   const [dirDrawerWidth, setDirDrawerWidth] = useState<number>(() => {
     try {
       const saved = Number(window.localStorage.getItem('notecraft.ssh.dirDrawerWidth.v1'));
@@ -268,12 +287,24 @@ export function SshTerminalView({
       }
     >
   >(new Map());
+  const pendingAsyncGitReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: Record<string, unknown>) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
   const dirCacheRef = useRef<Record<string, RemoteDirEntry[]>>(dirCache);
   dirCacheRef.current = dirCache;
   const expandedDirsRef = useRef<Record<string, boolean>>(expandedDirs);
   expandedDirsRef.current = expandedDirs;
   const dirBrowserOpenRef = useRef<boolean>(dirBrowserOpen);
   dirBrowserOpenRef.current = dirBrowserOpen;
+  const statusRef = useRef<ConnectionStatus>(status);
+  statusRef.current = status;
   const fileReqIdRef = useRef<string>('');
   const writeReqIdRef = useRef<string>('');
   const openFullScreenOnLoadRef = useRef<boolean>(false);
@@ -627,6 +658,8 @@ export function SshTerminalView({
     const portNum = Number(nextPort) || 22;
     if (nextHost.trim()) {
       setCommandInput(formatSshCommand({ username: nextUser, host: nextHost, port: portNum }));
+    } else {
+      setCommandInput('');
     }
   };
 
@@ -655,6 +688,27 @@ export function SshTerminalView({
       pending.reject(err);
     });
     pendingAsyncMkdirReqsRef.current.clear();
+
+    pendingAsyncGitReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncGitReqsRef.current.clear();
+  }, []);
+
+  const clearConnectionFields = useCallback(() => {
+    setSelectedProfileId(null);
+    setCommandInput('');
+    setLabel('');
+    setHost('');
+    setPort('');
+    setUsername('');
+    setAuthType('password');
+    setPassword('');
+    setShowPassword(false);
+    setPrivateKey('');
+    setPassphrase('');
+    setQuickCommand('');
   }, []);
 
   const closeSocket = useCallback(
@@ -677,10 +731,14 @@ export function SshTerminalView({
 
   const handleDisconnect = () => {
     closeSocket(true);
+    clearConnectionFields();
     setStatus('disconnected');
     setStatusMessage('Disconnected');
     setConnectedTarget(null);
     setDirBrowserOpen(false);
+    setOpenDirPromptOpen(false);
+    setOpenDirPromptError(null);
+    setHomeQuickDirs([]);
     setCurrentRemotePath('');
     setPathInput('');
     setDirCache({});
@@ -694,6 +752,9 @@ export function SshTerminalView({
     setSaveFileError(null);
     setLastSavedAt(null);
     setCreatingInDir(null);
+    setGitStatus(null);
+    setGitLoading(false);
+    setGitError(null);
     pendingSaveDraftRef.current = null;
     openFullScreenOnLoadRef.current = false;
     setDirError(null);
@@ -834,6 +895,64 @@ export function SshTerminalView({
       );
     });
   }, []);
+
+  const runGitCommandAsync = useCallback<GitCommandRunner>(
+    (action: GitCommandAction, payload?: Record<string, unknown>, cwd?: string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('SSH is not connected.'));
+      }
+      const reqId = `git-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const targetCwd = cwd || currentRemotePathRef.current || '~';
+      return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          pendingAsyncGitReqsRef.current.delete(reqId);
+          reject(new Error(`Timed out running git ${action}.`));
+        }, 45000);
+        pendingAsyncGitReqsRef.current.set(reqId, { resolve, reject, timer });
+        ws.send(
+          JSON.stringify({
+            type: 'gitCommand',
+            requestId: reqId,
+            cwd: targetCwd,
+            action,
+            payload: payload || {},
+          })
+        );
+      });
+    },
+    []
+  );
+
+  const refreshGitStatus = useCallback(
+    async (cwdOverride?: string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const targetCwd = cwdOverride || currentRemotePathRef.current;
+      if (!targetCwd) return;
+      setGitLoading(true);
+      setGitError(null);
+      try {
+        const snapshot = (await runGitCommandAsync(
+          'status',
+          {},
+          targetCwd
+        )) as unknown as GitStatusSnapshot;
+        setGitStatus(snapshot);
+      } catch (err) {
+        setGitError(err instanceof Error ? err.message : 'Unable to check Git status.');
+      } finally {
+        setGitLoading(false);
+      }
+    },
+    [runGitCommandAsync]
+  );
+
+  useEffect(() => {
+    if (status === 'connected' && currentRemotePath) {
+      void refreshGitStatus(currentRemotePath);
+    }
+  }, [status, currentRemotePath, refreshGitStatus]);
 
   const handleToggleTreeDir = useCallback(
     (dirPath: string) => {
@@ -1076,6 +1195,7 @@ export function SshTerminalView({
         size?: number;
         isBinary?: boolean;
         savedAt?: number;
+        action?: string;
       };
       try {
         msg = JSON.parse(String(event.data));
@@ -1340,6 +1460,32 @@ export function SshTerminalView({
         return;
       }
 
+      if (msg.type === 'gitResult') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncGitReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncGitReqsRef.current.delete(msg.requestId);
+          const resultData =
+            (msg as unknown as { data?: Record<string, unknown> }).data ?? {};
+          asyncPending.resolve(resultData);
+        }
+        return;
+      }
+
+      if (msg.type === 'gitError') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncGitReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncGitReqsRef.current.delete(msg.requestId);
+          asyncPending.reject(new Error(msg.error || 'Git command failed.'));
+        }
+        return;
+      }
+
       if (msg.type === 'status' && msg.status) {
         setStatus(msg.status);
         if (msg.message) setStatusMessage(msg.message);
@@ -1349,7 +1495,19 @@ export function SshTerminalView({
             msg.port || targetPort
           }`;
           setConnectedTarget(targetLabel);
-          termRef.current?.focus();
+          setOpenDirPromptError(null);
+          setOpenDirPromptInput('~');
+          setHomeQuickDirs([]);
+          setOpenDirPromptOpen(true);
+
+          void listRemoteDirAsync('~')
+            .then(({ path: homePath, entries }) => {
+              setOpenDirPromptInput((cur) => (!cur || cur === '~' ? homePath : cur));
+              setHomeQuickDirs(entries.filter((entry) => entry.isDirectory).slice(0, 8));
+            })
+            .catch(() => {
+              // ignore pre-fetch error; user can type any directory
+            });
 
           // Update lastConnectedAt if a saved profile is active
           const activeId = selectedProfileIdRef.current;
@@ -1369,15 +1527,20 @@ export function SshTerminalView({
         } else if (msg.status === 'error') {
           rejectPendingAsyncRequests(msg.message || 'SSH connection error.');
           setConnectedTarget(null);
+          setOpenDirPromptOpen(false);
           if (msg.message) {
             termRef.current?.writeln(`\x1b[31m✖ ${msg.message}\x1b[0m`);
           }
         } else if (msg.status === 'disconnected') {
           rejectPendingAsyncRequests(msg.message || 'SSH disconnected.');
+          clearConnectionFields();
           setConnectedTarget(null);
           setDirBrowserOpen(false);
+          setOpenDirPromptOpen(false);
           setEditorFullScreen(false);
           setPreviewFile(null);
+          setGitStatus(null);
+          setGitError(null);
           if (msg.message) {
             termRef.current?.writeln(`\r\n\x1b[90m[${msg.message}]\x1b[0m`);
           }
@@ -1395,8 +1558,18 @@ export function SshTerminalView({
 
     ws.onclose = () => {
       if (wsRef.current !== ws) return;
+      const wasConnected = statusRef.current === 'connected';
       rejectPendingAsyncRequests('WebSocket connection closed.');
       wsRef.current = null;
+      if (wasConnected) {
+        clearConnectionFields();
+        setOpenDirPromptOpen(false);
+        setDirBrowserOpen(false);
+        setEditorFullScreen(false);
+        setPreviewFile(null);
+        setGitStatus(null);
+        setGitError(null);
+      }
       setStatus((prev) => (prev === 'error' ? 'error' : 'disconnected'));
       setConnectedTarget(null);
     };
@@ -1512,6 +1685,35 @@ export function SshTerminalView({
     sendRawInput(`cd ${quotePosixPath(dirPath.trim())} && ls -la\n`);
   };
 
+  const handleConfirmInitialDirectory = async (
+    targetDir: string,
+    options?: { openFullScreen?: boolean }
+  ) => {
+    const requested = targetDir.trim() || '~';
+    setOpenDirPromptBusy(true);
+    setOpenDirPromptError(null);
+    try {
+      const { path: resolvedPath, entries, truncated } = await listRemoteDirAsync(requested);
+      setCurrentRemotePath(resolvedPath);
+      setPathInput(resolvedPath);
+      setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
+      setTruncatedDirs((prev) => ({ ...prev, [resolvedPath]: truncated }));
+      setDirBrowserOpen(true);
+      setOpenDirPromptOpen(false);
+      if (options?.openFullScreen) {
+        setEditorFullScreen(true);
+      }
+      sendRawInput(`cd ${quotePosixPath(resolvedPath)} && pwd\n`);
+      void refreshGitStatus(resolvedPath);
+    } catch (err) {
+      setOpenDirPromptError(
+        err instanceof Error ? err.message : `Unable to open directory: ${requested}`
+      );
+    } finally {
+      setOpenDirPromptBusy(false);
+    }
+  };
+
   const handleSaveRemoteFileToNote = (file: RemoteFilePreview, contentOverride?: string) => {
     const bodyContent = contentOverride !== undefined ? contentOverride : file.content;
     const ext = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() || '' : '';
@@ -1564,6 +1766,18 @@ export function SshTerminalView({
       ),
     [snippets]
   );
+
+  const gitTreeStatuses = useMemo(() => {
+    const map: Record<string, { letter: string; title: string; className: string }> = {};
+    if (!gitStatus?.isRepo) return map;
+    for (const change of gitStatus.changes) {
+      map[change.fullPath] = getGitBadgeMeta(
+        change,
+        change.staged && !change.unstaged ? 'staged' : 'unstaged'
+      );
+    }
+    return map;
+  }, [gitStatus]);
 
   const isConnected = status === 'connected';
   const isConnecting = status === 'connecting';
@@ -1768,7 +1982,8 @@ export function SshTerminalView({
                       setPort(e.target.value);
                       syncCommandPreview(username, host, e.target.value);
                     }}
-                    className="w-full px-2.5 py-1.5 text-[13px] tabular-nums rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#0e0e11] text-neutral-950 dark:text-white focus:outline-none focus:border-blue-500"
+                    placeholder="22"
+                    className="w-full px-2.5 py-1.5 text-[13px] tabular-nums rounded-lg border border-neutral-300 dark:border-white/12 bg-white dark:bg-[#0e0e11] text-neutral-950 dark:text-white placeholder:text-neutral-400 focus:outline-none focus:border-blue-500"
                   />
                 </div>
               </div>
@@ -2202,6 +2417,142 @@ export function SshTerminalView({
             >
               <div ref={terminalContainerRef} className="w-full h-full" />
 
+              {/* Initial Remote Directory Prompt on First Connect */}
+              {isConnected && openDirPromptOpen && (
+                <div className="absolute inset-0 z-30 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+                  <div className="w-full max-w-lg rounded-2xl border border-white/12 bg-[#14141b] shadow-2xl p-5 space-y-4 text-neutral-100">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-9 h-9 rounded-xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center shrink-0">
+                          <FolderOpen className="w-4.5 h-4.5 text-blue-400" />
+                        </div>
+                        <div>
+                          <h2 className="text-[15px] font-semibold text-white">
+                            Open Remote Directory
+                          </h2>
+                          <p className="text-[12px] text-neutral-400">
+                            Connected to{' '}
+                            <span className="font-mono-code text-neutral-200">
+                              {connectedTarget}
+                            </span>
+                            . Choose your project directory to start the terminal there.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void handleConfirmInitialDirectory(openDirPromptInput);
+                      }}
+                      className="space-y-3"
+                    >
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[11.5px] text-neutral-400">
+                          <span>Remote project path</span>
+                          <span className="font-mono-code text-[10.5px] text-neutral-500">
+                            Press Tab to autocomplete folders
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <RemotePathInput
+                            value={openDirPromptInput}
+                            onChange={setOpenDirPromptInput}
+                            onSyncDirectory={(dirPath) => {
+                              setOpenDirPromptInput(dirPath);
+                            }}
+                            dirCache={dirCache}
+                            fetchDirEntries={listRemoteDirAsync}
+                            currentRemotePath={currentRemotePath || '~'}
+                            placeholder="/home/user/project"
+                            ariaLabel="Initial remote directory path"
+                            inputClassName="font-mono-code w-full min-w-0 px-3 py-2 text-[13px] rounded-lg border border-white/15 bg-[#0c0c10] text-white placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
+                          />
+                        </div>
+                      </div>
+
+                      {homeQuickDirs.length > 0 && (
+                        <div className="space-y-1.5">
+                          <span className="block text-[11px] text-neutral-500">
+                            Quick folders in home:
+                          </span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {homeQuickDirs.map((entry) => (
+                              <button
+                                key={entry.path}
+                                type="button"
+                                onClick={() => setOpenDirPromptInput(entry.path)}
+                                onDoubleClick={() =>
+                                  void handleConfirmInitialDirectory(entry.path)
+                                }
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md border text-[11.5px] font-mono-code transition-colors cursor-pointer ${
+                                  openDirPromptInput === entry.path
+                                    ? 'border-blue-500/60 bg-blue-500/20 text-blue-200'
+                                    : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.09] text-neutral-200'
+                                }`}
+                              >
+                                <FolderOpen className="w-3 h-3 text-blue-400" />
+                                <span>{entry.name}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {openDirPromptError && (
+                        <div className="rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-2 text-[12px] text-red-300 flex items-start gap-2">
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                          <span>{openDirPromptError}</span>
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenDirPromptOpen(false);
+                            termRef.current?.focus();
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg text-[12px] text-neutral-400 hover:text-white cursor-pointer"
+                        >
+                          Skip (stay in ~)
+                        </button>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={openDirPromptBusy}
+                            onClick={() =>
+                              void handleConfirmInitialDirectory(openDirPromptInput, {
+                                openFullScreen: true,
+                              })
+                            }
+                            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-white/15 bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-45 text-[12px] font-medium text-neutral-100 cursor-pointer"
+                          >
+                            <Maximize2 className="w-3.5 h-3.5 text-blue-400" />
+                            <span>Open Full Screen</span>
+                          </button>
+
+                          <button
+                            type="submit"
+                            disabled={openDirPromptBusy}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-[12.5px] font-medium cursor-pointer"
+                          >
+                            {openDirPromptBusy ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Terminal className="w-3.5 h-3.5" />
+                            )}
+                            <span>Open & Start Terminal</span>
+                          </button>
+                        </div>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
+
               {contextMenu && (
                 <div
                   ref={contextMenuRef}
@@ -2346,7 +2697,28 @@ export function SshTerminalView({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setEditorFullScreen(true)}
+                      onClick={() => {
+                        setRequestedIdeTab({ tab: 'git', seq: Date.now() });
+                        setEditorFullScreen(true);
+                        void refreshGitStatus();
+                      }}
+                      disabled={!currentRemotePath}
+                      title="Open Source Control (Git) in Full Screen"
+                      className="inline-flex items-center gap-1 px-1.5 py-1 rounded text-neutral-200 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer text-[11px] font-medium"
+                    >
+                      <GitBranch className="w-3.5 h-3.5 text-blue-400" />
+                      {gitStatus?.isRepo && gitStatus.changes.length > 0 && (
+                        <span className="px-1 rounded-full bg-blue-600/40 text-blue-200 text-[10px] tabular-nums">
+                          {gitStatus.changes.length}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRequestedIdeTab({ tab: 'explorer', seq: Date.now() });
+                        setEditorFullScreen(true);
+                      }}
                       disabled={!currentRemotePath}
                       title="Open project explorer & editor in Full Screen"
                       className="p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 disabled:opacity-35 cursor-pointer"
@@ -2494,6 +2866,12 @@ export function SshTerminalView({
                     onReadRemoteFile={readRemoteFileAsync}
                     onWriteRemoteFile={writeRemoteFileAsync}
                     onCreateRemoteDir={createRemoteDirAsync}
+                    gitStatus={gitStatus}
+                    gitLoading={gitLoading}
+                    gitError={gitError}
+                    onRefreshGit={() => refreshGitStatus()}
+                    onRunGit={runGitCommandAsync}
+                    requestedSidebarTab={requestedIdeTab}
                     onCopyText={copyTextToClipboard}
                     onSaveToNote={handleSaveRemoteFileToNote}
                   />
@@ -2513,6 +2891,7 @@ export function SshTerminalView({
                       loadingDirs={loadingDirs}
                       truncatedDirs={truncatedDirs}
                       selectedFilePath={null}
+                      gitFileStatuses={gitTreeStatuses}
                       creatingInDir={creatingInDir}
                       onToggleDir={handleToggleTreeDir}
                       onSelectFile={(filePath) => requestReadFile(filePath)}

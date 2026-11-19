@@ -56,11 +56,33 @@ type ClientMessage =
       path?: unknown;
     }
   | {
+      type: 'gitCommand';
+      requestId?: unknown;
+      cwd?: unknown;
+      action?: unknown;
+      payload?: unknown;
+    }
+  | {
       type: 'disconnect';
     }
   | {
       type: 'ping';
     };
+
+function quoteShellArg(arg: string): string {
+  return `'${arg.replace(/'/g, `'"'"'`)}'`;
+}
+
+function isSafeRepoRelativePath(p: string): boolean {
+  if (!p || p.includes('\0')) return false;
+  if (p.startsWith('/')) return false;
+  const parts = p.split('/');
+  return !parts.some((seg) => seg === '..');
+}
+
+function sanitizeBranchName(name: string): string {
+  return name.trim().replace(/[\s\0~^:?*[\\]+/g, '-');
+}
 
 function sendJson(ws: WebSocket, payload: Record<string, unknown>) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -622,6 +644,497 @@ export function attachSshWebSocketServer(
               type: 'createDirError',
               requestId,
               error: err instanceof Error ? err.message : 'Unable to create directory.',
+            });
+          }
+        })();
+        return;
+      }
+
+      if (msg.type === 'gitCommand') {
+        const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+        const rawCwd = typeof msg.cwd === 'string' ? msg.cwd.trim() : '';
+        const action = typeof msg.action === 'string' ? msg.action.trim() : '';
+        const payload =
+          msg.payload && typeof msg.payload === 'object'
+            ? (msg.payload as Record<string, unknown>)
+            : {};
+
+        const execOnSsh = (
+          cmd: string,
+          timeoutMs = 20000
+        ): Promise<{ stdout: string; stderr: string; code: number }> =>
+          new Promise((resolve, reject) => {
+            if (!sshClient) {
+              reject(new Error('SSH is not connected.'));
+              return;
+            }
+            sshClient.exec(cmd, (err, stream) => {
+              if (err || !stream) {
+                reject(err || new Error('Failed to execute remote git command.'));
+                return;
+              }
+              let stdout = '';
+              let stderr = '';
+              let settled = false;
+              const MAX_OUTPUT = 1024 * 1024;
+              const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                try {
+                  stream.close();
+                } catch {
+                  // ignore
+                }
+                reject(new Error('Git command timed out.'));
+              }, timeoutMs);
+
+              stream.on('data', (chunk: Buffer) => {
+                if (stdout.length < MAX_OUTPUT) {
+                  stdout += chunk.toString('utf8');
+                }
+              });
+              stream.stderr?.on('data', (chunk: Buffer) => {
+                if (stderr.length < MAX_OUTPUT) {
+                  stderr += chunk.toString('utf8');
+                }
+              });
+              stream.on('close', (code: number | null) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
+              });
+              stream.on('error', (streamErr: Error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(streamErr);
+              });
+            });
+          });
+
+        void (async () => {
+          try {
+            if (!sshClient) {
+              throw new Error('SSH is not connected.');
+            }
+            const sftp = await getSftp();
+            const cwd = await resolveSftpPath(sftp, rawCwd || '~');
+            const qCwd = quoteShellArg(cwd);
+
+            if (action === 'status') {
+              const script = [
+                `cd ${qCwd} || exit 1`,
+                `if ! command -v git >/dev/null 2>&1; then echo "__GIT_MISSING__"; exit 0; fi`,
+                `TOP=$(git rev-parse --show-toplevel 2>/dev/null)`,
+                `if [ -z "$TOP" ]; then echo "__NOT_GIT_REPO__"; exit 0; fi`,
+                `echo "===NC_TOP==="`,
+                `printf '%s\\n' "$TOP"`,
+                `echo "===NC_BRANCH==="`,
+                `git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "HEAD"`,
+                `echo "===NC_AHEAD==="`,
+                `git rev-list --left-right --count @{u}...HEAD 2>/dev/null || echo "0 0"`,
+                `echo "===NC_REMOTES==="`,
+                `git remote 2>/dev/null || true`,
+                `echo "===NC_BRANCHES==="`,
+                `git branch --format='%(refname:short)|%(HEAD)' 2>/dev/null || true`,
+                `echo "===NC_LOG==="`,
+                `git log -n 20 --pretty=format:'%H%x1f%h%x1f%s%x1f%an%x1f%ar%x1f%D' 2>/dev/null || true`,
+                `echo ""`,
+                `echo "===NC_STATUS==="`,
+                `git -c core.quotepath=false status --porcelain=v1 -uall 2>/dev/null || true`,
+              ].join('\n');
+
+              const { stdout, stderr, code } = await execOnSsh(
+                `sh -c ${quoteShellArg(script)}`
+              );
+              if (code !== 0 && !stdout.includes('===NC_TOP===')) {
+                throw new Error(stderr.trim() || 'Unable to inspect git repository.');
+              }
+              if (stdout.includes('__GIT_MISSING__')) {
+                sendJson(ws, {
+                  type: 'gitResult',
+                  requestId,
+                  action,
+                  data: {
+                    gitInstalled: false,
+                    isRepo: false,
+                    cwd,
+                    repoRoot: null,
+                    branch: '',
+                    ahead: 0,
+                    behind: 0,
+                    hasRemote: false,
+                    changes: [],
+                    branches: [],
+                    commits: [],
+                  },
+                });
+                return;
+              }
+              if (stdout.includes('__NOT_GIT_REPO__')) {
+                sendJson(ws, {
+                  type: 'gitResult',
+                  requestId,
+                  action,
+                  data: {
+                    gitInstalled: true,
+                    isRepo: false,
+                    cwd,
+                    repoRoot: null,
+                    branch: '',
+                    ahead: 0,
+                    behind: 0,
+                    hasRemote: false,
+                    changes: [],
+                    branches: [],
+                    commits: [],
+                  },
+                });
+                return;
+              }
+
+              const readSection = (tag: string, nextTag?: string): string => {
+                const startMarker = `===NC_${tag}===\n`;
+                const sIdx = stdout.indexOf(startMarker);
+                if (sIdx === -1) return '';
+                const from = sIdx + startMarker.length;
+                if (!nextTag) return stdout.slice(from);
+                const endMarker = `===NC_${nextTag}===`;
+                const eIdx = stdout.indexOf(endMarker, from);
+                return eIdx === -1 ? stdout.slice(from) : stdout.slice(from, eIdx);
+              };
+
+              const repoRoot = readSection('TOP', 'BRANCH').trim() || cwd;
+              const branch = readSection('BRANCH', 'AHEAD').trim() || 'HEAD';
+              const aheadRaw = readSection('AHEAD', 'REMOTES').trim().split(/\s+/);
+              const behind = Number.parseInt(aheadRaw[0] || '0', 10) || 0;
+              const ahead = Number.parseInt(aheadRaw[1] || '0', 10) || 0;
+              const remotesRaw = readSection('REMOTES', 'BRANCHES').trim();
+              const hasRemote = remotesRaw.length > 0;
+
+              const branchesRaw = readSection('BRANCHES', 'LOG').trim();
+              const branches = branchesRaw
+                ? branchesRaw
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .map((line) => {
+                      const [name, headFlag] = line.split('|');
+                      return { name: (name || '').trim(), current: headFlag?.trim() === '*' };
+                    })
+                    .filter((b) => b.name.length > 0)
+                : [];
+
+              const logRaw = readSection('LOG', 'STATUS').trim();
+              const commits = logRaw
+                ? logRaw
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .map((line) => {
+                      const [hash, shortHash, subject, author, relativeDate, refs] =
+                        line.split('\x1f');
+                      return {
+                        hash: hash || '',
+                        shortHash: shortHash || '',
+                        message: subject || '',
+                        author: author || '',
+                        relativeDate: relativeDate || '',
+                        refs: (refs || '').trim(),
+                      };
+                    })
+                    .filter((c) => c.hash.length > 0)
+                : [];
+
+              const statusRaw = readSection('STATUS');
+              const changes = statusRaw
+                .split('\n')
+                .filter((line) => line.length >= 4)
+                .map((line) => {
+                  const indexStatus = line[0] || ' ';
+                  const workTreeStatus = line[1] || ' ';
+                  let relPath = line.slice(3).trim();
+                  if (
+                    (relPath.startsWith('"') && relPath.endsWith('"')) ||
+                    (relPath.startsWith("'") && relPath.endsWith("'"))
+                  ) {
+                    relPath = relPath.slice(1, -1);
+                  }
+                  const arrowIdx = relPath.indexOf(' -> ');
+                  if (arrowIdx !== -1) {
+                    relPath = relPath.slice(arrowIdx + 4).trim();
+                  }
+                  const untracked = indexStatus === '?' && workTreeStatus === '?';
+                  const staged = !untracked && indexStatus !== ' ';
+                  const unstaged = untracked || workTreeStatus !== ' ';
+                  return {
+                    path: relPath,
+                    fullPath: path.posix.join(repoRoot, relPath),
+                    indexStatus,
+                    workTreeStatus,
+                    staged,
+                    unstaged,
+                    untracked,
+                  };
+                })
+                .filter((item) => item.path.length > 0);
+
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: {
+                  gitInstalled: true,
+                  isRepo: true,
+                  cwd,
+                  repoRoot,
+                  branch,
+                  ahead,
+                  behind,
+                  hasRemote,
+                  changes,
+                  branches,
+                  commits,
+                },
+              });
+              return;
+            }
+
+            if (action === 'init') {
+              const { stdout, stderr, code } = await execOnSsh(
+                `cd ${qCwd} && git init`
+              );
+              if (code !== 0) throw new Error(stderr.trim() || 'git init failed.');
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { output: stdout.trim() || 'Initialized empty Git repository.' },
+              });
+              return;
+            }
+
+            if (action === 'stage') {
+              const rawPaths = Array.isArray(payload.paths)
+                ? payload.paths.filter((p): p is string => typeof p === 'string')
+                : [];
+              const safePaths = rawPaths.filter(isSafeRepoRelativePath);
+              const cmd =
+                safePaths.length > 0
+                  ? `cd ${qCwd} && git add -- ${safePaths.map(quoteShellArg).join(' ')}`
+                  : `cd ${qCwd} && git add -A`;
+              const { stderr, code } = await execOnSsh(cmd);
+              if (code !== 0) throw new Error(stderr.trim() || 'Failed to stage changes.');
+              sendJson(ws, { type: 'gitResult', requestId, action, data: { ok: true } });
+              return;
+            }
+
+            if (action === 'unstage') {
+              const rawPaths = Array.isArray(payload.paths)
+                ? payload.paths.filter((p): p is string => typeof p === 'string')
+                : [];
+              const safePaths = rawPaths.filter(isSafeRepoRelativePath);
+              const pathArgs =
+                safePaths.length > 0 ? ` -- ${safePaths.map(quoteShellArg).join(' ')}` : '';
+              const script = [
+                `cd ${qCwd} || exit 1`,
+                `if git rev-parse --verify HEAD >/dev/null 2>&1; then`,
+                `  git reset -q HEAD${pathArgs}`,
+                `else`,
+                `  git rm --cached -r -q${pathArgs || ' .'}`,
+                `fi`,
+              ].join('\n');
+              const { stderr, code } = await execOnSsh(`sh -c ${quoteShellArg(script)}`);
+              if (code !== 0) throw new Error(stderr.trim() || 'Failed to unstage changes.');
+              sendJson(ws, { type: 'gitResult', requestId, action, data: { ok: true } });
+              return;
+            }
+
+            if (action === 'discard') {
+              const rawTracked = Array.isArray(payload.trackedPaths)
+                ? payload.trackedPaths.filter((p): p is string => typeof p === 'string')
+                : [];
+              const rawUntracked = Array.isArray(payload.untrackedPaths)
+                ? payload.untrackedPaths.filter((p): p is string => typeof p === 'string')
+                : [];
+              const tracked = rawTracked.filter(isSafeRepoRelativePath);
+              const untracked = rawUntracked.filter(isSafeRepoRelativePath);
+              if (tracked.length === 0 && untracked.length === 0) {
+                throw new Error('No valid files specified to discard.');
+              }
+              const cmds = [`cd ${qCwd} || exit 1`];
+              if (tracked.length > 0) {
+                cmds.push(`git checkout -- ${tracked.map(quoteShellArg).join(' ')}`);
+              }
+              if (untracked.length > 0) {
+                cmds.push(`rm -rf -- ${untracked.map(quoteShellArg).join(' ')}`);
+              }
+              const { stderr, code } = await execOnSsh(
+                `sh -c ${quoteShellArg(cmds.join('\n'))}`
+              );
+              if (code !== 0) throw new Error(stderr.trim() || 'Failed to discard changes.');
+              sendJson(ws, { type: 'gitResult', requestId, action, data: { ok: true } });
+              return;
+            }
+
+            if (action === 'commit') {
+              const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+              if (!message) throw new Error('Enter a commit message.');
+              const stageAll = Boolean(payload.stageAll);
+              const cmd = stageAll
+                ? `cd ${qCwd} && git add -A && git commit -m ${quoteShellArg(message)}`
+                : `cd ${qCwd} && git commit -m ${quoteShellArg(message)}`;
+              const { stdout, stderr, code } = await execOnSsh(cmd);
+              if (code !== 0) {
+                throw new Error(stderr.trim() || stdout.trim() || 'git commit failed.');
+              }
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { output: stdout.trim() },
+              });
+              return;
+            }
+
+            if (action === 'diff') {
+              const filePath = typeof payload.path === 'string' ? payload.path.trim() : '';
+              const staged = Boolean(payload.staged);
+              const untracked = Boolean(payload.untracked);
+              if (!filePath || !isSafeRepoRelativePath(filePath)) {
+                throw new Error('Invalid repository file path.');
+              }
+              const qFile = quoteShellArg(filePath);
+              if (untracked) {
+                const { stdout } = await execOnSsh(
+                  `cd ${qCwd} && head -c 262144 ${qFile}`
+                );
+                sendJson(ws, {
+                  type: 'gitResult',
+                  requestId,
+                  action,
+                  data: {
+                    path: filePath,
+                    staged: false,
+                    untracked: true,
+                    diffText: '',
+                    newFilePreview: stdout,
+                  },
+                });
+                return;
+              }
+              const diffCmd = staged
+                ? `cd ${qCwd} && git diff --cached --no-color -U4 -- ${qFile}`
+                : `cd ${qCwd} && git diff --no-color -U4 -- ${qFile}`;
+              const { stdout, stderr, code } = await execOnSsh(diffCmd);
+              if (code !== 0) throw new Error(stderr.trim() || 'Failed to load diff.');
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: {
+                  path: filePath,
+                  staged,
+                  untracked: false,
+                  diffText: stdout,
+                },
+              });
+              return;
+            }
+
+            if (action === 'diffSummary') {
+              const stagedFlag = Boolean(payload.stagedOnly) ? '--cached ' : '';
+              const { stdout } = await execOnSsh(
+                `cd ${qCwd} && git diff ${stagedFlag}--no-color --stat && echo "---" && git diff ${stagedFlag}--no-color | head -c 24000`
+              );
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { diffText: stdout },
+              });
+              return;
+            }
+
+            if (action === 'commitDetails') {
+              const hash = typeof payload.hash === 'string' ? payload.hash.trim() : '';
+              if (!/^[a-fA-F0-9]{4,40}$/.test(hash)) {
+                throw new Error('Invalid commit hash.');
+              }
+              const { stdout, stderr, code } = await execOnSsh(
+                `cd ${qCwd} && git show --stat --patch --no-color ${hash} | head -c 160000`
+              );
+              if (code !== 0) throw new Error(stderr.trim() || 'Unable to inspect commit.');
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { hash, diffText: stdout },
+              });
+              return;
+            }
+
+            if (action === 'checkout') {
+              const rawBranch = typeof payload.branch === 'string' ? payload.branch : '';
+              const create = Boolean(payload.create);
+              const branch = sanitizeBranchName(rawBranch);
+              if (!branch) throw new Error('Enter a valid branch name.');
+              const cmd = create
+                ? `cd ${qCwd} && git checkout -b ${quoteShellArg(branch)}`
+                : `cd ${qCwd} && git checkout ${quoteShellArg(branch)}`;
+              const { stdout, stderr, code } = await execOnSsh(cmd);
+              if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || 'Checkout failed.');
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { branch, output: (stderr || stdout).trim() },
+              });
+              return;
+            }
+
+            if (action === 'pull' || action === 'push' || action === 'fetch') {
+              let cmd = `cd ${qCwd} && git ${action}`;
+              if (action === 'fetch') {
+                cmd = `cd ${qCwd} && git fetch --all --prune`;
+              } else if (action === 'push') {
+                const script = [
+                  `cd ${qCwd} || exit 1`,
+                  `if git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then`,
+                  `  git push`,
+                  `else`,
+                  `  CUR_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)`,
+                  `  REMOTE_NAME=$(git remote 2>/dev/null | head -n 1)`,
+                  `  if [ -n "$CUR_BRANCH" ] && [ -n "$REMOTE_NAME" ]; then`,
+                  `    git push -u "$REMOTE_NAME" "$CUR_BRANCH"`,
+                  `  else`,
+                  `    git push`,
+                  `  fi`,
+                  `fi`,
+                ].join('\n');
+                cmd = `sh -c ${quoteShellArg(script)}`;
+              }
+              const { stdout, stderr, code } = await execOnSsh(cmd, 45000);
+              if (code !== 0) {
+                throw new Error(stderr.trim() || stdout.trim() || `git ${action} failed.`);
+              }
+              sendJson(ws, {
+                type: 'gitResult',
+                requestId,
+                action,
+                data: { output: (stdout || stderr || `git ${action} completed.`).trim() },
+              });
+              return;
+            }
+
+            throw new Error(`Unsupported git action: ${action || 'unknown'}`);
+          } catch (err) {
+            sendJson(ws, {
+              type: 'gitError',
+              requestId,
+              action,
+              error: err instanceof Error ? err.message : 'Git command failed.',
             });
           }
         })();

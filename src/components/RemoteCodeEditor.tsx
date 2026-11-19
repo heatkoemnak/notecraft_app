@@ -9,8 +9,11 @@ import {
   ChevronsDownUp,
   ChevronUp,
   FilePlus2,
+  Files,
   FileText,
   FolderOpen,
+  GitBranch,
+  GitCommitHorizontal,
   Hash,
   Loader2,
   Maximize2,
@@ -49,7 +52,15 @@ import {
   toggleCommentLines,
 } from '../utils/codeEditing';
 import { highlightCodeToHtml } from '../utils/codeHighlight';
+import {
+  getGitBadgeMeta,
+  GitCommandRunner,
+  GitCommitInfo,
+  GitFileChange,
+  GitStatusSnapshot,
+} from '../utils/gitClient';
 import { CodeAgentPanel, StagedDiffPayload } from './CodeAgentPanel';
+import { GitSourceControlPanel } from './GitSourceControlPanel';
 import {
   getFileIconColorClass,
   ProjectTreeView,
@@ -95,6 +106,12 @@ interface RemoteCodeEditorProps {
   onReadRemoteFile?: (filePath: string) => Promise<RemoteFilePreview>;
   onWriteRemoteFile?: (filePath: string, content: string) => Promise<{ path: string; size: number }>;
   onCreateRemoteDir?: (dirPath: string) => Promise<{ path: string }>;
+  gitStatus?: GitStatusSnapshot | null;
+  gitLoading?: boolean;
+  gitError?: string | null;
+  onRefreshGit?: () => Promise<void> | void;
+  onRunGit?: GitCommandRunner;
+  requestedSidebarTab?: { tab: 'explorer' | 'git'; seq: number } | null;
   onCopyText: (text: string) => Promise<boolean>;
   onSaveToNote: (file: RemoteFilePreview, draftContent: string) => void;
 }
@@ -177,10 +194,17 @@ export function RemoteCodeEditor({
   onReadRemoteFile,
   onWriteRemoteFile,
   onCreateRemoteDir,
+  gitStatus = null,
+  gitLoading = false,
+  gitError = null,
+  onRefreshGit,
+  onRunGit,
+  requestedSidebarTab = null,
   onCopyText,
   onSaveToNote,
 }: RemoteCodeEditorProps) {
   const [draft, setDraft] = useState(file?.content ?? '');
+  const [sidebarTab, setSidebarTab] = useState<'explorer' | 'git'>('explorer');
   const wordWrap = false;
   const [savedBannerVisible, setSavedBannerVisible] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
@@ -248,6 +272,21 @@ export function RemoteCodeEditor({
   const [trackedChanges, setTrackedChanges] = useState<TrackedFileChange[]>([]);
   const [applyingTrackedChanges, setApplyingTrackedChanges] = useState(false);
   const [previewingNewFile, setPreviewingNewFile] = useState<TrackedFileChange | null>(null);
+  const [gitDiffView, setGitDiffView] = useState<
+    | {
+        kind: 'file';
+        change: GitFileChange;
+        staged: boolean;
+        diffText: string;
+        newFilePreview?: string;
+      }
+    | {
+        kind: 'commit';
+        commit: GitCommitInfo;
+        diffText: string;
+      }
+    | null
+  >(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
@@ -270,12 +309,19 @@ export function RemoteCodeEditor({
     setExplorerPathInput(currentRemotePath || '');
   }, [currentRemotePath]);
 
+  useEffect(() => {
+    if (!requestedSidebarTab) return;
+    setSidebarTab(requestedSidebarTab.tab);
+    setExplorerOpen(true);
+  }, [requestedSidebarTab]);
+
   // Reset draft & history when switching files or reloading from server, preserving tracked multi-file hunks
   useEffect(() => {
     const initial = file?.content ?? '';
     setDraft(initial);
     setPendingAction(null);
     setPreviewingNewFile(null);
+    setGitDiffView(null);
 
     const matchingTracked = file
       ? trackedChangesRef.current.find(
@@ -312,9 +358,10 @@ export function RemoteCodeEditor({
   useEffect(() => {
     if (!lastSavedAt) return;
     setSavedBannerVisible(true);
+    void onRefreshGit?.();
     const timer = window.setTimeout(() => setSavedBannerVisible(false), 2000);
     return () => window.clearTimeout(timer);
-  }, [lastSavedAt]);
+  }, [lastSavedAt, onRefreshGit]);
 
   const isEditable = Boolean(file && !file.isBinary && !file.truncated);
   const isDirty = Boolean(file && !file.isBinary && !file.truncated && draft !== file.content);
@@ -1534,7 +1581,181 @@ export function RemoteCodeEditor({
     }
   };
 
+  const gitFileStatuses = useMemo(() => {
+    const map: Record<string, { letter: string; title: string; className: string }> = {};
+    if (!gitStatus?.isRepo) return map;
+    for (const change of gitStatus.changes) {
+      map[change.fullPath] = getGitBadgeMeta(change, change.staged && !change.unstaged ? 'staged' : 'unstaged');
+    }
+    return map;
+  }, [gitStatus]);
+
+  const handleInspectGitChange = useCallback(
+    async (change: GitFileChange, staged: boolean) => {
+      if (!onRunGit) return;
+      const cwd = gitStatus?.repoRoot || currentRemotePath;
+      try {
+        const res = await onRunGit(
+          'diff',
+          { path: change.path, staged, untracked: change.untracked },
+          cwd
+        );
+        setPreviewingNewFile(null);
+        setGitDiffView({
+          kind: 'file',
+          change,
+          staged,
+          diffText: typeof res.diffText === 'string' ? res.diffText : '',
+          newFilePreview:
+            typeof res.newFilePreview === 'string' ? res.newFilePreview : undefined,
+        });
+      } catch (err) {
+        showNotice(err instanceof Error ? err.message : 'Unable to load Git diff.');
+      }
+    },
+    [onRunGit, gitStatus?.repoRoot, currentRemotePath, showNotice]
+  );
+
+  const handleInspectGitCommit = useCallback(
+    async (commit: GitCommitInfo) => {
+      if (!onRunGit) return;
+      const cwd = gitStatus?.repoRoot || currentRemotePath;
+      try {
+        const res = await onRunGit('commitDetails', { hash: commit.hash }, cwd);
+        setPreviewingNewFile(null);
+        setGitDiffView({
+          kind: 'commit',
+          commit,
+          diffText: typeof res.diffText === 'string' ? res.diffText : '',
+        });
+      } catch (err) {
+        showNotice(err instanceof Error ? err.message : 'Unable to load commit diff.');
+      }
+    },
+    [onRunGit, gitStatus?.repoRoot, currentRemotePath, showNotice]
+  );
+
   const renderCodeArea = (isFull: boolean) => {
+    if (gitDiffView) {
+      const isCommit = gitDiffView.kind === 'commit';
+      const rawLines = (
+        gitDiffView.kind === 'file' && gitDiffView.change.untracked
+          ? (gitDiffView.newFilePreview || '')
+              .split('\n')
+              .map((l) => `+${l}`)
+          : gitDiffView.diffText.split('\n')
+      );
+
+      return (
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-[#0c0c10]">
+          <div className="shrink-0 px-3 py-1.5 border-b border-blue-500/25 bg-[#121622] flex flex-wrap items-center justify-between gap-2 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              {isCommit ? (
+                <GitCommitHorizontal className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+              ) : (
+                <GitBranch className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+              )}
+              <span className="font-medium text-neutral-100 truncate">
+                {gitDiffView.kind === 'commit'
+                  ? `Commit ${gitDiffView.commit.shortHash}: ${gitDiffView.commit.message}`
+                  : `${gitDiffView.staged ? 'Staged Diff' : 'Working Tree Diff'}: ${
+                      gitDiffView.change.path
+                    }`}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              {gitDiffView.kind === 'file' && (
+                <>
+                  {onRunGit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target = gitDiffView.change;
+                        const wasStaged = gitDiffView.staged;
+                        const cwd = gitStatus?.repoRoot || currentRemotePath;
+                        void onRunGit(
+                          wasStaged ? 'unstage' : 'stage',
+                          { paths: [target.path] },
+                          cwd
+                        ).then(async () => {
+                          await onRefreshGit?.();
+                          await handleInspectGitChange(target, !wasStaged);
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11.5px] font-medium cursor-pointer"
+                    >
+                      <span>{gitDiffView.staged ? 'Unstage File' : 'Stage File'}</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetPath = gitDiffView.change.fullPath;
+                      setGitDiffView(null);
+                      onOpenFile(targetPath);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-white/15 bg-white/5 hover:bg-white/10 text-neutral-100 text-[11.5px] font-medium cursor-pointer"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    <span>Open File</span>
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setGitDiffView(null)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded text-neutral-400 hover:text-white text-[11.5px] cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Close Diff</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 min-h-0 overflow-auto py-2 font-mono-code text-[12.5px] leading-[20px]">
+            {rawLines.length === 0 || (rawLines.length === 1 && rawLines[0] === '') ? (
+              <div className="px-4 py-6 text-center text-neutral-500 font-sans text-[13px]">
+                No textual differences to display.
+              </div>
+            ) : (
+              rawLines.map((line, idx) => {
+                const isAdd = line.startsWith('+') && !line.startsWith('+++');
+                const isDel = line.startsWith('-') && !line.startsWith('---');
+                const isHunk = line.startsWith('@@');
+                const isMeta =
+                  line.startsWith('diff ') ||
+                  line.startsWith('index ') ||
+                  line.startsWith('+++') ||
+                  line.startsWith('---') ||
+                  line.startsWith('commit ') ||
+                  line.startsWith('Author:') ||
+                  line.startsWith('Date:');
+                return (
+                  <div
+                    key={idx}
+                    className={`flex min-w-max px-3.5 whitespace-pre ${
+                      isAdd
+                        ? 'bg-emerald-500/16 text-emerald-200 border-l-2 border-emerald-400'
+                        : isDel
+                        ? 'bg-red-500/16 text-red-200 border-l-2 border-red-400'
+                        : isHunk
+                        ? 'bg-blue-500/14 text-blue-300 border-l-2 border-blue-400/70'
+                        : isMeta
+                        ? 'text-neutral-400'
+                        : 'text-neutral-200'
+                    }`}
+                  >
+                    {line || ' '}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      );
+    }
+
     if (previewingNewFile) {
       const newFileName = previewingNewFile.path.split('/').pop() || 'new-file';
       const newLines = (previewingNewFile.newFileContent ?? '').replace(/\r\n/g, '\n').split('\n');
@@ -2394,6 +2615,28 @@ export function RemoteCodeEditor({
 
           <button
             type="button"
+            onClick={() => {
+              setSidebarTab('git');
+              setExplorerOpen(true);
+            }}
+            title="Source Control (Git)"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              explorerOpen && sidebarTab === 'git'
+                ? 'border-blue-500/50 bg-blue-500/20 text-blue-200'
+                : 'border-white/10 text-neutral-200 hover:bg-white/10'
+            }`}
+          >
+            <GitBranch className="w-3.5 h-3.5 text-blue-400" />
+            <span>{gitStatus?.isRepo && gitStatus.branch ? gitStatus.branch : 'Git'}</span>
+            {gitStatus?.isRepo && gitStatus.changes.length > 0 && (
+              <span className="px-1.5 rounded-full bg-blue-600/35 text-blue-200 text-[10.5px] tabular-nums">
+                {gitStatus.changes.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => setAiAgentOpen((p) => !p)}
             title={aiAgentOpen ? 'Hide AI Code Agent' : 'Open AI Code Agent'}
             className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
@@ -2432,138 +2675,213 @@ export function RemoteCodeEditor({
               style={{ width: `${explorerWidth}px` }}
               className="shrink-0 bg-[#121217] flex flex-col min-h-0"
             >
-              <div className="shrink-0 px-3 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2">
-                <div
-                  className="min-w-0 flex items-center gap-1.5"
-                  title={currentRemotePath || (file ? getParentPosixPath(file.path) : '/')}
-                >
-                  <FolderOpen className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                  <span className="text-[11.5px] font-semibold uppercase tracking-wider text-neutral-300 truncate">
-                    {(currentRemotePath || (file ? getParentPosixPath(file.path) : '/'))
-                      .split('/')
-                      .filter(Boolean)
-                      .pop() || '/'}
-                  </span>
-                </div>
-                <div className="flex items-center gap-0.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onNavigateRootDir(
-                        getParentPosixPath(
-                          currentRemotePath || (file ? getParentPosixPath(file.path) : '/')
-                        )
-                      )
-                    }
-                    disabled={
-                      Boolean(loadingDirs[currentRemotePath]) || currentRemotePath === '/'
-                    }
-                    title="Open parent folder"
-                    className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
-                  >
-                    <ArrowUp className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const base =
-                        currentRemotePath || (file ? getParentPosixPath(file.path) : '/');
-                      setCreatingInDir((prev) => (prev === base ? null : base));
-                    }}
-                    title="New file in root folder"
-                    className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onCollapseAllDirs}
-                    title="Collapse all folders"
-                    className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-                  >
-                    <ChevronsDownUp className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onRefreshExplorer}
-                    title="Refresh explorer"
-                    className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
-                  >
-                    <RefreshCw
-                      className={`w-3.5 h-3.5 ${
-                        loadingDirs[currentRemotePath] ? 'animate-spin' : ''
-                      }`}
-                    />
-                  </button>
-                </div>
-              </div>
-
-              {/* Direct Path Jump inside Full Screen Explorer (Tab autocomplete + sync) */}
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (explorerPathInput.trim()) {
-                    onNavigateRootDir(explorerPathInput.trim());
-                  }
-                }}
-                className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1"
-              >
-                <RemotePathInput
-                  value={explorerPathInput}
-                  onChange={setExplorerPathInput}
-                  onSyncDirectory={(dirPath) => onNavigateRootDir(dirPath)}
-                  dirCache={dirCache}
-                  fetchDirEntries={fetchDirEntries}
-                  currentRemotePath={currentRemotePath}
-                  placeholder="/home/user/project"
-                  ariaLabel="Open directory path"
-                  inputClassName="font-mono-code w-full min-w-0 px-2 py-1 text-[11.5px] rounded border border-white/12 bg-[#0c0c10] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
-                />
+              {/* Cursor-style Sidebar Activity Switcher: Explorer | Source Control (Git) */}
+              <div className="shrink-0 grid grid-cols-2 border-b border-white/[0.08] bg-[#101015]">
                 <button
-                  type="submit"
-                  className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer shrink-0"
+                  type="button"
+                  onClick={() => setSidebarTab('explorer')}
+                  className={`flex items-center justify-center gap-1.5 py-2 text-[11.5px] font-medium border-b-2 transition-colors cursor-pointer ${
+                    sidebarTab === 'explorer'
+                      ? 'border-blue-500 text-white bg-white/[0.04]'
+                      : 'border-transparent text-neutral-400 hover:text-neutral-200'
+                  }`}
                 >
-                  Open
+                  <Files className="w-3.5 h-3.5" />
+                  <span>Explorer</span>
                 </button>
-              </form>
-
-              {dirError && (
-                <div className="m-2 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-[11.5px] text-red-300 flex items-start gap-2">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                  <span>{dirError}</span>
-                </div>
-              )}
-
-              <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
-                {fileLoading && (
-                  <div className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-neutral-400">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
-                    <span>Opening file...</span>
-                  </div>
-                )}
-
-                <ProjectTreeView
-                  rootPath={currentRemotePath || (file ? getParentPosixPath(file.path) : '/')}
-                  dirCache={dirCache}
-                  expandedDirs={expandedDirs}
-                  loadingDirs={loadingDirs}
-                  truncatedDirs={truncatedDirs}
-                  selectedFilePath={file?.path ?? null}
-                  pendingFileStatuses={pendingFileStatuses}
-                  creatingInDir={creatingInDir}
-                  onToggleDir={onToggleDir}
-                  onSelectFile={handleAttemptSelectFile}
-                  onOpenInTerminal={onOpenInTerminal}
-                  onRequestCreateFile={(dirPath) => {
-                    if (!expandedDirs[dirPath]) {
-                      onToggleDir(dirPath);
-                    }
-                    setCreatingInDir(dirPath);
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSidebarTab('git');
+                    void onRefreshGit?.();
                   }}
-                  onSubmitNewFile={handleSubmitNewFile}
-                  onCancelNewFile={() => setCreatingInDir(null)}
-                />
+                  className={`flex items-center justify-center gap-1.5 py-2 text-[11.5px] font-medium border-b-2 transition-colors cursor-pointer ${
+                    sidebarTab === 'git'
+                      ? 'border-blue-500 text-white bg-white/[0.04]'
+                      : 'border-transparent text-neutral-400 hover:text-neutral-200'
+                  }`}
+                >
+                  <GitBranch className="w-3.5 h-3.5" />
+                  <span>Source Control</span>
+                  {gitStatus?.isRepo && gitStatus.changes.length > 0 && (
+                    <span className="px-1.5 py-0.2 rounded-full bg-blue-600/35 text-blue-200 text-[10px] tabular-nums">
+                      {gitStatus.changes.length}
+                    </span>
+                  )}
+                </button>
               </div>
+
+              {sidebarTab === 'git' && onRunGit ? (
+                <GitSourceControlPanel
+                  currentRemotePath={
+                    currentRemotePath || (file ? getParentPosixPath(file.path) : '/')
+                  }
+                  gitStatus={gitStatus ?? null}
+                  loading={gitLoading}
+                  error={gitError}
+                  onRefresh={() => onRefreshGit?.()}
+                  onRunGit={onRunGit}
+                  onInspectChangeDiff={(change, staged) =>
+                    void handleInspectGitChange(change, staged)
+                  }
+                  onInspectCommit={(commit) => void handleInspectGitCommit(commit)}
+                  onOpenFile={(targetPath) => {
+                    setGitDiffView(null);
+                    handleAttemptSelectFile(targetPath);
+                  }}
+                  onAfterWorkingTreeMutated={(affectedPaths) => {
+                    onRefreshExplorer();
+                    if (
+                      file &&
+                      affectedPaths &&
+                      (affectedPaths.length === 0 || affectedPaths.includes(file.path))
+                    ) {
+                      onReloadFile(file.path);
+                    }
+                  }}
+                />
+              ) : (
+                <>
+                  <div className="shrink-0 px-3 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2">
+                    <div
+                      className="min-w-0 flex items-center gap-1.5"
+                      title={currentRemotePath || (file ? getParentPosixPath(file.path) : '/')}
+                    >
+                      <FolderOpen className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                      <span className="text-[11.5px] font-semibold uppercase tracking-wider text-neutral-300 truncate">
+                        {(currentRemotePath || (file ? getParentPosixPath(file.path) : '/'))
+                          .split('/')
+                          .filter(Boolean)
+                          .pop() || '/'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-0.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onNavigateRootDir(
+                            getParentPosixPath(
+                              currentRemotePath || (file ? getParentPosixPath(file.path) : '/')
+                            )
+                          )
+                        }
+                        disabled={
+                          Boolean(loadingDirs[currentRemotePath]) || currentRemotePath === '/'
+                        }
+                        title="Open parent folder"
+                        className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 disabled:opacity-35 cursor-pointer"
+                      >
+                        <ArrowUp className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const base =
+                            currentRemotePath || (file ? getParentPosixPath(file.path) : '/');
+                          setCreatingInDir((prev) => (prev === base ? null : base));
+                        }}
+                        title="New file in root folder"
+                        className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onCollapseAllDirs}
+                        title="Collapse all folders"
+                        className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
+                      >
+                        <ChevronsDownUp className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRefreshExplorer}
+                        title="Refresh explorer"
+                        className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${
+                            loadingDirs[currentRemotePath] ? 'animate-spin' : ''
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Direct Path Jump inside Full Screen Explorer (Tab autocomplete + sync) */}
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (explorerPathInput.trim()) {
+                        onNavigateRootDir(explorerPathInput.trim());
+                      }
+                    }}
+                    className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1"
+                  >
+                    <RemotePathInput
+                      value={explorerPathInput}
+                      onChange={setExplorerPathInput}
+                      onSyncDirectory={(dirPath) => onNavigateRootDir(dirPath)}
+                      dirCache={dirCache}
+                      fetchDirEntries={fetchDirEntries}
+                      currentRemotePath={currentRemotePath}
+                      placeholder="/home/user/project"
+                      ariaLabel="Open directory path"
+                      inputClassName="font-mono-code w-full min-w-0 px-2 py-1 text-[11.5px] rounded border border-white/12 bg-[#0c0c10] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium cursor-pointer shrink-0"
+                    >
+                      Open
+                    </button>
+                  </form>
+
+                  {dirError && (
+                    <div className="m-2 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-[11.5px] text-red-300 flex items-start gap-2">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>{dirError}</span>
+                    </div>
+                  )}
+
+                  <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
+                    {fileLoading && (
+                      <div className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-neutral-400">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+                        <span>Opening file...</span>
+                      </div>
+                    )}
+
+                    <ProjectTreeView
+                      rootPath={
+                        currentRemotePath || (file ? getParentPosixPath(file.path) : '/')
+                      }
+                      dirCache={dirCache}
+                      expandedDirs={expandedDirs}
+                      loadingDirs={loadingDirs}
+                      truncatedDirs={truncatedDirs}
+                      selectedFilePath={file?.path ?? null}
+                      pendingFileStatuses={pendingFileStatuses}
+                      gitFileStatuses={gitFileStatuses}
+                      creatingInDir={creatingInDir}
+                      onToggleDir={onToggleDir}
+                      onSelectFile={(targetPath) => {
+                        setGitDiffView(null);
+                        handleAttemptSelectFile(targetPath);
+                      }}
+                      onOpenInTerminal={onOpenInTerminal}
+                      onRequestCreateFile={(dirPath) => {
+                        if (!expandedDirs[dirPath]) {
+                          onToggleDir(dirPath);
+                        }
+                        setCreatingInDir(dirPath);
+                      }}
+                      onSubmitNewFile={handleSubmitNewFile}
+                      onCancelNewFile={() => setCreatingInDir(null)}
+                    />
+                  </div>
+                </>
+              )}
             </aside>
 
             {/* Draggable Explorer Resize Handle */}

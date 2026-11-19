@@ -88,6 +88,7 @@ interface ProjectTreeViewProps {
   truncatedDirs?: Record<string, boolean>;
   selectedFilePath?: string | null;
   pendingFileStatuses?: Record<string, 'modified' | 'new' | 'accepted'>;
+  gitFileStatuses?: Record<string, { letter: string; title: string; className: string }>;
   creatingInDir: string | null;
   onToggleDir: (dirPath: string) => void;
   onSelectFile: (filePath: string) => void;
@@ -107,6 +108,7 @@ export function ProjectTreeView({
   truncatedDirs,
   selectedFilePath,
   pendingFileStatuses,
+  gitFileStatuses,
   creatingInDir,
   onToggleDir,
   onSelectFile,
@@ -274,6 +276,14 @@ export function ProjectTreeView({
               </div>
             ) : (
               <div className="flex items-center gap-1 shrink-0">
+                {gitFileStatuses?.[entry.path] && !pendingFileStatuses?.[entry.path] && (
+                  <span
+                    title={`Git: ${gitFileStatuses[entry.path].title}`}
+                    className={`font-mono-code text-[10px] font-semibold px-1 rounded ${gitFileStatuses[entry.path].className}`}
+                  >
+                    {gitFileStatuses[entry.path].letter}
+                  </span>
+                )}
                 {pendingFileStatuses?.[entry.path] && (
                   <span
                     title={

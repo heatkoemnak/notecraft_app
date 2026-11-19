@@ -33,6 +33,7 @@ import {
   type CodeAgentMode,
   type CodeAgentRelatedFile,
   type CodeAgentTaskMode,
+  generateGitCommitMessage,
   listCodeAgentModels,
   runCodeAgent,
 } from './server/codeAgent.ts';
@@ -1445,6 +1446,31 @@ async function startServer() {
       }
       console.error('AI Code Agent failed:', err);
       return res.status(500).json({ error: 'Failed to run AI Code Agent' });
+    }
+  });
+
+  app.post('/api/ai/git-commit', async (req, res) => {
+    try {
+      const { diffText, changedFiles, branch } = (req.body || {}) as {
+        diffText?: unknown;
+        changedFiles?: unknown;
+        branch?: unknown;
+      };
+      const cleanFiles = Array.isArray(changedFiles)
+        ? changedFiles.filter((f): f is string => typeof f === 'string').slice(0, 40)
+        : [];
+      const result = await generateGitCommitMessage({
+        diffText: typeof diffText === 'string' ? diffText : '',
+        changedFiles: cleanFiles,
+        branch: typeof branch === 'string' ? branch.slice(0, 120) : undefined,
+      });
+      return res.json(result);
+    } catch (err) {
+      if (err instanceof CodeAgentError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error('AI git commit message generation failed:', err);
+      return res.status(500).json({ error: 'Failed to generate commit message.' });
     }
   });
 
