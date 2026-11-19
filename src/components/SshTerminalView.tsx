@@ -18,7 +18,6 @@ import {
   EyeOff,
   FilePlus2,
   FolderOpen,
-  FolderTree,
   GitBranch,
   Home,
   KeyRound,
@@ -184,8 +183,6 @@ export function SshTerminalView({
   const [savingProfile, setSavingProfile] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [capturedNotice, setCapturedNotice] = useState(false);
-  const [snippetPickerOpen, setSnippetPickerOpen] = useState(false);
-  const [quickCommand, setQuickCommand] = useState('');
 
   // Clipboard & terminal context menu state
   const [hasSelection, setHasSelection] = useState(false);
@@ -241,7 +238,6 @@ export function SshTerminalView({
   const wsRef = useRef<WebSocket | null>(null);
   const keyFileInputRef = useRef<HTMLInputElement>(null);
   const passwordInputRef = useRef<HTMLInputElement>(null);
-  const snippetMenuRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const pendingDirReqRef = useRef<
     Map<string, { requestedPath: string; mode: 'root' | 'expand' }>
@@ -379,17 +375,10 @@ export function SshTerminalView({
     };
   }, [storageMode, currentUser.id]);
 
-  // Close snippet dropdown and terminal context menu on outside click
+  // Close terminal context menu on outside click
   useEffect(() => {
-    if (!snippetPickerOpen && !contextMenu) return;
+    if (!contextMenu) return;
     const handlePointerDown = (e: PointerEvent) => {
-      if (
-        snippetPickerOpen &&
-        snippetMenuRef.current &&
-        !snippetMenuRef.current.contains(e.target as Node)
-      ) {
-        setSnippetPickerOpen(false);
-      }
       if (
         contextMenu &&
         contextMenuRef.current &&
@@ -401,7 +390,6 @@ export function SshTerminalView({
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setContextMenu(null);
-        setSnippetPickerOpen(false);
       }
     };
     window.addEventListener('pointerdown', handlePointerDown);
@@ -410,7 +398,7 @@ export function SshTerminalView({
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKey);
     };
-  }, [snippetPickerOpen, contextMenu]);
+  }, [contextMenu]);
 
   const showClipboardHint = useCallback((msg: string) => {
     setClipboardNotice(msg);
@@ -708,7 +696,6 @@ export function SshTerminalView({
     setShowPassword(false);
     setPrivateKey('');
     setPassphrase('');
-    setQuickCommand('');
   }, []);
 
   const closeSocket = useCallback(
@@ -1660,26 +1647,6 @@ export function SshTerminalView({
     }
   };
 
-  const handleSendQuickCommand = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!quickCommand.trim() || status !== 'connected') return;
-    sendRawInput(`${quickCommand.trim()}\n`);
-    setQuickCommand('');
-  };
-
-  const handleScanProject = (targetDir?: string) => {
-    if (status !== 'connected') return;
-    // Read-only POSIX inspection of directory structure & key manifest files
-    const cdPrefix = targetDir ? `cd ${quotePosixPath(targetDir)}` : '';
-    const scanParts = [
-      ...(cdPrefix ? [cdPrefix] : []),
-      'echo "=== PWD ===" && pwd',
-      'echo "=== FOLDER STRUCTURE ===" && find . -maxdepth 4 \\( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name __pycache__ -o -name .venv -o -name venv \\) -prune -o -print | sort | head -n 250',
-      'for f in package.json docker-compose.yml docker-compose.yaml Dockerfile pyproject.toml requirements.txt go.mod Cargo.toml tsconfig.json README.md; do if [ -f "$f" ]; then echo "=== FILE: $f ==="; head -n 120 "$f"; fi; done',
-    ];
-    sendRawInput(`${scanParts.join('; ')}\n`);
-  };
-
   const handleOpenDirectoryInTerminal = (dirPath: string) => {
     if (status !== 'connected' || !dirPath.trim()) return;
     sendRawInput(`cd ${quotePosixPath(dirPath.trim())} && ls -la\n`);
@@ -2251,146 +2218,7 @@ export function SshTerminalView({
 
         {/* Right: Interactive Terminal Area */}
         <div className="flex-1 min-w-0 min-h-0 flex flex-col bg-[#0c0c0f]">
-          {/* Quick Command & Snippet Runner Strip */}
-          <div className="shrink-0 px-3 sm:px-4 py-2 border-b border-white/[0.08] bg-[#141418] flex flex-wrap items-center gap-2">
-            <form onSubmit={handleSendQuickCommand} className="flex-1 min-w-[200px] flex items-center gap-2">
-              <span className="text-[12px] font-mono-code text-blue-400 select-none">$</span>
-              <input
-                type="text"
-                disabled={!isConnected}
-                value={quickCommand}
-                onChange={(e) => setQuickCommand(e.target.value)}
-                placeholder={
-                  isConnected
-                    ? 'Type command to execute on remote server and press Enter...'
-                    : 'Connect to a server to run commands interactively'
-                }
-                className="font-mono-code flex-1 min-w-0 bg-transparent text-[12.5px] text-neutral-100 placeholder:text-neutral-500 focus:outline-none disabled:opacity-50"
-              />
-              <button
-                type="submit"
-                disabled={!isConnected || !quickCommand.trim()}
-                className="px-2.5 py-1 rounded-md bg-white/10 hover:bg-white/15 disabled:opacity-35 text-[11.5px] font-medium text-neutral-100 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                Run
-              </button>
-            </form>
 
-            <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
-              <button
-                type="button"
-                disabled={!isConnected}
-                onClick={handleToggleDirBrowser}
-                title="Open remote project directory browser"
-                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md border text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap disabled:opacity-35 ${
-                  dirBrowserOpen
-                    ? 'border-blue-500/50 bg-blue-500/15 text-blue-300'
-                    : 'border-white/10 text-neutral-200 hover:bg-white/10'
-                }`}
-              >
-                <FolderOpen className="w-3 h-3 text-blue-400" />
-                <span>Open Directory</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!isConnected}
-                onClick={() => handleScanProject()}
-                title="Run a read-only project folder tree & manifest scan in the current directory"
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-white/10 text-[11.5px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <FolderTree className="w-3 h-3 text-emerald-400" />
-                <span>Scan project</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!hasSelection}
-                onClick={() => void handleCopySelection()}
-                title="Copy selected terminal text (Ctrl+Shift+C or Ctrl+C when selected)"
-                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-white/10 text-[11.5px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                {copiedSelectionNotice ? (
-                  <>
-                    <Check className="w-3 h-3 text-emerald-400" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3 h-3 text-neutral-300" />
-                    <span>Copy</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                disabled={!isConnected}
-                onClick={() => void handlePasteToTerminal()}
-                title="Paste from clipboard into terminal (Ctrl+V / Ctrl+Shift+V)"
-                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-white/10 text-[11.5px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <ClipboardPaste className="w-3 h-3 text-neutral-300" />
-                <span>Paste</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!isConnected}
-                onClick={() => sendRawInput('\x03')}
-                title="Send Ctrl+C interrupt signal"
-                className="px-2 py-1 rounded-md border border-white/10 text-[11.5px] font-mono-code text-neutral-300 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                Ctrl+C
-              </button>
-
-              <div className="relative" ref={snippetMenuRef}>
-                <button
-                  type="button"
-                  disabled={!isConnected || shellSnippets.length === 0}
-                  onClick={() => setSnippetPickerOpen((prev) => !prev)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-white/10 text-[11.5px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-35 transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <Braces className="w-3 h-3 text-blue-400" />
-                  <span>Snippets</span>
-                  {snippetPickerOpen ? (
-                    <ChevronDown className="w-3 h-3" />
-                  ) : (
-                    <ChevronRight className="w-3 h-3" />
-                  )}
-                </button>
-
-                {snippetPickerOpen && (
-                  <div className="absolute right-0 mt-1.5 w-72 max-h-64 overflow-y-auto rounded-xl border border-white/12 bg-[#18181d] shadow-xl py-1 z-30">
-                    {shellSnippets.map((snippet) => (
-                      <button
-                        key={snippet.id}
-                        type="button"
-                        onClick={() => {
-                          setSnippetPickerOpen(false);
-                          const cleaned = snippet.content
-                            .replace(/^```[^\n]*\n?/m, '')
-                            .replace(/\n?```\s*$/m, '')
-                            .trim();
-                          if (cleaned) {
-                            sendRawInput(`${cleaned}\n`);
-                          }
-                        }}
-                        className="w-full px-3 py-2 text-left hover:bg-white/[0.07] transition-colors cursor-pointer"
-                      >
-                        <div className="text-[12.5px] font-medium text-white truncate">
-                          {snippet.title}
-                        </div>
-                        <div className="text-[11px] font-mono-code text-neutral-400 truncate">
-                          {snippet.language} · {snippet.category}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
 
           {clipboardNotice && (
             <div className="shrink-0 px-3 sm:px-4 py-1.5 border-b border-amber-500/20 bg-amber-500/10 text-[11.5px] text-amber-200 flex items-center justify-between gap-2">
@@ -2805,16 +2633,6 @@ export function SshTerminalView({
                       >
                         <Terminal className="w-3 h-3 text-blue-400" />
                         <span>Open in Terminal</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => handleScanProject(currentRemotePath)}
-                        title="Scan project folder structure & manifests in this directory"
-                        className="inline-flex items-center justify-center gap-1 px-2.5 py-1 rounded-md border border-white/10 hover:bg-white/10 text-[11.5px] font-medium text-neutral-200 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <FolderTree className="w-3 h-3 text-emerald-400" />
-                        <span>Scan</span>
                       </button>
                     </div>
                   )}

@@ -350,10 +350,10 @@ export function attachSshWebSocketServer(
 
     const resolvePathShell = async (rawPath?: string): Promise<string> => {
       const trimmed = (rawPath || '').trim();
-      const script = trimmed && trimmed !== '~'
-        ? `python3 -c "import os; p = os.path.expanduser(${JSON.stringify(trimmed)}); print(os.path.abspath(p))"`
-        : `python3 -c "import os; print(os.path.abspath(os.path.expanduser('~')))"`;
-      const res = await execOnSsh(script, 10000);
+      const pyCode = trimmed && trimmed !== '~'
+        ? `import os; p = os.path.expanduser(__import__('base64').b64decode(${JSON.stringify(Buffer.from(trimmed, 'utf8').toString('base64'))}).decode('utf-8')); print(os.path.abspath(p))`
+        : `import os; print(os.path.abspath(os.path.expanduser('~')))`;
+      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyCode)}`, 10000);
       if (res.code !== 0 || !res.stdout.trim()) {
         throw new Error(res.stderr.trim() || `Unable to resolve path: ${trimmed}`);
       }
@@ -361,9 +361,10 @@ export function attachSshWebSocketServer(
     };
 
     const listDirShell = async (resolvedPath: string) => {
+      const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
       const pyScript = [
-        `import os, json, stat`,
-        `p = ${JSON.stringify(resolvedPath)}`,
+        `import os, json, stat, base64`,
+        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
         `entries = []`,
         `try:`,
         `    for name in os.listdir(p):`,
@@ -401,9 +402,10 @@ export function attachSshWebSocketServer(
     };
 
     const readFileShell = async (resolvedPath: string) => {
+      const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
       const pyScript = [
         `import os, sys, base64, json`,
-        `p = ${JSON.stringify(resolvedPath)}`,
+        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
         `try:`,
         `    st = os.stat(p)`,
         `    if os.path.isdir(p):`,
@@ -441,12 +443,13 @@ export function attachSshWebSocketServer(
     const writeFileShell = async (resolvedPath: string, content: string) => {
       const buf = Buffer.from(content, 'utf8');
       const b64 = buf.toString('base64');
+      const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
       const script = [
         `import os, base64`,
-        `p = ${JSON.stringify(resolvedPath)}`,
+        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
         `d = os.path.dirname(p)`,
         `if d: os.makedirs(d, exist_ok=True)`,
-        `data = base64.b64decode(${JSON.stringify(b64)})`,
+        `data = base64.b64decode('${b64}')`,
         `with open(p, 'wb') as f:`,
         `    f.write(data)`,
         `print('OK')`
