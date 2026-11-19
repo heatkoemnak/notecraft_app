@@ -294,6 +294,176 @@ export function attachSshWebSocketServer(
         });
       });
 
+    const execOnSsh = (
+      cmd: string,
+      timeoutMs = 20000
+    ): Promise<{ stdout: string; stderr: string; code: number }> =>
+      new Promise((resolve, reject) => {
+        if (!sshClient) {
+          reject(new Error('SSH is not connected.'));
+          return;
+        }
+        sshClient.exec(cmd, (err, stream) => {
+          if (err || !stream) {
+            reject(err || new Error('Failed to execute remote command.'));
+            return;
+          }
+          let stdout = '';
+          let stderr = '';
+          let settled = false;
+          const MAX_OUTPUT = 2 * 1024 * 1024;
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try {
+              stream.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error('Remote command timed out.'));
+          }, timeoutMs);
+
+          stream.on('data', (chunk: Buffer) => {
+            if (stdout.length < MAX_OUTPUT) {
+              stdout += chunk.toString('utf8');
+            }
+          });
+          stream.stderr?.on('data', (chunk: Buffer) => {
+            if (stderr.length < MAX_OUTPUT) {
+              stderr += chunk.toString('utf8');
+            }
+          });
+          stream.on('close', (code: number | null) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
+          });
+          stream.on('error', (streamErr: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(streamErr);
+          });
+        });
+      });
+
+    const resolvePathShell = async (rawPath?: string): Promise<string> => {
+      const trimmed = (rawPath || '').trim();
+      const script = trimmed && trimmed !== '~'
+        ? `python3 -c "import os; p = os.path.expanduser(${JSON.stringify(trimmed)}); print(os.path.abspath(p))"`
+        : `python3 -c "import os; print(os.path.abspath(os.path.expanduser('~')))"`;
+      const res = await execOnSsh(script, 10000);
+      if (res.code !== 0 || !res.stdout.trim()) {
+        throw new Error(res.stderr.trim() || `Unable to resolve path: ${trimmed}`);
+      }
+      return res.stdout.trim().split('\n')[0];
+    };
+
+    const listDirShell = async (resolvedPath: string) => {
+      const pyScript = [
+        `import os, json, stat`,
+        `p = ${JSON.stringify(resolvedPath)}`,
+        `entries = []`,
+        `try:`,
+        `    for name in os.listdir(p):`,
+        `        if name == '.' or name == '..': continue`,
+        `        fp = os.path.join(p, name)`,
+        `        try:`,
+        `            st = os.lstat(fp)`,
+        `            is_sym = stat.S_ISLNK(st.st_mode)`,
+        `            is_dir = stat.S_ISDIR(st.st_mode)`,
+        `            if is_sym:`,
+        `                try:`,
+        `                    is_dir = os.path.isdir(fp)`,
+        `                except: pass`,
+        `            size = st.st_size if not is_dir else 0`,
+        `            mtime = int(st.st_mtime * 1000)`,
+        `            entries.append({'name': name, 'path': fp, 'isDirectory': is_dir, 'size': size, 'modifiedAt': mtime})`,
+        `        except: pass`,
+        `    entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))`,
+        `    print(json.dumps(entries[:300]))`,
+        `except Exception as e:`,
+        `    print(json.dumps({'error': str(e)}))`
+      ].join('\n');
+      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 15000);
+      if (res.code !== 0) throw new Error(res.stderr.trim() || 'Failed to list directory via shell.');
+      const trimmed = res.stdout.trim();
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+          throw new Error(parsed.error);
+        }
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (err) {
+        throw new Error(`Failed to parse directory listing: ${trimmed}`);
+      }
+    };
+
+    const readFileShell = async (resolvedPath: string) => {
+      const pyScript = [
+        `import os, sys, base64, json`,
+        `p = ${JSON.stringify(resolvedPath)}`,
+        `try:`,
+        `    st = os.stat(p)`,
+        `    if os.path.isdir(p):`,
+        `        print(json.dumps({'error': 'Selected path is a directory.'}))`,
+        `        sys.exit(0)`,
+        `    size = st.st_size`,
+        `    MAX = 524288`,
+        `    with open(p, 'rb') as f:`,
+        `        data = f.read(MAX)`,
+        `    is_bin = b'\\x00' in data[:1024]`,
+        `    b64 = base64.b64encode(data).decode('utf-8')`,
+        `    print(json.dumps({'size': size, 'isBinary': is_bin, 'content': b64 if not is_bin else '', 'truncated': size > MAX}))`,
+        `except Exception as e:`,
+        `    print(json.dumps({'error': str(e)}))`
+      ].join('\n');
+      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 20000);
+      if (res.code !== 0) throw new Error(res.stderr.trim() || 'Failed to read file via shell.');
+      const trimmed = res.stdout.trim();
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed.error) throw new Error(parsed.error);
+        const contentBuf = Buffer.from(parsed.content || '', 'base64');
+        return {
+          size: parsed.size,
+          isBinary: parsed.isBinary,
+          truncated: parsed.truncated,
+          content: contentBuf.toString('utf8'),
+        };
+      } catch (err) {
+        if (err instanceof Error && err.message) throw err;
+        throw new Error(`Failed to parse file content: ${trimmed}`);
+      }
+    };
+
+    const writeFileShell = async (resolvedPath: string, content: string) => {
+      const buf = Buffer.from(content, 'utf8');
+      const b64 = buf.toString('base64');
+      const script = [
+        `import os, base64`,
+        `p = ${JSON.stringify(resolvedPath)}`,
+        `d = os.path.dirname(p)`,
+        `if d: os.makedirs(d, exist_ok=True)`,
+        `data = base64.b64decode(${JSON.stringify(b64)})`,
+        `with open(p, 'wb') as f:`,
+        `    f.write(data)`,
+        `print('OK')`
+      ].join('\n');
+      const res = await execOnSsh(`python3 -c ${quoteShellArg(script)}`, 20000);
+      if (res.code !== 0 || !res.stdout.includes('OK')) {
+        throw new Error(res.stderr.trim() || res.stdout.trim() || 'Failed to write file via shell.');
+      }
+    };
+
+    const createDirShell = async (resolvedPath: string) => {
+      const res = await execOnSsh(`mkdir -p ${quoteShellArg(resolvedPath)}`, 10000);
+      if (res.code !== 0) {
+        throw new Error(res.stderr.trim() || 'Failed to create directory via shell.');
+      }
+    };
+
     ws.on('message', (raw) => {
       let msg: ClientMessage;
       try {
@@ -338,62 +508,73 @@ export function attachSshWebSocketServer(
         const requestedPath = typeof msg.path === 'string' ? msg.path : '';
         void (async () => {
           try {
-            const sftp = await getSftp();
-            const resolvedPath = await resolveSftpPath(sftp, requestedPath);
-            const rawEntries = await new Promise<
-              Array<{
-                filename: string;
-                longname: string;
-                attrs: { mode: number; size: number; mtime: number };
-              }>
-            >((resolve, reject) => {
-              sftp.readdir(resolvedPath, (err, list) => {
-                if (err || !list) reject(err || new Error('Failed to list directory.'));
-                else resolve(list);
+            let resolvedPath = '';
+            let resolvedEntries: any[] = [];
+            let truncated = false;
+            try {
+              const sftp = await getSftp();
+              resolvedPath = await resolveSftpPath(sftp, requestedPath);
+              const rawEntries = await new Promise<
+                Array<{
+                  filename: string;
+                  longname: string;
+                  attrs: { mode: number; size: number; mtime: number };
+                }>
+              >((resolve, reject) => {
+                sftp.readdir(resolvedPath, (err, list) => {
+                  if (err || !list) reject(err || new Error('Failed to list directory.'));
+                  else resolve(list);
+                });
               });
-            });
 
-            const filtered = rawEntries.filter(
-              (item) => item.filename !== '.' && item.filename !== '..'
-            );
+              const filtered = rawEntries.filter(
+                (item) => item.filename !== '.' && item.filename !== '..'
+              );
 
-            const resolvedEntries = await Promise.all(
-              filtered.slice(0, 400).map(async (item) => {
-                const fullPath = path.posix.join(resolvedPath, item.filename);
-                const mode = item.attrs?.mode ?? 0;
-                const isSymlink =
-                  (mode & 0o170000) === 0o120000 || Boolean(item.longname?.startsWith('l'));
-                let isDirectory =
-                  (mode & 0o170000) === 0o040000 || Boolean(item.longname?.startsWith('d'));
-                if (isSymlink) {
-                  isDirectory = await new Promise<boolean>((res) => {
-                    sftp.stat(fullPath, (statErr, stats) => {
-                      if (statErr || !stats) res(false);
-                      else res((stats.mode & 0o170000) === 0o040000);
+              resolvedEntries = await Promise.all(
+                filtered.slice(0, 400).map(async (item) => {
+                  const fullPath = path.posix.join(resolvedPath, item.filename);
+                  const mode = item.attrs?.mode ?? 0;
+                  const isSymlink =
+                    (mode & 0o170000) === 0o120000 || Boolean(item.longname?.startsWith('l'));
+                  let isDirectory =
+                    (mode & 0o170000) === 0o040000 || Boolean(item.longname?.startsWith('d'));
+                  if (isSymlink) {
+                    isDirectory = await new Promise<boolean>((res) => {
+                      sftp.stat(fullPath, (statErr, stats) => {
+                        if (statErr || !stats) res(false);
+                        else res((stats.mode & 0o170000) === 0o040000);
+                      });
                     });
-                  });
-                }
-                return {
-                  name: item.filename,
-                  path: fullPath,
-                  isDirectory,
-                  size: Number(item.attrs?.size ?? 0),
-                  modifiedAt: item.attrs?.mtime ? Number(item.attrs.mtime) * 1000 : null,
-                };
-              })
-            );
+                  }
+                  return {
+                    name: item.filename,
+                    path: fullPath,
+                    isDirectory,
+                    size: Number(item.attrs?.size ?? 0),
+                    modifiedAt: item.attrs?.mtime ? Number(item.attrs.mtime) * 1000 : null,
+                  };
+                })
+              );
 
-            resolvedEntries.sort((a, b) => {
-              if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-              return a.name.localeCompare(b.name);
-            });
+              resolvedEntries.sort((a, b) => {
+                if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+                return a.name.localeCompare(b.name);
+              });
+              truncated = filtered.length > 300;
+              resolvedEntries = resolvedEntries.slice(0, 300);
+            } catch (sftpErr) {
+              resolvedPath = await resolvePathShell(requestedPath);
+              resolvedEntries = await listDirShell(resolvedPath);
+              truncated = false;
+            }
 
             sendJson(ws, {
               type: 'dirListing',
               requestId,
               path: resolvedPath,
-              entries: resolvedEntries.slice(0, 300),
-              truncated: filtered.length > 300,
+              entries: resolvedEntries,
+              truncated,
             });
           } catch (err) {
             sendJson(ws, {
@@ -414,58 +595,63 @@ export function attachSshWebSocketServer(
             if (!requestedPath.trim()) {
               throw new Error('Missing file path.');
             }
-            const sftp = await getSftp();
-            const resolvedPath = await resolveSftpPath(sftp, requestedPath);
-            const stats = await new Promise<{ size: number; mode: number }>((resolve, reject) => {
-              sftp.stat(resolvedPath, (err, st) => {
-                if (err || !st) reject(err || new Error('Unable to read file metadata.'));
-                else resolve({ size: st.size, mode: st.mode });
+            let resolvedPath = '';
+            let size = 0;
+            let isBinary = false;
+            let truncated = false;
+            let content = '';
+
+            try {
+              const sftp = await getSftp();
+              resolvedPath = await resolveSftpPath(sftp, requestedPath);
+              const stats = await new Promise<{ size: number; mode: number }>((resolve, reject) => {
+                sftp.stat(resolvedPath, (err, st) => {
+                  if (err || !st) reject(err || new Error('Unable to read file metadata.'));
+                  else resolve({ size: st.size, mode: st.mode });
+                });
               });
-            });
-            if ((stats.mode & 0o170000) === 0o040000) {
-              throw new Error('Selected path is a directory.');
+              if ((stats.mode & 0o170000) === 0o040000) {
+                throw new Error('Selected path is a directory.');
+              }
+              size = stats.size;
+              if (size > 0) {
+                const MAX_BYTES = 524288;
+                const buffer = await new Promise<Buffer>((resolve, reject) => {
+                  const chunks: Buffer[] = [];
+                  let total = 0;
+                  const stream = sftp.createReadStream(resolvedPath, {
+                    start: 0,
+                    end: Math.min(size, MAX_BYTES) - 1,
+                  });
+                  stream.on('data', (chunk: Buffer) => {
+                    chunks.push(chunk);
+                    total += chunk.length;
+                  });
+                  stream.on('error', (err: Error) => reject(err));
+                  stream.on('end', () => resolve(Buffer.concat(chunks, total)));
+                });
+                isBinary = buffer.subarray(0, 1024).includes(0);
+                truncated = size > MAX_BYTES;
+                content = isBinary ? '' : buffer.toString('utf8');
+              }
+            } catch (sftpErr) {
+              resolvedPath = await resolvePathShell(requestedPath);
+              const resShell = await readFileShell(resolvedPath);
+              size = resShell.size;
+              isBinary = resShell.isBinary;
+              truncated = resShell.truncated;
+              content = resShell.content;
             }
 
-            if (stats.size === 0) {
-              sendJson(ws, {
-                type: 'fileContent',
-                requestId,
-                path: resolvedPath,
-                name: path.posix.basename(resolvedPath),
-                size: 0,
-                truncated: false,
-                isBinary: false,
-                content: '',
-              });
-              return;
-            }
-
-            const MAX_BYTES = 524288;
-            const buffer = await new Promise<Buffer>((resolve, reject) => {
-              const chunks: Buffer[] = [];
-              let total = 0;
-              const stream = sftp.createReadStream(resolvedPath, {
-                start: 0,
-                end: Math.min(stats.size, MAX_BYTES) - 1,
-              });
-              stream.on('data', (chunk: Buffer) => {
-                chunks.push(chunk);
-                total += chunk.length;
-              });
-              stream.on('error', (err: Error) => reject(err));
-              stream.on('end', () => resolve(Buffer.concat(chunks, total)));
-            });
-
-            const isBinary = buffer.subarray(0, 1024).includes(0);
             sendJson(ws, {
               type: 'fileContent',
               requestId,
               path: resolvedPath,
               name: path.posix.basename(resolvedPath),
-              size: stats.size,
-              truncated: stats.size > MAX_BYTES,
+              size,
+              truncated,
               isBinary,
-              content: isBinary ? '' : buffer.toString('utf8'),
+              content,
             });
           } catch (err) {
             sendJson(ws, {
@@ -495,84 +681,87 @@ export function attachSshWebSocketServer(
               throw new Error('File content exceeds 2 MB save limit.');
             }
 
-            const sftp = await getSftp();
-
-            const ensureDirRecursive = async (dirPath: string): Promise<string> => {
-              let clean = dirPath.trim();
-              if (!clean || clean === '~') {
-                return resolveSftpPath(sftp, '~');
-              }
-              if (clean.startsWith('~/')) {
-                const home = await resolveSftpPath(sftp, '~');
-                clean = path.posix.join(home, clean.slice(2));
-              }
-              const normalized = path.posix.normalize(clean);
-              const segments = normalized.split('/').filter(Boolean);
-              let current = normalized.startsWith('/') ? '/' : '';
-              for (const seg of segments) {
-                current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
-                const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
-                  sftp.stat(current, (err, st) => {
-                    if (err || !st) resolve('none');
-                    else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
-                  });
-                });
-                if (exists === 'file') {
-                  throw new Error(`Path exists as a file, not a directory: ${current}`);
+            let targetPath = '';
+            try {
+              const sftp = await getSftp();
+              const ensureDirRecursive = async (dirPath: string): Promise<string> => {
+                let clean = dirPath.trim();
+                if (!clean || clean === '~') {
+                  return resolveSftpPath(sftp, '~');
                 }
-                if (exists === 'none') {
-                  await new Promise<void>((resolve, reject) => {
-                    sftp.mkdir(current, (mkErr) => {
-                      if (!mkErr) {
-                        resolve();
-                        return;
-                      }
-                      // Handle concurrent creation race safely
-                      sftp.stat(current, (stErr, st) => {
-                        if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
-                          resolve();
-                        } else {
-                          reject(mkErr);
-                        }
-                      });
+                if (clean.startsWith('~/')) {
+                  const home = await resolveSftpPath(sftp, '~');
+                  clean = path.posix.join(home, clean.slice(2));
+                }
+                const normalized = path.posix.normalize(clean);
+                const segments = normalized.split('/').filter(Boolean);
+                let current = normalized.startsWith('/') ? '/' : '';
+                for (const seg of segments) {
+                  current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
+                  const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
+                    sftp.stat(current, (err, st) => {
+                      if (err || !st) resolve('none');
+                      else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
                     });
                   });
+                  if (exists === 'file') {
+                    throw new Error(`Path exists as a file, not a directory: ${current}`);
+                  }
+                  if (exists === 'none') {
+                    await new Promise<void>((resolve, reject) => {
+                      sftp.mkdir(current, (mkErr) => {
+                        if (!mkErr) {
+                          resolve();
+                          return;
+                        }
+                        sftp.stat(current, (stErr, st) => {
+                          if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
+                            resolve();
+                          } else {
+                            reject(mkErr);
+                          }
+                        });
+                      });
+                    });
+                  }
                 }
-              }
-              return current || '/';
-            };
+                return current || '/';
+              };
 
-            let targetPath: string;
-            try {
-              targetPath = await resolveSftpPath(sftp, requestedPath);
-              const existingStats = await new Promise<{ mode: number }>((resolve, reject) => {
-                sftp.stat(targetPath, (err, st) => {
-                  if (err || !st) reject(err || new Error('Stat failed.'));
-                  else resolve({ mode: st.mode });
+              try {
+                targetPath = await resolveSftpPath(sftp, requestedPath);
+                const existingStats = await new Promise<{ mode: number }>((resolve, reject) => {
+                  sftp.stat(targetPath, (err, st) => {
+                    if (err || !st) reject(err || new Error('Stat failed.'));
+                    else resolve({ mode: st.mode });
+                  });
+                });
+                if ((existingStats.mode & 0o170000) === 0o040000) {
+                  throw new Error('Cannot overwrite a directory.');
+                }
+              } catch (err) {
+                if (err instanceof Error && err.message === 'Cannot overwrite a directory.') {
+                  throw err;
+                }
+                const baseName = path.posix.basename(requestedPath);
+                const dirPart = path.posix.dirname(requestedPath);
+                if (!baseName || baseName === '.' || baseName === '..') {
+                  throw new Error('Invalid file name.');
+                }
+                const resolvedParent = await ensureDirRecursive(dirPart === '.' ? '~' : dirPart);
+                targetPath = path.posix.join(resolvedParent, baseName);
+              }
+
+              await new Promise<void>((resolve, reject) => {
+                sftp.writeFile(targetPath, buf, (err) => {
+                  if (err) reject(err);
+                  else resolve();
                 });
               });
-              if ((existingStats.mode & 0o170000) === 0o040000) {
-                throw new Error('Cannot overwrite a directory.');
-              }
-            } catch (err) {
-              if (err instanceof Error && err.message === 'Cannot overwrite a directory.') {
-                throw err;
-              }
-              const baseName = path.posix.basename(requestedPath);
-              const dirPart = path.posix.dirname(requestedPath);
-              if (!baseName || baseName === '.' || baseName === '..') {
-                throw new Error('Invalid file name.');
-              }
-              const resolvedParent = await ensureDirRecursive(dirPart === '.' ? '~' : dirPart);
-              targetPath = path.posix.join(resolvedParent, baseName);
+            } catch (sftpErr) {
+              targetPath = await resolvePathShell(requestedPath);
+              await writeFileShell(targetPath, content);
             }
-
-            await new Promise<void>((resolve, reject) => {
-              sftp.writeFile(targetPath, buf, (err) => {
-                if (err) reject(err);
-                else resolve();
-              });
-            });
 
             sendJson(ws, {
               type: 'writeFileResult',
@@ -600,45 +789,52 @@ export function attachSshWebSocketServer(
             if (!requestedPath) {
               throw new Error('Missing directory path.');
             }
-            const sftp = await getSftp();
-            let clean = requestedPath;
-            if (clean === '~' || clean.startsWith('~/')) {
-              const home = await resolveSftpPath(sftp, '~');
-              clean = clean === '~' ? home : path.posix.join(home, clean.slice(2));
-            }
-            const normalized = path.posix.normalize(clean);
-            const segments = normalized.split('/').filter(Boolean);
-            let current = normalized.startsWith('/') ? '/' : '';
-            for (const seg of segments) {
-              current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
-              const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
-                sftp.stat(current, (err, st) => {
-                  if (err || !st) resolve('none');
-                  else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
-                });
-              });
-              if (exists === 'file') {
-                throw new Error(`Path exists as a file, not a directory: ${current}`);
+            let resolvedDir = '';
+            try {
+              const sftp = await getSftp();
+              let clean = requestedPath;
+              if (clean === '~' || clean.startsWith('~/')) {
+                const home = await resolveSftpPath(sftp, '~');
+                clean = clean === '~' ? home : path.posix.join(home, clean.slice(2));
               }
-              if (exists === 'none') {
-                await new Promise<void>((resolve, reject) => {
-                  sftp.mkdir(current, (mkErr) => {
-                    if (!mkErr) {
-                      resolve();
-                      return;
-                    }
-                    sftp.stat(current, (stErr, st) => {
-                      if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
-                        resolve();
-                      } else {
-                        reject(mkErr);
-                      }
-                    });
+              const normalized = path.posix.normalize(clean);
+              const segments = normalized.split('/').filter(Boolean);
+              let current = normalized.startsWith('/') ? '/' : '';
+              for (const seg of segments) {
+                current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
+                const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
+                  sftp.stat(current, (err, st) => {
+                    if (err || !st) resolve('none');
+                    else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
                   });
                 });
+                if (exists === 'file') {
+                  throw new Error(`Path exists as a file, not a directory: ${current}`);
+                }
+                if (exists === 'none') {
+                  await new Promise<void>((resolve, reject) => {
+                    sftp.mkdir(current, (mkErr) => {
+                      if (!mkErr) {
+                        resolve();
+                        return;
+                      }
+                      sftp.stat(current, (stErr, st) => {
+                        if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
+                          resolve();
+                        } else {
+                          reject(mkErr);
+                        }
+                      });
+                    });
+                  });
+                }
               }
+              resolvedDir = await resolveSftpPath(sftp, current || '/');
+            } catch (sftpErr) {
+              resolvedDir = await resolvePathShell(requestedPath);
+              await createDirShell(resolvedDir);
             }
-            const resolvedDir = await resolveSftpPath(sftp, current || '/');
+
             sendJson(ws, {
               type: 'createDirResult',
               requestId,
