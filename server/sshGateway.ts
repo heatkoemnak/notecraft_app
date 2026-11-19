@@ -193,6 +193,11 @@ export function attachSshWebSocketServer(
       }
       if (shellStream) {
         try {
+          shellStream.write('\x03exit\n');
+        } catch {
+          // ignore write error
+        }
+        try {
           shellStream.removeAllListeners();
           shellStream.close();
         } catch {
