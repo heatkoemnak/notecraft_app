@@ -174,15 +174,25 @@ export function attachSshWebSocketServer(
 
   wss.on('connection', (ws: WebSocket) => {
     let sshClient: SshClient | null = null;
+    let fileClient: SshClient | null = null;
+    let fileClientPromise: Promise<SshClient> | null = null;
+    let activeConnectConfig: ConnectConfig | null = null;
+    let activeAuthType: string = 'password';
+    let activePassword = '';
     let shellStream: ClientChannel | null = null;
     let sftpSession: SFTPWrapper | null = null;
     let sftpInitPromise: Promise<SFTPWrapper> | null = null;
+    let sftpFailedPermanently = false;
     let currentCols = 100;
     let currentRows = 30;
     let manualDisconnect = false;
+    let execQueue: Promise<unknown> = Promise.resolve();
 
     const cleanupSsh = (reason?: string, notifyDisconnect = false) => {
       sftpInitPromise = null;
+      sftpFailedPermanently = false;
+      fileClientPromise = null;
+      activeConnectConfig = null;
       if (sftpSession) {
         try {
           sftpSession.end();
@@ -190,6 +200,15 @@ export function attachSshWebSocketServer(
           // ignore sftp cleanup errors
         }
         sftpSession = null;
+      }
+      if (fileClient) {
+        try {
+          fileClient.removeAllListeners();
+          fileClient.end();
+        } catch {
+          // ignore fileClient cleanup errors
+        }
+        fileClient = null;
       }
       if (shellStream) {
         try {
@@ -223,32 +242,84 @@ export function attachSshWebSocketServer(
       }
     };
 
-    const getSftp = (): Promise<SFTPWrapper> => {
+    const getFileClient = async (): Promise<SshClient> => {
       if (!sshClient) {
-        return Promise.reject(new Error('SSH is not connected.'));
+        throw new Error('SSH is not connected.');
+      }
+      if (fileClient) {
+        return fileClient;
+      }
+      if (!activeConnectConfig) {
+        return sshClient;
+      }
+      if (fileClientPromise) {
+        return fileClientPromise;
+      }
+
+      fileClientPromise = new Promise<SshClient>((resolve) => {
+        try {
+          const fc = new SshClient();
+          let settled = false;
+
+          fc.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
+            if (activeAuthType === 'password' && prompts.length > 0) {
+              finish(prompts.map(() => activePassword));
+            } else {
+              finish([]);
+            }
+          });
+
+          fc.on('ready', () => {
+            if (settled) return;
+            settled = true;
+            fileClient = fc;
+            fileClientPromise = null;
+            fc.on('close', () => {
+              if (fileClient === fc) {
+                fileClient = null;
+                sftpSession = null;
+              }
+            });
+            resolve(fc);
+          });
+
+          fc.on('error', () => {
+            if (!settled) {
+              settled = true;
+              fileClientPromise = null;
+              // If secondary connection is refused, fall back to main sshClient
+              resolve(sshClient || fc);
+            }
+          });
+
+          fc.connect({ ...activeConnectConfig, readyTimeout: 10000 });
+        } catch {
+          fileClientPromise = null;
+          resolve(sshClient);
+        }
+      });
+
+      return fileClientPromise;
+    };
+
+    const getSftp = async (): Promise<SFTPWrapper> => {
+      if (sftpFailedPermanently) {
+        throw new Error('SFTP subsystem unavailable on remote server.');
       }
       if (sftpSession) {
-        return Promise.resolve(sftpSession);
+        return sftpSession;
       }
       if (sftpInitPromise) {
         return sftpInitPromise;
       }
-      const clientRef = sshClient;
+
+      const clientRef = await getFileClient();
       sftpInitPromise = new Promise<SFTPWrapper>((resolve, reject) => {
         clientRef.sftp((err, sftp) => {
+          sftpInitPromise = null;
           if (err || !sftp) {
-            sftpInitPromise = null;
+            sftpFailedPermanently = true;
             reject(err || new Error('SFTP subsystem unavailable on remote server.'));
-            return;
-          }
-          if (sshClient !== clientRef) {
-            try {
-              sftp.end();
-            } catch {
-              // ignore
-            }
-            sftpInitPromise = null;
-            reject(new Error('SSH session changed.'));
             return;
           }
           sftpSession = sftp;
@@ -265,205 +336,305 @@ export function attachSshWebSocketServer(
     };
 
     const resolveSftpPath = (sftp: SFTPWrapper, rawPath?: string): Promise<string> =>
-      new Promise((resolve, reject) => {
+      new Promise((resolve) => {
         const trimmed = (rawPath || '').trim();
         if (!trimmed || trimmed === '~') {
           sftp.realpath('.', (err, absPath) => {
-            if (err || !absPath) reject(err || new Error('Unable to resolve home directory.'));
-            else resolve(absPath);
+            if (!err && absPath) resolve(absPath);
+            else resolve('/');
           });
           return;
         }
         if (trimmed.startsWith('~/')) {
           sftp.realpath('.', (homeErr, homePath) => {
-            if (homeErr || !homePath) {
-              reject(homeErr || new Error('Unable to resolve home directory.'));
-              return;
-            }
-            const joined = path.posix.join(homePath, trimmed.slice(2));
+            const home = (!homeErr && homePath) ? homePath : '/';
+            const joined = path.posix.join(home, trimmed.slice(2));
             sftp.realpath(joined, (err, absPath) => {
-              if (err || !absPath) reject(err || new Error(`Directory not found: ${trimmed}`));
-              else resolve(absPath);
+              if (!err && absPath) resolve(absPath);
+              else resolve(joined);
             });
           });
           return;
         }
+        if (trimmed.startsWith('/')) {
+          const norm = path.posix.normalize(trimmed);
+          sftp.realpath(norm, (err, absPath) => {
+            if (!err && absPath) resolve(absPath);
+            else resolve(norm);
+          });
+          return;
+        }
         sftp.realpath(trimmed, (err, absPath) => {
-          if (err || !absPath) reject(err || new Error(`Path not found: ${trimmed}`));
-          else resolve(absPath);
+          if (!err && absPath) resolve(absPath);
+          else resolve(path.posix.normalize(trimmed));
         });
       });
 
     const execOnSsh = (
       cmd: string,
-      timeoutMs = 20000
-    ): Promise<{ stdout: string; stderr: string; code: number }> =>
-      new Promise((resolve, reject) => {
-        if (!sshClient) {
-          reject(new Error('SSH is not connected.'));
-          return;
-        }
-        sshClient.exec(cmd, (err, stream) => {
-          if (err || !stream) {
-            reject(err || new Error('Failed to execute remote command.'));
-            return;
-          }
-          let stdout = '';
-          let stderr = '';
-          let settled = false;
-          const MAX_OUTPUT = 2 * 1024 * 1024;
-          const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            try {
-              stream.close();
-            } catch {
-              // ignore
-            }
-            reject(new Error('Remote command timed out.'));
-          }, timeoutMs);
+      timeoutMs = 25000
+    ): Promise<{ stdout: string; stderr: string; code: number }> => {
+      const execute = async () => {
+        const client = await getFileClient();
+        return new Promise<{ stdout: string; stderr: string; code: number }>((resolve, reject) => {
+          let retried = false;
 
-          stream.on('data', (chunk: Buffer) => {
-            if (stdout.length < MAX_OUTPUT) {
-              stdout += chunk.toString('utf8');
+          const attempt = () => {
+            if (!sshClient) {
+              reject(new Error('SSH is not connected.'));
+              return;
             }
-          });
-          stream.stderr?.on('data', (chunk: Buffer) => {
-            if (stderr.length < MAX_OUTPUT) {
-              stderr += chunk.toString('utf8');
-            }
-          });
-          stream.on('close', (code: number | null) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
-          });
-          stream.on('error', (streamErr: Error) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            reject(streamErr);
-          });
+            client.exec(cmd, (err, stream) => {
+              if (err) {
+                if (!retried && err.message?.includes('Channel open failure')) {
+                  retried = true;
+                  setTimeout(attempt, 300);
+                  return;
+                }
+                reject(err);
+                return;
+              }
+
+              let stdout = '';
+              let stderr = '';
+              let settled = false;
+              const MAX_OUTPUT = 2 * 1024 * 1024;
+              const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                try {
+                  stream.close();
+                } catch {
+                  // ignore
+                }
+                reject(new Error('Remote command timed out.'));
+              }, timeoutMs);
+
+              stream.on('data', (chunk: Buffer) => {
+                if (stdout.length < MAX_OUTPUT) {
+                  stdout += chunk.toString('utf8');
+                }
+              });
+              stream.stderr?.on('data', (chunk: Buffer) => {
+                if (stderr.length < MAX_OUTPUT) {
+                  stderr += chunk.toString('utf8');
+                }
+              });
+              stream.on('close', (code: number | null) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
+              });
+              stream.on('error', (streamErr: Error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(streamErr);
+              });
+            });
+          };
+
+          attempt();
         });
-      });
+      };
+
+      const result = execQueue.then(execute, execute);
+      execQueue = result.catch(() => {});
+      return result;
+    };
 
     const resolvePathShell = async (rawPath?: string): Promise<string> => {
       const trimmed = (rawPath || '').trim();
-      const pyCode = trimmed && trimmed !== '~'
-        ? `import os; p = os.path.expanduser(__import__('base64').b64decode(${JSON.stringify(Buffer.from(trimmed, 'utf8').toString('base64'))}).decode('utf-8')); print(os.path.abspath(p))`
-        : `import os; print(os.path.abspath(os.path.expanduser('~')))`;
-      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyCode)}`, 10000);
-      if (res.code !== 0 || !res.stdout.trim()) {
-        throw new Error(res.stderr.trim() || `Unable to resolve path: ${trimmed}`);
+      if (!trimmed || trimmed === '~') {
+        const res = await execOnSsh(`sh -c 'cd ~ 2>/dev/null && pwd || echo "/"'`, 8000);
+        const out = res.stdout.trim().split('\n')[0];
+        return out || '/';
       }
-      return res.stdout.trim().split('\n')[0];
+      if (trimmed.startsWith('/') && !trimmed.includes('..') && !trimmed.includes('~')) {
+        return path.posix.normalize(trimmed);
+      }
+      if (trimmed.startsWith('~/')) {
+        const homeRes = await execOnSsh(`sh -c 'cd ~ 2>/dev/null && pwd || echo "/"'`, 8000);
+        const home = homeRes.stdout.trim().split('\n')[0] || '/';
+        return path.posix.join(home, trimmed.slice(2));
+      }
+      const qPath = quoteShellArg(trimmed);
+      const res = await execOnSsh(`sh -c 'cd ${qPath} 2>/dev/null && pwd || echo ${qPath}'`, 8000);
+      const out = res.stdout.trim().split('\n')[0];
+      return out || path.posix.normalize(trimmed);
     };
 
     const listDirShell = async (resolvedPath: string) => {
-      const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
-      const pyScript = [
-        `import os, json, stat, base64`,
-        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
-        `entries = []`,
-        `try:`,
-        `    for name in os.listdir(p):`,
-        `        if name == '.' or name == '..': continue`,
-        `        fp = os.path.join(p, name)`,
-        `        try:`,
-        `            st = os.lstat(fp)`,
-        `            is_sym = stat.S_ISLNK(st.st_mode)`,
-        `            is_dir = stat.S_ISDIR(st.st_mode)`,
-        `            if is_sym:`,
-        `                try:`,
-        `                    is_dir = os.path.isdir(fp)`,
-        `                except: pass`,
-        `            size = st.st_size if not is_dir else 0`,
-        `            mtime = int(st.st_mtime * 1000)`,
-        `            entries.append({'name': name, 'path': fp, 'isDirectory': is_dir, 'size': size, 'modifiedAt': mtime})`,
-        `        except: pass`,
-        `    entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))`,
-        `    print(json.dumps(entries[:300]))`,
-        `except Exception as e:`,
-        `    print(json.dumps({'error': str(e)}))`
-      ].join('\n');
-      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 15000);
-      if (res.code !== 0) throw new Error(res.stderr.trim() || 'Failed to list directory via shell.');
-      const trimmed = res.stdout.trim();
+      // 1. Try python3 first if available
       try {
-        const parsed = JSON.parse(trimmed);
-        if (parsed && typeof parsed === 'object' && 'error' in parsed) {
-          throw new Error(parsed.error);
+        const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
+        const pyScript = [
+          `import os, json, stat, base64`,
+          `p = base64.b64decode('${pathB64}').decode('utf-8')`,
+          `entries = []`,
+          `for name in os.listdir(p):`,
+          `    if name == '.' or name == '..': continue`,
+          `    fp = os.path.join(p, name)`,
+          `    try:`,
+          `        st = os.lstat(fp)`,
+          `        is_sym = stat.S_ISLNK(st.st_mode)`,
+          `        is_dir = stat.S_ISDIR(st.st_mode)`,
+          `        if is_sym:`,
+          `            try: is_dir = os.path.isdir(fp)`,
+          `            except: pass`,
+          `        entries.append({'name': name, 'path': fp, 'isDirectory': is_dir, 'size': st.st_size if not is_dir else 0, 'modifiedAt': int(st.st_mtime * 1000)})`,
+          `    except: pass`,
+          `entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))`,
+          `print(json.dumps(entries[:300]))`
+        ].join('\n');
+        const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 12000);
+        if (res.code === 0 && res.stdout.trim().startsWith('[')) {
+          return JSON.parse(res.stdout.trim()) as Array<{
+            name: string;
+            path: string;
+            isDirectory: boolean;
+            size: number;
+            modifiedAt: number | null;
+          }>;
         }
-        return Array.isArray(parsed) ? parsed : [];
-      } catch (err) {
-        throw new Error(`Failed to parse directory listing: ${trimmed}`);
+      } catch {
+        // Fall through to POSIX ls
       }
+
+      // 2. Pure POSIX shell fallback (works on EVERY Unix/Linux/BusyBox/macOS machine)
+      const qPath = quoteShellArg(resolvedPath);
+      const script = `cd ${qPath} 2>/dev/null || exit 1; ls -1ap`;
+      const res = await execOnSsh(`sh -c ${quoteShellArg(script)}`, 12000);
+      if (res.code !== 0) {
+        throw new Error(res.stderr.trim() || `Cannot access directory: ${resolvedPath}`);
+      }
+      const lines = res.stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && l !== './' && l !== '../');
+
+      const entries = lines.slice(0, 300).map((line) => {
+        const isDirectory = line.endsWith('/');
+        const name = isDirectory ? line.slice(0, -1) : line;
+        return {
+          name,
+          path: path.posix.join(resolvedPath, name),
+          isDirectory,
+          size: 0,
+          modifiedAt: null,
+        };
+      });
+
+      entries.sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      return entries;
     };
 
     const readFileShell = async (resolvedPath: string) => {
-      const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
-      const pyScript = [
-        `import os, sys, base64, json`,
-        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
-        `try:`,
-        `    st = os.stat(p)`,
-        `    if os.path.isdir(p):`,
-        `        print(json.dumps({'error': 'Selected path is a directory.'}))`,
-        `        sys.exit(0)`,
-        `    size = st.st_size`,
-        `    MAX = 524288`,
-        `    with open(p, 'rb') as f:`,
-        `        data = f.read(MAX)`,
-        `    is_bin = b'\\x00' in data[:1024]`,
-        `    b64 = base64.b64encode(data).decode('utf-8')`,
-        `    print(json.dumps({'size': size, 'isBinary': is_bin, 'content': b64 if not is_bin else '', 'truncated': size > MAX}))`,
-        `except Exception as e:`,
-        `    print(json.dumps({'error': str(e)}))`
-      ].join('\n');
-      const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 20000);
-      if (res.code !== 0) throw new Error(res.stderr.trim() || 'Failed to read file via shell.');
-      const trimmed = res.stdout.trim();
+      // 1. Try python3 first
       try {
-        const parsed = JSON.parse(trimmed);
-        if (parsed.error) throw new Error(parsed.error);
-        const contentBuf = Buffer.from(parsed.content || '', 'base64');
-        return {
-          size: parsed.size,
-          isBinary: parsed.isBinary,
-          truncated: parsed.truncated,
-          content: contentBuf.toString('utf8'),
-        };
+        const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
+        const pyScript = [
+          `import os, sys, base64, json`,
+          `p = base64.b64decode('${pathB64}').decode('utf-8')`,
+          `try:`,
+          `    st = os.stat(p)`,
+          `    if os.path.isdir(p):`,
+          `        print(json.dumps({'error': 'Selected path is a directory.'}))`,
+          `        sys.exit(0)`,
+          `    size = st.st_size`,
+          `    MAX = 524288`,
+          `    with open(p, 'rb') as f:`,
+          `        data = f.read(MAX)`,
+          `    is_bin = b'\\x00' in data[:1024]`,
+          `    b64 = base64.b64encode(data).decode('utf-8')`,
+          `    print(json.dumps({'size': size, 'isBinary': is_bin, 'content': b64 if not is_bin else '', 'truncated': size > MAX}))`,
+          `except Exception as e:`,
+          `    print(json.dumps({'error': str(e)}))`
+        ].join('\n');
+        const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 15000);
+        if (res.code === 0 && res.stdout.trim().startsWith('{')) {
+          const parsed = JSON.parse(res.stdout.trim());
+          if (parsed.error) throw new Error(parsed.error);
+          const contentBuf = Buffer.from(parsed.content || '', 'base64');
+          return {
+            size: parsed.size,
+            isBinary: parsed.isBinary,
+            truncated: parsed.truncated,
+            content: contentBuf.toString('utf8'),
+          };
+        }
       } catch (err) {
-        if (err instanceof Error && err.message) throw err;
-        throw new Error(`Failed to parse file content: ${trimmed}`);
+        if (err instanceof Error && err.message === 'Selected path is a directory.') {
+          throw err;
+        }
       }
+
+      // 2. POSIX head / base64 fallback
+      const qPath = quoteShellArg(resolvedPath);
+      const res = await execOnSsh(
+        `sh -c 'if [ -d ${qPath} ]; then echo "__DIR__"; exit 0; fi; head -c 524288 ${qPath} | base64'`,
+        15000
+      );
+      if (res.stdout.trim() === '__DIR__') {
+        throw new Error('Selected path is a directory.');
+      }
+      if (res.code !== 0) {
+        throw new Error(res.stderr.trim() || `Cannot read file: ${resolvedPath}`);
+      }
+      const rawB64 = res.stdout.replace(/\s+/g, '');
+      const buf = Buffer.from(rawB64, 'base64');
+      const isBin = buf.subarray(0, 1024).includes(0);
+      return {
+        size: buf.length,
+        isBinary: isBin,
+        truncated: false,
+        content: isBin ? '' : buf.toString('utf8'),
+      };
     };
 
     const writeFileShell = async (resolvedPath: string, content: string) => {
       const buf = Buffer.from(content, 'utf8');
       const b64 = buf.toString('base64');
       const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
-      const script = [
-        `import os, base64`,
-        `p = base64.b64decode('${pathB64}').decode('utf-8')`,
-        `d = os.path.dirname(p)`,
-        `if d: os.makedirs(d, exist_ok=True)`,
-        `data = base64.b64decode('${b64}')`,
-        `with open(p, 'wb') as f:`,
-        `    f.write(data)`,
-        `print('OK')`
-      ].join('\n');
-      const res = await execOnSsh(`python3 -c ${quoteShellArg(script)}`, 20000);
-      if (res.code !== 0 || !res.stdout.includes('OK')) {
-        throw new Error(res.stderr.trim() || res.stdout.trim() || 'Failed to write file via shell.');
+      // Try python3 first
+      try {
+        const script = [
+          `import os, base64`,
+          `p = base64.b64decode('${pathB64}').decode('utf-8')`,
+          `d = os.path.dirname(p)`,
+          `if d: os.makedirs(d, exist_ok=True)`,
+          `data = base64.b64decode('${b64}')`,
+          `with open(p, 'wb') as f:`,
+          `    f.write(data)`,
+          `print('OK')`
+        ].join('\n');
+        const res = await execOnSsh(`python3 -c ${quoteShellArg(script)}`, 15000);
+        if (res.code === 0 && res.stdout.includes('OK')) {
+          return;
+        }
+      } catch {
+        // Fall through
+      }
+
+      // POSIX fallback
+      const dir = path.posix.dirname(resolvedPath);
+      const qDir = quoteShellArg(dir);
+      const qFile = quoteShellArg(resolvedPath);
+      const script = `mkdir -p ${qDir} && echo '${b64}' | base64 -d > ${qFile}`;
+      const resPosix = await execOnSsh(`sh -c ${quoteShellArg(script)}`, 15000);
+      if (resPosix.code !== 0) {
+        throw new Error(resPosix.stderr.trim() || 'Failed to save file.');
       }
     };
 
     const createDirShell = async (resolvedPath: string) => {
       const res = await execOnSsh(`mkdir -p ${quoteShellArg(resolvedPath)}`, 10000);
       if (res.code !== 0) {
-        throw new Error(res.stderr.trim() || 'Failed to create directory via shell.');
+        throw new Error(res.stderr.trim() || 'Failed to create directory.');
       }
     };
 
