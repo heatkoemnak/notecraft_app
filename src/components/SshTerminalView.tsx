@@ -53,6 +53,7 @@ import {
   RemoteDirEntry,
   RemoteFilePreview,
 } from './RemoteCodeEditor';
+import { RemotePathInput } from './RemotePathInput';
 
 interface SshTerminalViewProps {
   isActive?: boolean;
@@ -226,10 +227,53 @@ export function SshTerminalView({
   const pendingDirReqRef = useRef<
     Map<string, { requestedPath: string; mode: 'root' | 'expand' }>
   >(new Map());
+  const pendingAsyncDirReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: { path: string; entries: RemoteDirEntry[]; truncated: boolean }) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
+  const pendingAsyncFileReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: RemoteFilePreview) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
+  const pendingAsyncWriteReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: { path: string; size: number }) => void;
+        reject: (err: Error) => void;
+        content: string;
+        timer: number;
+      }
+    >
+  >(new Map());
+  const pendingAsyncMkdirReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: { path: string }) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
   const dirCacheRef = useRef<Record<string, RemoteDirEntry[]>>(dirCache);
   dirCacheRef.current = dirCache;
   const expandedDirsRef = useRef<Record<string, boolean>>(expandedDirs);
   expandedDirsRef.current = expandedDirs;
+  const dirBrowserOpenRef = useRef<boolean>(dirBrowserOpen);
+  dirBrowserOpenRef.current = dirBrowserOpen;
   const fileReqIdRef = useRef<string>('');
   const writeReqIdRef = useRef<string>('');
   const openFullScreenOnLoadRef = useRef<boolean>(false);
@@ -248,6 +292,12 @@ export function SshTerminalView({
   isActiveRef.current = isActive;
   const copySelectionRef = useRef<() => Promise<boolean>>(async () => false);
   const pasteClipboardRef = useRef<() => Promise<void>>(async () => {});
+  const requestListDirRef = useRef<
+    (
+      targetPath?: string,
+      options?: { mode?: 'root' | 'expand'; keepPreview?: boolean; openFullScreen?: boolean }
+    ) => void
+  >(() => {});
 
   useEffect(() => {
     const mq = window.matchMedia('(min-width: 1024px)');
@@ -439,6 +489,23 @@ export function SshTerminalView({
       setHasSelection(term.hasSelection());
     });
 
+    const osc7Disposable = term.parser.registerOscHandler(7, (data) => {
+      try {
+        const match = /^file:\/\/[^/]*(\/.*)$/i.exec(data.trim());
+        if (!match?.[1]) return false;
+        const decodedPath = decodeURIComponent(match[1]);
+        if (decodedPath && decodedPath.startsWith('/')) {
+          setPathInput(decodedPath);
+          if (dirBrowserOpenRef.current && decodedPath !== currentRemotePathRef.current) {
+            requestListDirRef.current(decodedPath, { mode: 'root', keepPreview: true });
+          }
+        }
+      } catch {
+        // ignore malformed OSC-7 URI
+      }
+      return false;
+    });
+
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== 'keydown') return true;
       const key = ev.key.toLowerCase();
@@ -498,6 +565,7 @@ export function SshTerminalView({
       resizeObserver.disconnect();
       inputDisposable.dispose();
       selectionDisposable.dispose();
+      osc7Disposable.dispose();
       if (wsRef.current) {
         try {
           wsRef.current.close();
@@ -562,19 +630,50 @@ export function SshTerminalView({
     }
   };
 
-  const closeSocket = useCallback((sendDisconnectMsg = true) => {
-    const ws = wsRef.current;
-    if (!ws) return;
-    try {
-      if (sendDisconnectMsg && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'disconnect' }));
-      }
-      ws.close();
-    } catch {
-      // ignore
-    }
-    wsRef.current = null;
+  const rejectPendingAsyncRequests = useCallback((reason: string) => {
+    const err = new Error(reason);
+    pendingAsyncDirReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncDirReqsRef.current.clear();
+
+    pendingAsyncFileReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncFileReqsRef.current.clear();
+
+    pendingAsyncWriteReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncWriteReqsRef.current.clear();
+
+    pendingAsyncMkdirReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncMkdirReqsRef.current.clear();
   }, []);
+
+  const closeSocket = useCallback(
+    (sendDisconnectMsg = true) => {
+      rejectPendingAsyncRequests('SSH connection closed.');
+      const ws = wsRef.current;
+      if (!ws) return;
+      try {
+        if (sendDisconnectMsg && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'disconnect' }));
+        }
+        ws.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+    },
+    [rejectPendingAsyncRequests]
+  );
 
   const handleDisconnect = () => {
     closeSocket(true);
@@ -633,6 +732,108 @@ export function SshTerminalView({
     },
     []
   );
+
+  requestListDirRef.current = requestListDir;
+
+  const listRemoteDirAsync = useCallback(
+    (dirPath: string): Promise<{ path: string; entries: RemoteDirEntry[]; truncated: boolean }> => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('SSH is not connected.'));
+      }
+      const reqId = `adir-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          pendingAsyncDirReqsRef.current.delete(reqId);
+          reject(new Error(`Timed out listing directory: ${dirPath}`));
+        }, 15000);
+        pendingAsyncDirReqsRef.current.set(reqId, { resolve, reject, timer });
+        ws.send(
+          JSON.stringify({
+            type: 'listDir',
+            requestId: reqId,
+            path: dirPath,
+          })
+        );
+      });
+    },
+    []
+  );
+
+  const readRemoteFileAsync = useCallback((filePath: string): Promise<RemoteFilePreview> => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('SSH is not connected.'));
+    }
+    const reqId = `afile-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        pendingAsyncFileReqsRef.current.delete(reqId);
+        reject(new Error(`Timed out reading file: ${filePath}`));
+      }, 15000);
+      pendingAsyncFileReqsRef.current.set(reqId, { resolve, reject, timer });
+      ws.send(
+        JSON.stringify({
+          type: 'readFile',
+          requestId: reqId,
+          path: filePath,
+        })
+      );
+    });
+  }, []);
+
+  const writeRemoteFileAsync = useCallback(
+    (filePath: string, nextContent: string): Promise<{ path: string; size: number }> => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('SSH is not connected.'));
+      }
+      const reqId = `awrite-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          pendingAsyncWriteReqsRef.current.delete(reqId);
+          reject(new Error(`Timed out saving file: ${filePath}`));
+        }, 20000);
+        pendingAsyncWriteReqsRef.current.set(reqId, {
+          resolve,
+          reject,
+          content: nextContent,
+          timer,
+        });
+        ws.send(
+          JSON.stringify({
+            type: 'writeFile',
+            requestId: reqId,
+            path: filePath,
+            content: nextContent,
+          })
+        );
+      });
+    },
+    []
+  );
+
+  const createRemoteDirAsync = useCallback((dirPath: string): Promise<{ path: string }> => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('SSH is not connected.'));
+    }
+    const reqId = `amkdir-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        pendingAsyncMkdirReqsRef.current.delete(reqId);
+        reject(new Error(`Timed out creating directory: ${dirPath}`));
+      }, 15000);
+      pendingAsyncMkdirReqsRef.current.set(reqId, { resolve, reject, timer });
+      ws.send(
+        JSON.stringify({
+          type: 'createDir',
+          requestId: reqId,
+          path: dirPath,
+        })
+      );
+    });
+  }, []);
 
   const handleToggleTreeDir = useCallback(
     (dirPath: string) => {
@@ -888,12 +1089,32 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'dirListing') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncDirReqsRef.current.get(msg.requestId)
+          : undefined;
+        const resolvedPath = msg.path || '/';
+        const entries = Array.isArray(msg.entries) ? msg.entries : [];
+
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncDirReqsRef.current.delete(msg.requestId);
+          setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
+          setTruncatedDirs((prev) => ({
+            ...prev,
+            [resolvedPath]: Boolean(msg.truncated),
+          }));
+          asyncPending.resolve({
+            path: resolvedPath,
+            entries,
+            truncated: Boolean(msg.truncated),
+          });
+          return;
+        }
+
         const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
         if (msg.requestId) {
           pendingDirReqRef.current.delete(msg.requestId);
         }
-        const resolvedPath = msg.path || '/';
-        const entries = Array.isArray(msg.entries) ? msg.entries : [];
 
         setLoadingDirs((prev) => {
           const next = { ...prev };
@@ -919,6 +1140,16 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'dirError') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncDirReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncDirReqsRef.current.delete(msg.requestId);
+          asyncPending.reject(new Error(msg.error || 'Unable to list remote directory.'));
+          return;
+        }
+
         const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
         if (msg.requestId) {
           pendingDirReqRef.current.delete(msg.requestId);
@@ -934,18 +1165,29 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'fileContent') {
-        if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
-        setFileLoading(false);
-        setSaveFileError(null);
-        setLastSavedAt(null);
-        setPreviewFile({
+        const asyncPending = msg.requestId
+          ? pendingAsyncFileReqsRef.current.get(msg.requestId)
+          : undefined;
+        const preview: RemoteFilePreview = {
           path: msg.path || '',
           name: msg.name || 'file',
           content: msg.content || '',
           size: Number(msg.size || 0),
           truncated: Boolean(msg.truncated),
           isBinary: Boolean(msg.isBinary),
-        });
+        };
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncFileReqsRef.current.delete(msg.requestId);
+          asyncPending.resolve(preview);
+          return;
+        }
+
+        if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
+        setFileLoading(false);
+        setSaveFileError(null);
+        setLastSavedAt(null);
+        setPreviewFile(preview);
         if (openFullScreenOnLoadRef.current) {
           openFullScreenOnLoadRef.current = false;
           setEditorFullScreen(true);
@@ -954,6 +1196,16 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'fileError') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncFileReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncFileReqsRef.current.delete(msg.requestId);
+          asyncPending.reject(new Error(msg.error || 'Unable to read remote file.'));
+          return;
+        }
+
         if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
         openFullScreenOnLoadRef.current = false;
         setFileLoading(false);
@@ -962,6 +1214,43 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'writeFileResult') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncWriteReqsRef.current.delete(msg.requestId);
+          const savedPath = msg.path || '';
+          const savedSize = Number(msg.size ?? new Blob([asyncPending.content]).size);
+          setLastSavedAt(Number(msg.savedAt || Date.now()));
+          const fileName = savedPath.split('/').pop() || 'file';
+          setPreviewFile((prev) => {
+            if (prev && prev.path === savedPath) {
+              return {
+                path: savedPath,
+                name: fileName,
+                content: asyncPending.content,
+                size: savedSize,
+                truncated: false,
+                isBinary: false,
+              };
+            }
+            return prev;
+          });
+          const parentDir = savedPath ? getParentPosixPath(savedPath) : '';
+          if (
+            parentDir &&
+            (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
+          ) {
+            requestListDir(parentDir, {
+              mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
+              keepPreview: true,
+            });
+          }
+          asyncPending.resolve({ path: savedPath, size: savedSize });
+          return;
+        }
+
         if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
         setSavingFile(false);
         setSaveFileError(null);
@@ -999,10 +1288,55 @@ export function SshTerminalView({
       }
 
       if (msg.type === 'writeFileError') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncWriteReqsRef.current.delete(msg.requestId);
+          asyncPending.reject(new Error(msg.error || 'Unable to save remote file.'));
+          return;
+        }
+
         if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
         setSavingFile(false);
         pendingSaveDraftRef.current = null;
         setSaveFileError(msg.error || 'Unable to save remote file.');
+        return;
+      }
+
+      if (msg.type === 'createDirResult') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
+          : undefined;
+        const createdDir = msg.path || '';
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
+          const parentDir = createdDir ? getParentPosixPath(createdDir) : '';
+          if (
+            parentDir &&
+            (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
+          ) {
+            requestListDir(parentDir, {
+              mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
+              keepPreview: true,
+            });
+          }
+          asyncPending.resolve({ path: createdDir });
+        }
+        return;
+      }
+
+      if (msg.type === 'createDirError') {
+        const asyncPending = msg.requestId
+          ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
+          : undefined;
+        if (asyncPending && msg.requestId) {
+          window.clearTimeout(asyncPending.timer);
+          pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
+          asyncPending.reject(new Error(msg.error || 'Unable to create remote directory.'));
+        }
         return;
       }
 
@@ -1033,11 +1367,13 @@ export function SshTerminalView({
             });
           }
         } else if (msg.status === 'error') {
+          rejectPendingAsyncRequests(msg.message || 'SSH connection error.');
           setConnectedTarget(null);
           if (msg.message) {
             termRef.current?.writeln(`\x1b[31m✖ ${msg.message}\x1b[0m`);
           }
         } else if (msg.status === 'disconnected') {
+          rejectPendingAsyncRequests(msg.message || 'SSH disconnected.');
           setConnectedTarget(null);
           setDirBrowserOpen(false);
           setEditorFullScreen(false);
@@ -1051,6 +1387,7 @@ export function SshTerminalView({
 
     ws.onerror = () => {
       if (wsRef.current !== ws) return;
+      rejectPendingAsyncRequests('WebSocket connection to SSH gateway failed.');
       setStatus('error');
       setStatusMessage('WebSocket connection to SSH gateway failed.');
       setConnectedTarget(null);
@@ -1058,6 +1395,7 @@ export function SshTerminalView({
 
     ws.onclose = () => {
       if (wsRef.current !== ws) return;
+      rejectPendingAsyncRequests('WebSocket connection closed.');
       wsRef.current = null;
       setStatus((prev) => (prev === 'error' ? 'error' : 'disconnected'));
       setConnectedTarget(null);
@@ -2063,13 +2401,18 @@ export function SshTerminalView({
                     >
                       <Home className="w-3.5 h-3.5" />
                     </button>
-                    <input
-                      type="text"
+                    <RemotePathInput
                       value={pathInput}
-                      onChange={(e) => setPathInput(e.target.value)}
+                      onChange={setPathInput}
+                      onSyncDirectory={(dirPath) =>
+                        requestListDir(dirPath, { mode: 'root', keepPreview: true })
+                      }
+                      dirCache={dirCache}
+                      fetchDirEntries={listRemoteDirAsync}
+                      currentRemotePath={currentRemotePath}
                       placeholder="/var/www/project"
-                      aria-label="Remote project directory path"
-                      className="font-mono-code flex-1 min-w-0 px-2.5 py-1 text-[12px] rounded-md border border-white/12 bg-[#0c0c0f] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
+                      ariaLabel="Remote project directory path"
+                      inputClassName="font-mono-code w-full min-w-0 px-2.5 py-1 text-[12px] rounded-md border border-white/12 bg-[#0c0c0f] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
                     />
                     <button
                       type="submit"
@@ -2147,6 +2490,10 @@ export function SshTerminalView({
                     onOpenInTerminal={handleOpenDirectoryInTerminal}
                     onOpenFile={(filePath) => requestReadFile(filePath)}
                     onCreateNewFile={handleCreateNewRemoteFile}
+                    fetchDirEntries={listRemoteDirAsync}
+                    onReadRemoteFile={readRemoteFileAsync}
+                    onWriteRemoteFile={writeRemoteFileAsync}
+                    onCreateRemoteDir={createRemoteDirAsync}
                     onCopyText={copyTextToClipboard}
                     onSaveToNote={handleSaveRemoteFileToNote}
                   />

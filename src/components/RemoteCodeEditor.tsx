@@ -24,6 +24,11 @@ import {
   X,
 } from 'lucide-react';
 import {
+  CodeAgentFileOperation,
+  resolvePosixWorkspacePath,
+  TrackedFileChange,
+} from '../utils/codeAgentClient';
+import {
   acceptSingleLineInHunk,
   applyAllDiffHunks,
   applySingleDiffHunk,
@@ -51,6 +56,7 @@ import {
   RemoteDirEntry,
   RemoteFilePreview,
 } from './ProjectTreeView';
+import { RemotePathInput } from './RemotePathInput';
 
 export type { RemoteDirEntry, RemoteFilePreview };
 
@@ -85,6 +91,10 @@ interface RemoteCodeEditorProps {
   onOpenInTerminal?: (dirPath: string) => void;
   onOpenFile: (path: string) => void;
   onCreateNewFile: (fullPath: string, initialContent?: string) => void;
+  fetchDirEntries?: (dirPath: string) => Promise<{ path: string; entries: RemoteDirEntry[] }>;
+  onReadRemoteFile?: (filePath: string) => Promise<RemoteFilePreview>;
+  onWriteRemoteFile?: (filePath: string, content: string) => Promise<{ path: string; size: number }>;
+  onCreateRemoteDir?: (dirPath: string) => Promise<{ path: string }>;
   onCopyText: (text: string) => Promise<boolean>;
   onSaveToNote: (file: RemoteFilePreview, draftContent: string) => void;
 }
@@ -163,6 +173,10 @@ export function RemoteCodeEditor({
   onOpenInTerminal,
   onOpenFile,
   onCreateNewFile,
+  fetchDirEntries,
+  onReadRemoteFile,
+  onWriteRemoteFile,
+  onCreateRemoteDir,
   onCopyText,
   onSaveToNote,
 }: RemoteCodeEditorProps) {
@@ -231,7 +245,9 @@ export function RemoteCodeEditor({
   >(null);
 
   const [pendingHunks, setPendingHunks] = useState<PendingDiffHunk[]>([]);
-  const [activeReviewTurnId, setActiveReviewTurnId] = useState<string | null>(null);
+  const [trackedChanges, setTrackedChanges] = useState<TrackedFileChange[]>([]);
+  const [applyingTrackedChanges, setApplyingTrackedChanges] = useState(false);
+  const [previewingNewFile, setPreviewingNewFile] = useState<TrackedFileChange | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
@@ -240,25 +256,34 @@ export function RemoteCodeEditor({
   const findInputRef = useRef<HTMLInputElement>(null);
   const gotoInputRef = useRef<HTMLInputElement>(null);
   const saveAsInputRef = useRef<HTMLInputElement>(null);
+  const trackedChangesRef = useRef<TrackedFileChange[]>(trackedChanges);
+  trackedChangesRef.current = trackedChanges;
 
   const showNotice = useCallback((msg: string) => {
     setActionNotice(msg);
     window.setTimeout(() => {
       setActionNotice((cur) => (cur === msg ? null : cur));
-    }, 2200);
+    }, 2400);
   }, []);
 
   useEffect(() => {
     setExplorerPathInput(currentRemotePath || '');
   }, [currentRemotePath]);
 
-  // Reset draft, pending diffs & history when switching files or reloading from server
+  // Reset draft & history when switching files or reloading from server, preserving tracked multi-file hunks
   useEffect(() => {
     const initial = file?.content ?? '';
     setDraft(initial);
     setPendingAction(null);
-    setPendingHunks([]);
-    setActiveReviewTurnId(null);
+    setPreviewingNewFile(null);
+
+    const matchingTracked = file
+      ? trackedChangesRef.current.find(
+          (c) => c.path === file.path && c.status === 'pending' && c.operation === 'edit-file'
+        )
+      : undefined;
+    setPendingHunks(matchingTracked ? matchingTracked.hunks : []);
+
     setSaveAsOpen(false);
     setSaveAsPath(file?.path ?? '');
     setCursorPos({ line: 1, col: 1 });
@@ -488,6 +513,41 @@ export function RemoteCodeEditor({
     });
   }, []);
 
+  const pendingFileStatuses = useMemo(() => {
+    const map: Record<string, 'modified' | 'new' | 'accepted'> = {};
+    for (const item of trackedChanges) {
+      if (item.operation === 'create-dir') continue;
+      if (item.status === 'pending') {
+        map[item.path] = item.operation === 'create-file' ? 'new' : 'modified';
+      } else if (item.status === 'accepted') {
+        map[item.path] = 'accepted';
+      }
+    }
+    return map;
+  }, [trackedChanges]);
+
+  const syncActiveFileHunksToTracked = useCallback(
+    (nextHunks: PendingDiffHunk[], resolvedStatus?: 'accepted' | 'rejected') => {
+      if (!file) return;
+      setTrackedChanges((prev) =>
+        prev.map((c) => {
+          if (c.path !== file.path || c.operation !== 'edit-file' || c.status !== 'pending') {
+            return c;
+          }
+          if (nextHunks.length === 0) {
+            return {
+              ...c,
+              hunks: [],
+              status: resolvedStatus || 'accepted',
+            };
+          }
+          return { ...c, hunks: nextHunks };
+        })
+      );
+    },
+    [file]
+  );
+
   const handleStageInlineDiff = useCallback(
     (payload: StagedDiffPayload) => {
       if (!file || !isEditable) return;
@@ -508,7 +568,10 @@ export function RemoteCodeEditor({
 
       if (hunks.length === 0 && payload.proposedCode) {
         const cleanProposed = payload.proposedCode.replace(/\r\n/g, '\n');
-        if (payload.targetAction === 'replace-selection' && selectionRange.end > selectionRange.start) {
+        if (
+          payload.targetAction === 'replace-selection' &&
+          selectionRange.end > selectionRange.start
+        ) {
           const selStartLine = draft.slice(0, selectionRange.start).split('\n').length;
           const selEndLine = draft.slice(0, selectionRange.end).split('\n').length;
           const draftLines = draft.replace(/\r\n/g, '\n').split('\n');
@@ -552,12 +615,378 @@ export function RemoteCodeEditor({
         return;
       }
 
+      setPreviewingNewFile(null);
       setPendingHunks(hunks);
-      setActiveReviewTurnId(payload.turnId);
+      setTrackedChanges((prev) => [
+        ...prev.filter((c) => !(c.path === file.path && c.status === 'pending')),
+        {
+          id: `trk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          path: file.path,
+          operation: 'edit-file',
+          description: payload.summary,
+          status: 'pending',
+          originalContent: draft,
+          hunks,
+          unmatchedCount: unmatched,
+          turnId: payload.turnId,
+        },
+      ]);
       focusFirstDiffHunk(hunks[0]?.id);
     },
     [file, isEditable, draft, cursorPos.line, selectionRange, showNotice, focusFirstDiffHunk]
   );
+
+  const handleStageFileOperations = useCallback(
+    async (operations: CodeAgentFileOperation[], turnId: string, summary?: string) => {
+      const root =
+        currentRemotePath || (file ? getParentPosixPath(file.path) : '/');
+      const nextEntries: TrackedFileChange[] = [];
+
+      for (const op of operations) {
+        const absPath = resolvePosixWorkspacePath(root, op.path);
+        if (!absPath) continue;
+
+        if (op.operation === 'create-dir') {
+          nextEntries.push({
+            id: `trk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            path: absPath,
+            operation: 'create-dir',
+            description: op.description || summary,
+            status: 'pending',
+            hunks: [],
+            turnId,
+          });
+          continue;
+        }
+
+        if (op.operation === 'create-file') {
+          nextEntries.push({
+            id: `trk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            path: absPath,
+            operation: 'create-file',
+            description: op.description || summary,
+            status: 'pending',
+            hunks: [],
+            newFileContent: op.content ?? '',
+            turnId,
+          });
+          continue;
+        }
+
+        // edit-file
+        const edits = op.edits || [];
+        if (edits.length === 0) continue;
+
+        let baseContent = '';
+        let loaded = false;
+        if (file && file.path === absPath) {
+          baseContent = draft;
+          loaded = true;
+        } else if (onReadRemoteFile) {
+          try {
+            const remote = await onReadRemoteFile(absPath);
+            if (!remote.isBinary) {
+              baseContent = remote.content;
+              loaded = true;
+            }
+          } catch {
+            // File might not exist yet; if oldCode is empty, treat as create-file
+          }
+        }
+
+        if (!loaded && edits.every((e) => !e.oldCode.trim())) {
+          nextEntries.push({
+            id: `trk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            path: absPath,
+            operation: 'create-file',
+            description: op.description || summary,
+            status: 'pending',
+            hunks: [],
+            newFileContent: edits.map((e) => e.newCode).join('\n'),
+            turnId,
+          });
+          continue;
+        }
+
+        const { hunks, unmatchedEdits } = buildHunksFromSearchReplace(
+          baseContent,
+          edits,
+          file && file.path === absPath ? cursorPos.line : 1,
+          turnId
+        );
+
+        nextEntries.push({
+          id: `trk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          path: absPath,
+          operation: 'edit-file',
+          description: op.description || summary,
+          status: hunks.length > 0 ? 'pending' : 'rejected',
+          originalContent: baseContent,
+          hunks,
+          unmatchedCount: unmatchedEdits.length,
+          turnId,
+        });
+      }
+
+      if (nextEntries.length === 0) return;
+
+      setTrackedChanges((prev) => {
+        const replacedPaths = new Set(nextEntries.map((e) => e.path));
+        const kept = prev.filter((c) => !(c.status === 'pending' && replacedPaths.has(c.path)));
+        return [...kept, ...nextEntries];
+      });
+
+      // Stage inline diff immediately if active file has edits
+      const activeEntry = file
+        ? nextEntries.find(
+            (e) => e.path === file.path && e.operation === 'edit-file' && e.hunks.length > 0
+          )
+        : undefined;
+
+      if (activeEntry) {
+        setPreviewingNewFile(null);
+        setPendingHunks(activeEntry.hunks);
+        focusFirstDiffHunk(activeEntry.hunks[0]?.id);
+      } else {
+        const firstOtherEdit = nextEntries.find(
+          (e) => e.operation === 'edit-file' && e.hunks.length > 0
+        );
+        const firstNewFile = nextEntries.find((e) => e.operation === 'create-file');
+        if (!file && firstOtherEdit) {
+          onOpenFile(firstOtherEdit.path);
+        } else if (!file && firstNewFile) {
+          setPreviewingNewFile(firstNewFile);
+        }
+      }
+
+      const pendingCount = nextEntries.filter((e) => e.status === 'pending').length;
+      if (pendingCount > 0) {
+        showNotice(
+          `Staged ${pendingCount} ${pendingCount === 1 ? 'change' : 'changes'} for review`
+        );
+      }
+    },
+    [
+      currentRemotePath,
+      file,
+      draft,
+      onReadRemoteFile,
+      cursorPos.line,
+      focusFirstDiffHunk,
+      onOpenFile,
+      showNotice,
+    ]
+  );
+
+  const handleReviewTrackedChange = useCallback(
+    (change: TrackedFileChange) => {
+      if (change.operation === 'create-dir') return;
+      if (change.operation === 'create-file') {
+        setPreviewingNewFile(change);
+        return;
+      }
+      setPreviewingNewFile(null);
+      if (file && file.path === change.path) {
+        setPendingHunks(change.hunks);
+        focusFirstDiffHunk(change.hunks[0]?.id);
+        return;
+      }
+      if (isDirty) {
+        setPendingAction({ type: 'switch-file', path: change.path });
+      } else {
+        onOpenFile(change.path);
+      }
+    },
+    [file, isDirty, focusFirstDiffHunk, onOpenFile]
+  );
+
+  const handleAcceptTrackedChange = useCallback(
+    async (changeId: string) => {
+      const target = trackedChangesRef.current.find((c) => c.id === changeId);
+      if (!target || target.status !== 'pending') return;
+
+      setApplyingTrackedChanges(true);
+      try {
+        if (target.operation === 'create-dir') {
+          if (!onCreateRemoteDir) {
+            throw new Error('Remote directory creation unavailable.');
+          }
+          await onCreateRemoteDir(target.path);
+          onRefreshExplorer();
+        } else if (target.operation === 'create-file') {
+          if (onWriteRemoteFile) {
+            await onWriteRemoteFile(target.path, target.newFileContent ?? '');
+            onRefreshExplorer();
+          } else {
+            onCreateNewFile(target.path, target.newFileContent ?? '');
+          }
+          if (previewingNewFile?.id === target.id) {
+            setPreviewingNewFile(null);
+            onOpenFile(target.path);
+          }
+        } else if (target.operation === 'edit-file') {
+          if (file && file.path === target.path) {
+            const res = applyAllDiffHunks(draft, target.hunks);
+            applyEdit(
+              {
+                value: res.nextDraft,
+                selectionStart: res.nextCursorOffset,
+                selectionEnd: res.nextCursorOffset,
+              },
+              { focus: false }
+            );
+            setPendingHunks([]);
+            if (onWriteRemoteFile) {
+              await onWriteRemoteFile(target.path, res.nextDraft);
+            } else {
+              onSaveFile(target.path, res.nextDraft);
+            }
+          } else {
+            const base =
+              typeof target.originalContent === 'string'
+                ? target.originalContent
+                : onReadRemoteFile
+                ? (await onReadRemoteFile(target.path)).content
+                : '';
+            const res = applyAllDiffHunks(base, target.hunks);
+            if (!onWriteRemoteFile) {
+              throw new Error('Background multi-file write unavailable.');
+            }
+            await onWriteRemoteFile(target.path, res.nextDraft);
+          }
+        }
+
+        setTrackedChanges((prev) =>
+          prev.map((c) => (c.id === changeId ? { ...c, status: 'accepted', hunks: [] } : c))
+        );
+        showNotice(`Accepted & applied ${target.path.split('/').pop() || target.path}`);
+      } catch (err) {
+        showNotice(
+          err instanceof Error ? err.message : `Failed to apply ${target.path}`
+        );
+      } finally {
+        setApplyingTrackedChanges(false);
+      }
+    },
+    [
+      onCreateRemoteDir,
+      onRefreshExplorer,
+      onWriteRemoteFile,
+      onCreateNewFile,
+      previewingNewFile,
+      onOpenFile,
+      file,
+      draft,
+      applyEdit,
+      onSaveFile,
+      onReadRemoteFile,
+      showNotice,
+    ]
+  );
+
+  const handleRejectTrackedChange = useCallback(
+    (changeId: string) => {
+      const target = trackedChangesRef.current.find((c) => c.id === changeId);
+      if (!target) return;
+      if (file && file.path === target.path) {
+        setPendingHunks([]);
+      }
+      if (previewingNewFile?.id === target.id) {
+        setPreviewingNewFile(null);
+      }
+      setTrackedChanges((prev) =>
+        prev.map((c) => (c.id === changeId ? { ...c, status: 'rejected' } : c))
+      );
+    },
+    [file, previewingNewFile]
+  );
+
+  const handleAcceptAllTrackedChanges = useCallback(async () => {
+    const pendingList = trackedChangesRef.current.filter((c) => c.status === 'pending');
+    if (pendingList.length === 0) return;
+
+    const ordered = [
+      ...pendingList.filter((c) => c.operation === 'create-dir'),
+      ...pendingList.filter((c) => c.operation === 'create-file'),
+      ...pendingList.filter((c) => c.operation === 'edit-file'),
+    ];
+
+    setApplyingTrackedChanges(true);
+    let appliedCount = 0;
+    try {
+      for (const item of ordered) {
+        if (item.operation === 'create-dir') {
+          if (onCreateRemoteDir) {
+            await onCreateRemoteDir(item.path);
+          }
+        } else if (item.operation === 'create-file') {
+          if (onWriteRemoteFile) {
+            await onWriteRemoteFile(item.path, item.newFileContent ?? '');
+          } else {
+            onCreateNewFile(item.path, item.newFileContent ?? '');
+          }
+        } else if (item.operation === 'edit-file') {
+          if (file && file.path === item.path) {
+            const res = applyAllDiffHunks(draft, item.hunks);
+            applyEdit(
+              {
+                value: res.nextDraft,
+                selectionStart: res.nextCursorOffset,
+                selectionEnd: res.nextCursorOffset,
+              },
+              { focus: false }
+            );
+            setPendingHunks([]);
+            if (onWriteRemoteFile) {
+              await onWriteRemoteFile(item.path, res.nextDraft);
+            } else {
+              onSaveFile(item.path, res.nextDraft);
+            }
+          } else if (onWriteRemoteFile) {
+            const base =
+              typeof item.originalContent === 'string'
+                ? item.originalContent
+                : onReadRemoteFile
+                ? (await onReadRemoteFile(item.path)).content
+                : '';
+            const res = applyAllDiffHunks(base, item.hunks);
+            await onWriteRemoteFile(item.path, res.nextDraft);
+          }
+        }
+        appliedCount += 1;
+        setTrackedChanges((prev) =>
+          prev.map((c) => (c.id === item.id ? { ...c, status: 'accepted', hunks: [] } : c))
+        );
+      }
+
+      setPreviewingNewFile(null);
+      onRefreshExplorer();
+      showNotice(`Accepted & saved ${appliedCount} workspace ${appliedCount === 1 ? 'change' : 'changes'}`);
+    } catch (err) {
+      showNotice(
+        err instanceof Error ? err.message : 'Stopped applying changes due to an error.'
+      );
+    } finally {
+      setApplyingTrackedChanges(false);
+    }
+  }, [
+    onCreateRemoteDir,
+    onWriteRemoteFile,
+    onCreateNewFile,
+    file,
+    draft,
+    applyEdit,
+    onSaveFile,
+    onReadRemoteFile,
+    onRefreshExplorer,
+    showNotice,
+  ]);
+
+  const handleRejectAllTrackedChanges = useCallback(() => {
+    setPendingHunks([]);
+    setPreviewingNewFile(null);
+    setTrackedChanges([]);
+  }, []);
 
   const handleAcceptHunk = useCallback(
     (hunkId: string) => {
@@ -574,22 +1003,22 @@ export function RemoteCodeEditor({
         { focus: false }
       );
 
-      setPendingHunks((prev) =>
-        prev
-          .filter((h) => h.id !== hunkId)
-          .map((h) =>
-            h.startLine > target.startLine
-              ? {
-                  ...h,
-                  startLine: h.startLine + res.lineDelta,
-                  endLine: h.endLine + res.lineDelta,
-                }
-              : h
-          )
-      );
-      showNotice('Accepted change (Ctrl+Z to undo)');
+      const nextHunks = pendingHunks
+        .filter((h) => h.id !== hunkId)
+        .map((h) =>
+          h.startLine > target.startLine
+            ? {
+                ...h,
+                startLine: h.startLine + res.lineDelta,
+                endLine: h.endLine + res.lineDelta,
+              }
+            : h
+        );
+      setPendingHunks(nextHunks);
+      syncActiveFileHunksToTracked(nextHunks, 'accepted');
+      showNotice('Accepted change (Ctrl+Z to undo, Ctrl+S to save)');
     },
-    [pendingHunks, draft, applyEdit, showNotice]
+    [pendingHunks, draft, applyEdit, syncActiveFileHunksToTracked, showNotice]
   );
 
   const handleAcceptSingleLine = useCallback(
@@ -607,31 +1036,35 @@ export function RemoteCodeEditor({
         { focus: false }
       );
 
-      setPendingHunks((prev) => {
-        const next: PendingDiffHunk[] = [];
-        for (const h of prev) {
-          if (h.id === hunkId) {
-            next.push(...res.remainingHunks);
-          } else if (h.startLine > target.startLine) {
-            next.push({
-              ...h,
-              startLine: h.startLine + res.lineDelta,
-              endLine: h.endLine + res.lineDelta,
-            });
-          } else {
-            next.push(h);
-          }
+      const nextHunks: PendingDiffHunk[] = [];
+      for (const h of pendingHunks) {
+        if (h.id === hunkId) {
+          nextHunks.push(...res.remainingHunks);
+        } else if (h.startLine > target.startLine) {
+          nextHunks.push({
+            ...h,
+            startLine: h.startLine + res.lineDelta,
+            endLine: h.endLine + res.lineDelta,
+          });
+        } else {
+          nextHunks.push(h);
         }
-        return next;
-      });
-      showNotice('Accepted line (Ctrl+Z to undo)');
+      }
+      setPendingHunks(nextHunks);
+      syncActiveFileHunksToTracked(nextHunks, 'accepted');
+      showNotice('Accepted line (Ctrl+Z to undo, Ctrl+S to save)');
     },
-    [pendingHunks, draft, applyEdit, showNotice]
+    [pendingHunks, draft, applyEdit, syncActiveFileHunksToTracked, showNotice]
   );
 
-  const handleRejectHunk = useCallback((hunkId: string) => {
-    setPendingHunks((prev) => prev.filter((h) => h.id !== hunkId));
-  }, []);
+  const handleRejectHunk = useCallback(
+    (hunkId: string) => {
+      const nextHunks = pendingHunks.filter((h) => h.id !== hunkId);
+      setPendingHunks(nextHunks);
+      syncActiveFileHunksToTracked(nextHunks, 'rejected');
+    },
+    [pendingHunks, syncActiveFileHunksToTracked]
+  );
 
   const handleAcceptAllPendingDiffs = useCallback(() => {
     if (pendingHunks.length === 0) return;
@@ -645,14 +1078,14 @@ export function RemoteCodeEditor({
       { focus: false }
     );
     setPendingHunks([]);
-    setActiveReviewTurnId(null);
-    showNotice('Accepted all AI changes (Ctrl+Z to undo)');
-  }, [pendingHunks, draft, applyEdit, showNotice]);
+    syncActiveFileHunksToTracked([], 'accepted');
+    showNotice('Accepted all changes in file (Ctrl+Z to undo, Ctrl+S to save)');
+  }, [pendingHunks, draft, applyEdit, syncActiveFileHunksToTracked, showNotice]);
 
   const handleRejectAllPendingDiffs = useCallback(() => {
     setPendingHunks([]);
-    setActiveReviewTurnId(null);
-  }, []);
+    syncActiveFileHunksToTracked([], 'rejected');
+  }, [syncActiveFileHunksToTracked]);
 
   const handleApplyAgentCode = useCallback(
     (nextCode: string, mode: 'replace-file' | 'replace-selection' | 'insert-at-cursor') => {
@@ -1102,6 +1535,80 @@ export function RemoteCodeEditor({
   };
 
   const renderCodeArea = (isFull: boolean) => {
+    if (previewingNewFile) {
+      const newFileName = previewingNewFile.path.split('/').pop() || 'new-file';
+      const newLines = (previewingNewFile.newFileContent ?? '').replace(/\r\n/g, '\n').split('\n');
+      const gutterWidthClass = isFull ? 'w-14 pr-3' : 'w-10 pr-2';
+
+      return (
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-[#0c0c10]">
+          <div className="shrink-0 px-3 py-1.5 border-b border-emerald-500/25 bg-[#121820] flex flex-wrap items-center justify-between gap-2 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <FilePlus2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="font-medium text-neutral-100 truncate">
+                New File: {previewingNewFile.path}
+              </span>
+              <span className="font-mono-code text-[11px] text-emerald-300">
+                +{newLines.length} lines
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                disabled={applyingTrackedChanges}
+                onClick={() => void handleAcceptTrackedChange(previewingNewFile.id)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-45 text-white text-[11.5px] font-medium cursor-pointer"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Accept & Create File</span>
+              </button>
+              <button
+                type="button"
+                disabled={applyingTrackedChanges}
+                onClick={() => handleRejectTrackedChange(previewingNewFile.id)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-white/15 bg-white/5 hover:bg-white/10 text-neutral-200 text-[11.5px] font-medium cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Reject</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setPreviewingNewFile(null)}
+                className="px-2 py-1 rounded text-neutral-400 hover:text-white text-[11.5px] cursor-pointer"
+              >
+                Close Preview
+              </button>
+            </div>
+          </div>
+
+          <div
+            className={`flex-1 min-h-0 overflow-auto py-2 font-mono-code ${
+              isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+            }`}
+          >
+            {newLines.map((lineText, idx) => (
+              <div
+                key={idx}
+                className="flex min-w-max bg-emerald-500/14 border-l-2 border-emerald-400"
+              >
+                <div
+                  className={`${gutterWidthClass} shrink-0 select-none text-right bg-emerald-950/35 border-r border-emerald-500/20 text-emerald-300 tabular-nums`}
+                >
+                  + {idx + 1}
+                </div>
+                <div
+                  className="code-highlight-layer flex-1 px-3.5 whitespace-pre"
+                  dangerouslySetInnerHTML={{
+                    __html: highlightCodeToHtml(lineText || ' ', newFileName),
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
     if (!file) {
       return (
         <div className="flex-1 min-w-0 flex flex-col items-center justify-center p-8 text-center bg-[#0c0c10]">
@@ -1991,7 +2498,7 @@ export function RemoteCodeEditor({
                 </div>
               </div>
 
-              {/* Direct Path Jump inside Full Screen Explorer */}
+              {/* Direct Path Jump inside Full Screen Explorer (Tab autocomplete + sync) */}
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -2001,13 +2508,16 @@ export function RemoteCodeEditor({
                 }}
                 className="shrink-0 p-2 border-b border-white/[0.08] flex items-center gap-1"
               >
-                <input
-                  type="text"
+                <RemotePathInput
                   value={explorerPathInput}
-                  onChange={(e) => setExplorerPathInput(e.target.value)}
+                  onChange={setExplorerPathInput}
+                  onSyncDirectory={(dirPath) => onNavigateRootDir(dirPath)}
+                  dirCache={dirCache}
+                  fetchDirEntries={fetchDirEntries}
+                  currentRemotePath={currentRemotePath}
                   placeholder="/home/user/project"
-                  aria-label="Open directory path"
-                  className="font-mono-code flex-1 min-w-0 px-2 py-1 text-[11.5px] rounded border border-white/12 bg-[#0c0c10] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
+                  ariaLabel="Open directory path"
+                  inputClassName="font-mono-code w-full min-w-0 px-2 py-1 text-[11.5px] rounded border border-white/12 bg-[#0c0c10] text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-500"
                 />
                 <button
                   type="submit"
@@ -2039,6 +2549,7 @@ export function RemoteCodeEditor({
                   loadingDirs={loadingDirs}
                   truncatedDirs={truncatedDirs}
                   selectedFilePath={file?.path ?? null}
+                  pendingFileStatuses={pendingFileStatuses}
                   creatingInDir={creatingInDir}
                   onToggleDir={onToggleDir}
                   onSelectFile={handleAttemptSelectFile}
@@ -2118,12 +2629,16 @@ export function RemoteCodeEditor({
               dirCache={dirCache}
               expandedDirs={expandedDirs}
               canUndo={historyMeta.canUndo}
-              pendingHunkCount={pendingHunks.length}
-              activeReviewTurnId={activeReviewTurnId}
+              trackedChanges={trackedChanges}
+              applyingTrackedChanges={applyingTrackedChanges}
+              onReadRemoteFile={onReadRemoteFile}
+              onStageFileOperations={handleStageFileOperations}
+              onReviewTrackedChange={handleReviewTrackedChange}
+              onAcceptTrackedChange={handleAcceptTrackedChange}
+              onRejectTrackedChange={handleRejectTrackedChange}
+              onAcceptAllTrackedChanges={handleAcceptAllTrackedChanges}
+              onRejectAllTrackedChanges={handleRejectAllTrackedChanges}
               onStageInlineDiff={handleStageInlineDiff}
-              onAcceptAllPendingDiffs={handleAcceptAllPendingDiffs}
-              onRejectAllPendingDiffs={handleRejectAllPendingDiffs}
-              onFocusDiffReview={() => focusFirstDiffHunk(pendingHunks[0]?.id)}
               onApplyCode={handleApplyAgentCode}
               onCreateFileWithCode={(fullPath, content) => onCreateNewFile(fullPath, content)}
               onUndoLastEdit={performUndo}

@@ -87,6 +87,7 @@ interface ProjectTreeViewProps {
   loadingDirs: Record<string, boolean>;
   truncatedDirs?: Record<string, boolean>;
   selectedFilePath?: string | null;
+  pendingFileStatuses?: Record<string, 'modified' | 'new' | 'accepted'>;
   creatingInDir: string | null;
   onToggleDir: (dirPath: string) => void;
   onSelectFile: (filePath: string) => void;
@@ -105,6 +106,7 @@ export function ProjectTreeView({
   loadingDirs,
   truncatedDirs,
   selectedFilePath,
+  pendingFileStatuses,
   creatingInDir,
   onToggleDir,
   onSelectFile,
@@ -272,6 +274,30 @@ export function ProjectTreeView({
               </div>
             ) : (
               <div className="flex items-center gap-1 shrink-0">
+                {pendingFileStatuses?.[entry.path] && (
+                  <span
+                    title={
+                      pendingFileStatuses[entry.path] === 'new'
+                        ? 'Pending AI new file'
+                        : pendingFileStatuses[entry.path] === 'accepted'
+                        ? 'AI change applied'
+                        : 'Pending AI edits'
+                    }
+                    className={`font-mono-code text-[10px] font-semibold px-1 rounded ${
+                      pendingFileStatuses[entry.path] === 'new'
+                        ? 'text-emerald-300 bg-emerald-500/15'
+                        : pendingFileStatuses[entry.path] === 'accepted'
+                        ? 'text-blue-300 bg-blue-500/15'
+                        : 'text-amber-300 bg-amber-500/15'
+                    }`}
+                  >
+                    {pendingFileStatuses[entry.path] === 'new'
+                      ? 'U'
+                      : pendingFileStatuses[entry.path] === 'accepted'
+                      ? '✓'
+                      : 'M'}
+                  </span>
+                )}
                 {onOpenFileFullScreen && (
                   <button
                     type="button"

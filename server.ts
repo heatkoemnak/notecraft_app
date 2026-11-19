@@ -30,6 +30,8 @@ import { listAvailableGroqModels } from './server/groqModels.ts';
 import {
   CodeAgentError,
   type CodeAgentMessage,
+  type CodeAgentMode,
+  type CodeAgentRelatedFile,
   type CodeAgentTaskMode,
   listCodeAgentModels,
   runCodeAgent,
@@ -1338,6 +1340,7 @@ async function startServer() {
         prompt,
         model,
         taskMode,
+        agentMode,
         filePath,
         fileName,
         language,
@@ -1347,11 +1350,13 @@ async function startServer() {
         cursorLine,
         rootPath,
         projectTree,
+        relatedFiles,
         history,
       } = (req.body || {}) as {
         prompt?: unknown;
         model?: unknown;
         taskMode?: unknown;
+        agentMode?: unknown;
         filePath?: unknown;
         fileName?: unknown;
         language?: unknown;
@@ -1361,6 +1366,7 @@ async function startServer() {
         cursorLine?: unknown;
         rootPath?: unknown;
         projectTree?: unknown;
+        relatedFiles?: unknown;
         history?: unknown;
       };
 
@@ -1382,9 +1388,25 @@ async function startServer() {
           ? taskMode
           : 'chat';
 
+      const validAgentMode: CodeAgentMode = agentMode === 'plan' ? 'plan' : 'auto';
+
+      const sanitizedRelatedFiles: CodeAgentRelatedFile[] = Array.isArray(relatedFiles)
+        ? relatedFiles
+            .slice(0, 8)
+            .filter(
+              (item): item is { path?: unknown; content?: unknown } =>
+                Boolean(item && typeof item === 'object')
+            )
+            .map((item) => ({
+              path: typeof item.path === 'string' ? item.path.trim().slice(0, 500) : '',
+              content: typeof item.content === 'string' ? item.content.slice(0, 16000) : '',
+            }))
+            .filter((item) => item.path.length > 0)
+        : [];
+
       const sanitizedHistory: CodeAgentMessage[] = Array.isArray(history)
         ? history
-            .slice(-10)
+            .slice(-14)
             .filter(
               (item): item is { role?: unknown; content?: unknown } =>
                 Boolean(item && typeof item === 'object')
@@ -1400,6 +1422,7 @@ async function startServer() {
         prompt,
         model: typeof model === 'string' ? model : undefined,
         taskMode: validTaskMode,
+        agentMode: validAgentMode,
         filePath: typeof filePath === 'string' ? filePath.slice(0, 500) : undefined,
         fileName: typeof fileName === 'string' ? fileName.slice(0, 200) : undefined,
         language: typeof language === 'string' ? language.slice(0, 80) : undefined,
@@ -1411,6 +1434,7 @@ async function startServer() {
           typeof cursorLine === 'number' && Number.isFinite(cursorLine) ? cursorLine : undefined,
         rootPath: typeof rootPath === 'string' ? rootPath.slice(0, 500) : undefined,
         projectTree: typeof projectTree === 'string' ? projectTree.slice(0, 10000) : undefined,
+        relatedFiles: sanitizedRelatedFiles,
         history: sanitizedHistory,
       });
 

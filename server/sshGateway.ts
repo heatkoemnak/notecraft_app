@@ -51,6 +51,11 @@ type ClientMessage =
       content?: unknown;
     }
   | {
+      type: 'createDir';
+      requestId?: unknown;
+      path?: unknown;
+    }
+  | {
       type: 'disconnect';
     }
   | {
@@ -464,6 +469,52 @@ export function attachSshWebSocketServer(
             }
 
             const sftp = await getSftp();
+
+            const ensureDirRecursive = async (dirPath: string): Promise<string> => {
+              let clean = dirPath.trim();
+              if (!clean || clean === '~') {
+                return resolveSftpPath(sftp, '~');
+              }
+              if (clean.startsWith('~/')) {
+                const home = await resolveSftpPath(sftp, '~');
+                clean = path.posix.join(home, clean.slice(2));
+              }
+              const normalized = path.posix.normalize(clean);
+              const segments = normalized.split('/').filter(Boolean);
+              let current = normalized.startsWith('/') ? '/' : '';
+              for (const seg of segments) {
+                current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
+                const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
+                  sftp.stat(current, (err, st) => {
+                    if (err || !st) resolve('none');
+                    else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
+                  });
+                });
+                if (exists === 'file') {
+                  throw new Error(`Path exists as a file, not a directory: ${current}`);
+                }
+                if (exists === 'none') {
+                  await new Promise<void>((resolve, reject) => {
+                    sftp.mkdir(current, (mkErr) => {
+                      if (!mkErr) {
+                        resolve();
+                        return;
+                      }
+                      // Handle concurrent creation race safely
+                      sftp.stat(current, (stErr, st) => {
+                        if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
+                          resolve();
+                        } else {
+                          reject(mkErr);
+                        }
+                      });
+                    });
+                  });
+                }
+              }
+              return current || '/';
+            };
+
             let targetPath: string;
             try {
               targetPath = await resolveSftpPath(sftp, requestedPath);
@@ -477,7 +528,6 @@ export function attachSshWebSocketServer(
                 throw new Error('Cannot overwrite a directory.');
               }
             } catch (err) {
-              // If target doesn't exist yet, resolve its parent directory to support creating new files
               if (err instanceof Error && err.message === 'Cannot overwrite a directory.') {
                 throw err;
               }
@@ -486,10 +536,7 @@ export function attachSshWebSocketServer(
               if (!baseName || baseName === '.' || baseName === '..') {
                 throw new Error('Invalid file name.');
               }
-              const resolvedParent = await resolveSftpPath(
-                sftp,
-                dirPart === '.' ? '~' : dirPart
-              );
+              const resolvedParent = await ensureDirRecursive(dirPart === '.' ? '~' : dirPart);
               targetPath = path.posix.join(resolvedParent, baseName);
             }
 
@@ -512,6 +559,69 @@ export function attachSshWebSocketServer(
               type: 'writeFileError',
               requestId,
               error: err instanceof Error ? err.message : 'Unable to save remote file.',
+            });
+          }
+        })();
+        return;
+      }
+
+      if (msg.type === 'createDir') {
+        const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+        const requestedPath = typeof msg.path === 'string' ? msg.path.trim() : '';
+        void (async () => {
+          try {
+            if (!requestedPath) {
+              throw new Error('Missing directory path.');
+            }
+            const sftp = await getSftp();
+            let clean = requestedPath;
+            if (clean === '~' || clean.startsWith('~/')) {
+              const home = await resolveSftpPath(sftp, '~');
+              clean = clean === '~' ? home : path.posix.join(home, clean.slice(2));
+            }
+            const normalized = path.posix.normalize(clean);
+            const segments = normalized.split('/').filter(Boolean);
+            let current = normalized.startsWith('/') ? '/' : '';
+            for (const seg of segments) {
+              current = current === '/' ? `/${seg}` : current ? `${current}/${seg}` : seg;
+              const exists = await new Promise<'dir' | 'file' | 'none'>((resolve) => {
+                sftp.stat(current, (err, st) => {
+                  if (err || !st) resolve('none');
+                  else resolve((st.mode & 0o170000) === 0o040000 ? 'dir' : 'file');
+                });
+              });
+              if (exists === 'file') {
+                throw new Error(`Path exists as a file, not a directory: ${current}`);
+              }
+              if (exists === 'none') {
+                await new Promise<void>((resolve, reject) => {
+                  sftp.mkdir(current, (mkErr) => {
+                    if (!mkErr) {
+                      resolve();
+                      return;
+                    }
+                    sftp.stat(current, (stErr, st) => {
+                      if (!stErr && st && (st.mode & 0o170000) === 0o040000) {
+                        resolve();
+                      } else {
+                        reject(mkErr);
+                      }
+                    });
+                  });
+                });
+              }
+            }
+            const resolvedDir = await resolveSftpPath(sftp, current || '/');
+            sendJson(ws, {
+              type: 'createDirResult',
+              requestId,
+              path: resolvedDir,
+            });
+          } catch (err) {
+            sendJson(ws, {
+              type: 'createDirError',
+              requestId,
+              error: err instanceof Error ? err.message : 'Unable to create directory.',
             });
           }
         })();
