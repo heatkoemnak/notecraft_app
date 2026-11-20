@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ArrowDown,
   ArrowLeft,
   ArrowUp,
   Bot,
@@ -8,6 +9,8 @@ import {
   ChevronDown,
   ChevronsDownUp,
   ChevronUp,
+  ClipboardPaste,
+  Copy,
   FilePlus2,
   Files,
   FileText,
@@ -17,13 +20,17 @@ import {
   Hash,
   Loader2,
   Maximize2,
+  MessageSquare,
   Minimize2,
   PanelLeftOpen,
   Plus,
   RefreshCw,
   Replace,
   Save,
+  Scissors,
   Search,
+  Trash2,
+  Wand2,
   X,
 } from 'lucide-react';
 import {
@@ -40,18 +47,23 @@ import {
   PendingDiffHunk,
 } from '../utils/codeDiff';
 import {
+  applyAutoRenameTag,
+  applyMultiRangeEdit,
   deleteSelectedLines,
   duplicateSelectedLines,
   EditResult,
+  expandWordAtOffset,
   findAllTextMatches,
-  formatSourceDocument,
+  formatSelectionRangeAsync,
+  formatSourceDocumentAsync,
   getOffsetForLineCol,
   indentLines,
   moveSelectedLines,
   smartNewLineIndent,
+  TextMatchRange,
   toggleCommentLines,
 } from '../utils/codeEditing';
-import { highlightCodeToHtml } from '../utils/codeHighlight';
+import { escapeHtml, highlightCodeToHtml } from '../utils/codeHighlight';
 import {
   getGitBadgeMeta,
   GitCommandRunner,
@@ -255,6 +267,20 @@ export function RemoteCodeEditor({
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
   const [selectionRange, setSelectionRange] = useState({ start: 0, end: 0 });
   const [editorScrollTop, setEditorScrollTop] = useState(0);
+  const [formatting, setFormatting] = useState(false);
+  const [editorContextMenu, setEditorContextMenu] = useState<{
+    x: number;
+    y: number;
+    selectionStart: number;
+    selectionEnd: number;
+    lineNumber: number;
+    endLineNumber: number;
+  } | null>(null);
+  const [multiSelection, setMultiSelection] = useState<{
+    ranges: TextMatchRange[];
+    primaryIndex: number;
+    query: string;
+  } | null>(null);
 
   // Undo / Redo history state
   const historyRef = useRef<{
@@ -313,6 +339,7 @@ export function RemoteCodeEditor({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
+  const selectionOverlayRef = useRef<HTMLPreElement>(null);
   const diffScrollRef = useRef<HTMLDivElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const gotoInputRef = useRef<HTMLInputElement>(null);
@@ -329,6 +356,34 @@ export function RemoteCodeEditor({
   activeSelectionRef.current = selectionRange;
   const activeScrollTopRef = useRef(editorScrollTop);
   activeScrollTopRef.current = editorScrollTop;
+  const activeFilePathRef = useRef<string | null>(file?.path ?? null);
+  activeFilePathRef.current = file?.path ?? null;
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!editorContextMenu) return;
+    const closeMenu = (ev?: Event) => {
+      if (
+        ev &&
+        ev.type === 'mousedown' &&
+        contextMenuRef.current &&
+        ev.target instanceof Node &&
+        contextMenuRef.current.contains(ev.target)
+      ) {
+        return;
+      }
+      setEditorContextMenu(null);
+    };
+    const handleResizeOrBlur = () => setEditorContextMenu(null);
+    window.addEventListener('mousedown', closeMenu, true);
+    window.addEventListener('resize', handleResizeOrBlur);
+    window.addEventListener('blur', handleResizeOrBlur);
+    return () => {
+      window.removeEventListener('mousedown', closeMenu, true);
+      window.removeEventListener('resize', handleResizeOrBlur);
+      window.removeEventListener('blur', handleResizeOrBlur);
+    };
+  }, [editorContextMenu]);
 
   const showNotice = useCallback((msg: string) => {
     setActionNotice(msg);
@@ -384,6 +439,8 @@ export function RemoteCodeEditor({
       activeDraftRef.current === nextContent;
 
     setPendingAction(null);
+    setEditorContextMenu(null);
+    setMultiSelection(null);
     setPreviewingNewFile(null);
     setGitDiffView(null);
     setSaveAsOpen(false);
@@ -437,6 +494,9 @@ export function RemoteCodeEditor({
         if (preRef.current) {
           preRef.current.scrollTop = existingTabState.scrollTop;
         }
+        if (selectionOverlayRef.current) {
+          selectionOverlayRef.current.scrollTop = existingTabState.scrollTop;
+        }
         if (gutterRef.current) {
           gutterRef.current.scrollTop = existingTabState.scrollTop;
         }
@@ -474,6 +534,10 @@ export function RemoteCodeEditor({
         preRef.current.scrollTop = 0;
         preRef.current.scrollLeft = 0;
       }
+      if (selectionOverlayRef.current) {
+        selectionOverlayRef.current.scrollTop = 0;
+        selectionOverlayRef.current.scrollLeft = 0;
+      }
       if (gutterRef.current) {
         gutterRef.current.scrollTop = 0;
       }
@@ -503,6 +567,37 @@ export function RemoteCodeEditor({
     () => (!file || file.isBinary ? '' : highlightCodeToHtml(draft, file.name)),
     [draft, file]
   );
+
+  const multiSelectionHtml = useMemo(() => {
+    if (!multiSelection || multiSelection.ranges.length === 0 || !file || file.isBinary) {
+      return '';
+    }
+    let html = '';
+    let cursor = 0;
+    for (let i = 0; i < multiSelection.ranges.length; i += 1) {
+      const r = multiSelection.ranges[i];
+      const start = Math.max(cursor, Math.min(draft.length, r.start));
+      const end = Math.max(start, Math.min(draft.length, r.end));
+      if (start > cursor) {
+        html += escapeHtml(draft.slice(cursor, start));
+      }
+      if (end > start) {
+        const cls =
+          i === multiSelection.primaryIndex
+            ? 'bg-blue-500/45 text-transparent rounded-[2px] outline outline-1 outline-blue-300/90'
+            : 'bg-blue-500/30 text-transparent rounded-[2px] outline outline-1 outline-blue-400/70';
+        html += `<mark class="${cls}">${escapeHtml(draft.slice(start, end))}</mark>`;
+      } else {
+        html +=
+          '<span class="relative inline-block w-0 align-baseline"><span aria-hidden="true" class="absolute left-0 top-[-0.95em] h-[1.2em] w-[1.5px] bg-blue-400"></span></span>';
+      }
+      cursor = end;
+    }
+    if (cursor < draft.length) {
+      html += escapeHtml(draft.slice(cursor));
+    }
+    return draft.endsWith('\n') ? `${html} ` : html;
+  }, [multiSelection, draft, file]);
 
   const matches = useMemo(
     () => (findOpen && findQuery ? findAllTextMatches(draft, findQuery, caseSensitive) : []),
@@ -613,6 +708,7 @@ export function RemoteCodeEditor({
       el.scrollTop = targetTop;
       setEditorScrollTop(targetTop);
       if (preRef.current) preRef.current.scrollTop = targetTop;
+      if (selectionOverlayRef.current) selectionOverlayRef.current.scrollTop = targetTop;
       if (gutterRef.current) gutterRef.current.scrollTop = targetTop;
     },
     [fullScreen]
@@ -649,6 +745,7 @@ export function RemoteCodeEditor({
 
   const applyEdit = useCallback(
     (res: EditResult, options?: { coalesce?: boolean; focus?: boolean }) => {
+      setMultiSelection(null);
       setDraft(res.value);
       pushHistory(
         {
@@ -1319,6 +1416,7 @@ export function RemoteCodeEditor({
     h.index -= 1;
     const snap = h.stack[h.index];
     h.lastInputAt = 0;
+    setMultiSelection(null);
     setDraft(snap.value);
     setHistoryMeta({
       canUndo: h.index > 0,
@@ -1339,6 +1437,7 @@ export function RemoteCodeEditor({
     h.index += 1;
     const snap = h.stack[h.index];
     h.lastInputAt = 0;
+    setMultiSelection(null);
     setDraft(snap.value);
     setHistoryMeta({
       canUndo: h.index > 0,
@@ -1449,21 +1548,124 @@ export function RemoteCodeEditor({
     showNotice(`Replaced ${count} occurrence${count === 1 ? '' : 's'}`);
   }, [isEditable, matches, draft, replaceQuery, applyEdit, showNotice]);
 
-  const handleFormatDocument = useCallback(() => {
-    if (!file || !isEditable) return;
-    const formatted = formatSourceDocument(draft, file.name);
-    if (!formatted.ok) {
-      if (formatted.notice) showNotice(formatted.notice);
-      return;
+  const handleFormatDocument = useCallback(async () => {
+    if (!file || !isEditable || formatting) return;
+    const targetPath = file.path;
+    const targetName = file.name;
+    const targetDraft = draft;
+    setFormatting(true);
+    try {
+      const formatted = await formatSourceDocumentAsync(targetDraft, targetName);
+      if (activeFilePathRef.current !== targetPath || activeDraftRef.current !== targetDraft) {
+        return;
+      }
+      if (!formatted.ok) {
+        if (formatted.notice) showNotice(formatted.notice);
+        return;
+      }
+      if (formatted.value === targetDraft) {
+        showNotice('Already formatted');
+        return;
+      }
+      const prevPos = Math.min(formatted.value.length, textareaRef.current?.selectionStart ?? 0);
+      applyEdit({ value: formatted.value, selectionStart: prevPos, selectionEnd: prevPos });
+      showNotice('Document formatted');
+    } finally {
+      setFormatting(false);
     }
-    if (formatted.value === draft) {
-      showNotice('Already formatted');
-      return;
-    }
-    const prevPos = Math.min(formatted.value.length, textareaRef.current?.selectionStart ?? 0);
-    applyEdit({ value: formatted.value, selectionStart: prevPos, selectionEnd: prevPos });
-    showNotice('Document formatted');
-  }, [file, isEditable, draft, applyEdit, showNotice]);
+  }, [file, isEditable, formatting, draft, applyEdit, showNotice]);
+
+  const handleFormatSelection = useCallback(
+    async (selStart?: number, selEnd?: number) => {
+      if (!file || !isEditable || formatting) return;
+      const start = selStart ?? selectionRange.start;
+      const end = selEnd ?? selectionRange.end;
+      if (end <= start) {
+        await handleFormatDocument();
+        return;
+      }
+      const targetPath = file.path;
+      const targetName = file.name;
+      const targetDraft = draft;
+      setFormatting(true);
+      try {
+        const formatted = await formatSelectionRangeAsync(targetDraft, targetName, start, end);
+        if (activeFilePathRef.current !== targetPath || activeDraftRef.current !== targetDraft) {
+          return;
+        }
+        if (!formatted.ok || !formatted.edit) {
+          if (formatted.notice) showNotice(formatted.notice);
+          return;
+        }
+        if (formatted.edit.value === targetDraft) {
+          showNotice('Selection already formatted');
+          return;
+        }
+        applyEdit(formatted.edit);
+        showNotice('Selection formatted');
+      } finally {
+        setFormatting(false);
+      }
+    },
+    [file, isEditable, formatting, draft, selectionRange, applyEdit, handleFormatDocument, showNotice]
+  );
+
+  const handleSelectAllOccurrences = useCallback(
+    (customStart?: number, customEnd?: number) => {
+      if (!file || file.isBinary) return;
+      const el = textareaRef.current;
+      const rawStart = customStart ?? el?.selectionStart ?? activeSelectionRef.current.start;
+      const rawEnd = customEnd ?? el?.selectionEnd ?? activeSelectionRef.current.end;
+      const selStart = Math.min(rawStart, rawEnd);
+      const selEnd = Math.max(rawStart, rawEnd);
+
+      let needle = '';
+      let anchorStart = selStart;
+      let anchorEnd = selEnd;
+
+      if (selEnd > selStart) {
+        needle = draft.slice(selStart, selEnd);
+      } else {
+        const expanded = expandWordAtOffset(draft, selStart);
+        if (!expanded) {
+          showNotice('Select text or place cursor on a word to select all occurrences');
+          return;
+        }
+        needle = expanded.text;
+        anchorStart = expanded.start;
+        anchorEnd = expanded.end;
+      }
+
+      if (!needle) return;
+      const ranges = findAllTextMatches(draft, needle, true);
+      if (ranges.length === 0) return;
+
+      let primaryIndex = ranges.findIndex(
+        (r) => r.start <= anchorStart && anchorEnd <= r.end
+      );
+      if (primaryIndex === -1) {
+        primaryIndex = Math.max(
+          0,
+          ranges.findIndex((r) => r.start >= anchorStart)
+        );
+      }
+      const primary = ranges[primaryIndex] ?? ranges[0];
+
+      setMultiSelection({
+        ranges,
+        primaryIndex,
+        query: needle,
+      });
+      updateCursorStatsFromOffsets(draft, primary.start, primary.end);
+      window.requestAnimationFrame(() => {
+        const area = textareaRef.current;
+        if (!area) return;
+        area.focus();
+        area.setSelectionRange(primary.start, primary.end);
+      });
+    },
+    [file, draft, showNotice, updateCursorStatsFromOffsets]
+  );
 
   // Global keyboard shortcuts when Full-Screen IDE is open
   useEffect(() => {
@@ -1484,6 +1686,11 @@ export function RemoteCodeEditor({
         }
         return;
       }
+      if (mod && !e.altKey && e.shiftKey && (key === 'l' || e.code === 'KeyL')) {
+        e.preventDefault();
+        handleSelectAllOccurrences();
+        return;
+      }
       if (mod && !e.altKey && key === 'f') {
         e.preventDefault();
         openFindBar(false);
@@ -1499,13 +1706,29 @@ export function RemoteCodeEditor({
         openGotoLineBar();
         return;
       }
-      if (e.shiftKey && e.altKey && key === 'f') {
+      if (e.shiftKey && e.altKey && (key === 'f' || e.code === 'KeyF')) {
         e.preventDefault();
-        handleFormatDocument();
+        if (activeSelectionRef.current.end > activeSelectionRef.current.start) {
+          void handleFormatSelection(
+            activeSelectionRef.current.start,
+            activeSelectionRef.current.end
+          );
+        } else {
+          void handleFormatDocument();
+        }
         return;
       }
 
       if (e.key === 'Escape') {
+        if (editorContextMenu) {
+          setEditorContextMenu(null);
+          return;
+        }
+        if (multiSelection) {
+          setMultiSelection(null);
+          textareaRef.current?.focus();
+          return;
+        }
         const activeEl = document.activeElement as HTMLElement | null;
         if (activeEl && activeEl.closest('[data-code-agent-panel="true"]')) {
           activeEl.blur();
@@ -1555,13 +1778,17 @@ export function RemoteCodeEditor({
     saveAsOpen,
     creatingInDir,
     pendingAction,
+    editorContextMenu,
+    multiSelection,
     isDirty,
     onSaveFile,
     onToggleFullScreen,
     openFindBar,
     openGotoLineBar,
     openSaveAsBar,
+    handleSelectAllOccurrences,
     handleFormatDocument,
+    handleFormatSelection,
   ]);
 
   const handleEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1585,6 +1812,13 @@ export function RemoteCodeEditor({
       return;
     }
 
+    // Select All Occurrences (Ctrl+Shift+L / Cmd+Shift+L)
+    if (mod && !e.altKey && e.shiftKey && (key === 'l' || e.code === 'KeyL')) {
+      e.preventDefault();
+      handleSelectAllOccurrences(start, end);
+      return;
+    }
+
     // Find, Replace, Go to Line
     if (mod && !e.altKey && key === 'f') {
       e.preventDefault();
@@ -1600,6 +1834,29 @@ export function RemoteCodeEditor({
       e.preventDefault();
       openGotoLineBar();
       return;
+    }
+
+    if (e.key === 'Escape' && multiSelection) {
+      e.preventDefault();
+      e.stopPropagation();
+      setMultiSelection(null);
+      return;
+    }
+
+    if (
+      multiSelection &&
+      [
+        'ArrowLeft',
+        'ArrowRight',
+        'ArrowUp',
+        'ArrowDown',
+        'Home',
+        'End',
+        'PageUp',
+        'PageDown',
+      ].includes(e.key)
+    ) {
+      setMultiSelection(null);
     }
 
     if (!isEditable || !file) return;
@@ -1648,10 +1905,21 @@ export function RemoteCodeEditor({
       return;
     }
 
-    // Format Document (Shift+Alt+F)
-    if (!mod && e.shiftKey && e.altKey && key === 'f') {
+    // Format Selection / Document (Shift+Alt+F)
+    if (!mod && e.shiftKey && e.altKey && (key === 'f' || e.code === 'KeyF')) {
       e.preventDefault();
-      handleFormatDocument();
+      if (end > start) {
+        void handleFormatSelection(start, end);
+      } else {
+        void handleFormatDocument();
+      }
+      return;
+    }
+
+    if (e.key === 'Escape' && editorContextMenu) {
+      e.preventDefault();
+      e.stopPropagation();
+      setEditorContextMenu(null);
       return;
     }
 
@@ -2111,7 +2379,7 @@ export function RemoteCodeEditor({
             <span>Ctrl+S · Save</span>
             <span>Ctrl+Shift+S · Save As</span>
             <span>Ctrl+F / H · Find & Replace</span>
-            <span>Ctrl+G · Go to Line</span>
+            <span>Ctrl+Shift+L · Select All Same</span>
             <span>Ctrl+/ · Comment Line</span>
             <span>Shift+Alt+F · Format</span>
           </div>
@@ -2155,6 +2423,33 @@ export function RemoteCodeEditor({
               className="text-blue-300 hover:text-white cursor-pointer"
             >
               <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {multiSelection && (
+          <div className="shrink-0 px-3 py-1 border-b border-blue-500/35 bg-blue-600/15 text-[11.5px] text-blue-100 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="inline-block w-2 h-2 rounded-full bg-blue-400 shrink-0" />
+              <span className="font-medium truncate">
+                {multiSelection.ranges.length} occurrence
+                {multiSelection.ranges.length === 1 ? '' : 's'} selected
+              </span>
+              {isEditable && (
+                <span className="hidden sm:inline text-blue-300/85">
+                  · Type to edit all simultaneously · Esc to exit
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMultiSelection(null);
+                textareaRef.current?.focus();
+              }}
+              className="px-2 py-0.5 rounded border border-blue-400/30 bg-blue-500/20 hover:bg-blue-500/35 text-[10.5px] font-medium text-blue-100 cursor-pointer shrink-0"
+            >
+              Exit (Esc)
             </button>
           </div>
         )}
@@ -2641,6 +2936,18 @@ export function RemoteCodeEditor({
                 dangerouslySetInnerHTML={{ __html: highlightedHtml }}
               />
 
+              {multiSelectionHtml && (
+                <pre
+                  ref={selectionOverlayRef}
+                  aria-hidden="true"
+                  style={{ tabSize: 2 }}
+                  className={`sync-scroll-ghost absolute inset-0 m-0 py-3 px-3.5 overflow-auto pointer-events-none select-none text-transparent font-mono-code ${
+                    isFull ? 'text-[13px] leading-[21px]' : 'text-[11.5px] leading-[19px]'
+                  } ${wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}
+                  dangerouslySetInnerHTML={{ __html: multiSelectionHtml }}
+                />
+              )}
+
               <textarea
                 ref={textareaRef}
                 value={draft}
@@ -2654,6 +2961,84 @@ export function RemoteCodeEditor({
                   const val = e.target.value;
                   const pos = e.target.selectionStart ?? 0;
                   const endPos = e.target.selectionEnd ?? pos;
+                  const prevScrollTop = e.currentTarget.scrollTop;
+                  const prevScrollLeft = e.currentTarget.scrollLeft;
+
+                  // 1. Live multi-occurrence edit (Ctrl+Shift+L)
+                  if (multiSelection && multiSelection.ranges.length > 0 && isEditable) {
+                    const multi = applyMultiRangeEdit(
+                      draft,
+                      val,
+                      pos,
+                      multiSelection.ranges,
+                      multiSelection.primaryIndex
+                    );
+                    if (multi) {
+                      const p = multi.ranges[multi.primaryIndex] ?? { start: pos, end: pos };
+                      setDraft(multi.value);
+                      setMultiSelection({
+                        ...multiSelection,
+                        ranges: multi.ranges,
+                        primaryIndex: multi.primaryIndex,
+                      });
+                      pushHistory(
+                        { value: multi.value, selectionStart: p.start, selectionEnd: p.end },
+                        true
+                      );
+                      updateCursorStatsFromOffsets(multi.value, p.start, p.end);
+                      window.requestAnimationFrame(() => {
+                        const area = textareaRef.current;
+                        if (!area) return;
+                        area.setSelectionRange(p.start, p.end);
+                        area.scrollTop = prevScrollTop;
+                        area.scrollLeft = prevScrollLeft;
+                        if (preRef.current) {
+                          preRef.current.scrollTop = prevScrollTop;
+                          preRef.current.scrollLeft = prevScrollLeft;
+                        }
+                        if (selectionOverlayRef.current) {
+                          selectionOverlayRef.current.scrollTop = prevScrollTop;
+                          selectionOverlayRef.current.scrollLeft = prevScrollLeft;
+                        }
+                      });
+                      return;
+                    }
+                  }
+
+                  // 2. Auto Rename Tag (HTML / XML / SVG / JSX / TSX / Vue / Svelte)
+                  if (isEditable && file) {
+                    const renamed = applyAutoRenameTag(draft, val, pos, file.name);
+                    if (renamed) {
+                      setDraft(renamed.value);
+                      pushHistory(
+                        {
+                          value: renamed.value,
+                          selectionStart: renamed.selectionStart,
+                          selectionEnd: renamed.selectionEnd,
+                        },
+                        true
+                      );
+                      updateCursorStatsFromOffsets(
+                        renamed.value,
+                        renamed.selectionStart,
+                        renamed.selectionEnd
+                      );
+                      window.requestAnimationFrame(() => {
+                        const area = textareaRef.current;
+                        if (!area) return;
+                        area.setSelectionRange(renamed.selectionStart, renamed.selectionEnd);
+                        area.scrollTop = prevScrollTop;
+                        area.scrollLeft = prevScrollLeft;
+                        if (preRef.current) {
+                          preRef.current.scrollTop = prevScrollTop;
+                          preRef.current.scrollLeft = prevScrollLeft;
+                        }
+                      });
+                      return;
+                    }
+                  }
+
+                  // 3. Normal single-cursor edit
                   setDraft(val);
                   const lastChar = val[Math.max(0, pos - 1)] ?? '';
                   const boundaryChar = lastChar === '\n' || lastChar === ' ';
@@ -2663,19 +3048,60 @@ export function RemoteCodeEditor({
                   );
                   updateCursorStatsFromOffsets(val, pos, endPos);
                 }}
-                onClick={updateCursorStats}
+                onClick={() => {
+                  setEditorContextMenu(null);
+                  setMultiSelection(null);
+                  updateCursorStats();
+                }}
                 onKeyUp={updateCursorStats}
-                onSelect={updateCursorStats}
+                onSelect={() => {
+                  if (!multiSelection) {
+                    updateCursorStats();
+                  }
+                }}
+                onContextMenu={(e) => {
+                  if (!file || file.isBinary) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const el = e.currentTarget;
+                  const start = el.selectionStart ?? 0;
+                  const end = el.selectionEnd ?? start;
+                  const selStart = Math.min(start, end);
+                  const selEnd = Math.max(start, end);
+                  const effectiveEnd =
+                    selEnd > selStart && draft[selEnd - 1] === '\n' ? selEnd - 1 : selEnd;
+                  const lineNumber = draft.slice(0, selStart).split('\n').length;
+                  const endLineNumber = Math.max(
+                    lineNumber,
+                    draft.slice(0, effectiveEnd).split('\n').length
+                  );
+                  updateCursorStatsFromOffsets(el.value, selStart, selEnd);
+                  setEditorContextMenu({
+                    x: e.clientX,
+                    y: e.clientY,
+                    selectionStart: selStart,
+                    selectionEnd: selEnd,
+                    lineNumber,
+                    endLineNumber,
+                  });
+                }}
                 onScroll={(e) => {
                   const top = e.currentTarget.scrollTop;
                   const left = e.currentTarget.scrollLeft;
                   setEditorScrollTop(top);
+                  if (editorContextMenu) {
+                    setEditorContextMenu(null);
+                  }
                   if (gutterRef.current) {
                     gutterRef.current.scrollTop = top;
                   }
                   if (preRef.current) {
                     preRef.current.scrollTop = top;
                     preRef.current.scrollLeft = left;
+                  }
+                  if (selectionOverlayRef.current) {
+                    selectionOverlayRef.current.scrollTop = top;
+                    selectionOverlayRef.current.scrollLeft = left;
                   }
                 }}
                 onKeyDown={handleEditorKeyDown}
@@ -2688,6 +3114,308 @@ export function RemoteCodeEditor({
             </div>
           </div>
         )}
+
+        {/* Right-Click Context Menu Popup */}
+        {editorContextMenu && file && !file.isBinary && (() => {
+          const { x, y, selectionStart, selectionEnd, lineNumber, endLineNumber } =
+            editorContextMenu;
+          const hasSelection = selectionEnd > selectionStart;
+          const menuWidth = 248;
+          const estimatedHeight = isEditable ? (hasSelection ? 444 : 408) : 130;
+          const left =
+            typeof window !== 'undefined'
+              ? Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8))
+              : x;
+          const top =
+            typeof window !== 'undefined'
+              ? Math.max(8, Math.min(y, window.innerHeight - estimatedHeight - 8))
+              : y;
+          const lineLabel =
+            hasSelection && endLineNumber > lineNumber
+              ? `Lines ${lineNumber}–${endLineNumber}`
+              : hasSelection
+              ? `Selected · Line ${lineNumber}`
+              : `Line ${lineNumber}`;
+
+          const getLineBoundsForCursor = () => {
+            const ls = draft.lastIndexOf('\n', Math.max(0, selectionStart - 1)) + 1;
+            const leRaw = draft.indexOf('\n', selectionStart);
+            const le = leRaw === -1 ? draft.length : leRaw;
+            return { ls, le };
+          };
+
+          return (
+            <div
+              ref={contextMenuRef}
+              role="menu"
+              aria-label="Code editor actions"
+              style={{ left: `${left}px`, top: `${top}px`, width: `${menuWidth}px` }}
+              className="fixed z-[120] rounded-lg border border-white/15 bg-[#181820] shadow-2xl shadow-black/70 py-1 text-[12px] text-neutral-200 select-none backdrop-blur-md"
+              onContextMenu={(ev) => ev.preventDefault()}
+            >
+              <div className="px-3 py-1.5 border-b border-white/[0.08] flex items-center justify-between gap-2 text-[10.5px] text-neutral-400">
+                <span className="font-medium text-neutral-300 truncate">{file.name}</span>
+                <span className="font-mono-code shrink-0 text-blue-300">{lineLabel}</span>
+              </div>
+
+              {isEditable && (
+                <>
+                  {hasSelection && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setEditorContextMenu(null);
+                        void handleFormatSelection(selectionStart, selectionEnd);
+                      }}
+                      className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-blue-600/25 hover:text-white text-left cursor-pointer"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Wand2 className="w-3.5 h-3.5 text-blue-400" />
+                        <span>Format Selection</span>
+                      </span>
+                      <span className="font-mono-code text-[10px] text-neutral-500">⇧⌥F</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      void handleFormatDocument();
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-blue-600/25 hover:text-white text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Wand2 className="w-3.5 h-3.5 text-blue-400" />
+                      <span>Format Document</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">
+                      {hasSelection ? '' : '⇧⌥F'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      handleSelectAllOccurrences(selectionStart, selectionEnd);
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-blue-600/25 hover:text-white text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Search className="w-3.5 h-3.5 text-blue-400" />
+                      <span>Select All Occurrences</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+⇧L</span>
+                  </button>
+
+                  <div className="my-1 border-t border-white/[0.07]" />
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      applyEdit(toggleCommentLines(draft, selectionStart, selectionEnd, file.name));
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Hash className="w-3.5 h-3.5 text-neutral-400" />
+                      <span>Toggle Comment</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+/</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      applyEdit(
+                        duplicateSelectedLines(draft, selectionStart, selectionEnd, 'down')
+                      );
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Files className="w-3.5 h-3.5 text-neutral-400" />
+                      <span>Duplicate {hasSelection ? 'Selection' : 'Line'}</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">⇧⌥↓</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={lineNumber <= 1}
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      applyEdit(moveSelectedLines(draft, selectionStart, selectionEnd, 'up'));
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white disabled:opacity-35 text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <ArrowUp className="w-3.5 h-3.5 text-neutral-400" />
+                      <span>Move Line Up</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">⌥↑</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={endLineNumber >= lineCount}
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      applyEdit(moveSelectedLines(draft, selectionStart, selectionEnd, 'down'));
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white disabled:opacity-35 text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <ArrowDown className="w-3.5 h-3.5 text-neutral-400" />
+                      <span>Move Line Down</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">⌥↓</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setEditorContextMenu(null);
+                      applyEdit(deleteSelectedLines(draft, selectionStart, selectionEnd));
+                    }}
+                    className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-red-500/20 hover:text-red-200 text-left cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Trash2 className="w-3.5 h-3.5 text-red-400" />
+                      <span>Delete {hasSelection && endLineNumber > lineNumber ? 'Lines' : 'Line'}</span>
+                    </span>
+                    <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+⇧K</span>
+                  </button>
+
+                  <div className="my-1 border-t border-white/[0.07]" />
+                </>
+              )}
+
+              {isEditable && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={async () => {
+                    setEditorContextMenu(null);
+                    if (hasSelection) {
+                      const snippet = draft.slice(selectionStart, selectionEnd);
+                      await onCopyText(snippet);
+                      applyEdit({
+                        value: `${draft.slice(0, selectionStart)}${draft.slice(selectionEnd)}`,
+                        selectionStart,
+                        selectionEnd: selectionStart,
+                      });
+                    } else {
+                      const { ls, le } = getLineBoundsForCursor();
+                      await onCopyText(draft.slice(ls, le));
+                      applyEdit(deleteSelectedLines(draft, selectionStart, selectionEnd));
+                    }
+                  }}
+                  className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white text-left cursor-pointer"
+                >
+                  <span className="flex items-center gap-2">
+                    <Scissors className="w-3.5 h-3.5 text-neutral-400" />
+                    <span>Cut</span>
+                  </span>
+                  <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+X</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={async () => {
+                  setEditorContextMenu(null);
+                  const textToCopy = hasSelection
+                    ? draft.slice(selectionStart, selectionEnd)
+                    : (() => {
+                        const { ls, le } = getLineBoundsForCursor();
+                        return draft.slice(ls, le);
+                      })();
+                  const ok = await onCopyText(textToCopy);
+                  showNotice(ok ? 'Copied to clipboard' : 'Copy failed');
+                }}
+                className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white text-left cursor-pointer"
+              >
+                <span className="flex items-center gap-2">
+                  <Copy className="w-3.5 h-3.5 text-neutral-400" />
+                  <span>Copy</span>
+                </span>
+                <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+C</span>
+              </button>
+
+              {isEditable && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={async () => {
+                    setEditorContextMenu(null);
+                    try {
+                      const clip = await navigator.clipboard.readText();
+                      if (clip === undefined || clip === null) return;
+                      const nextValue = `${draft.slice(0, selectionStart)}${clip}${draft.slice(selectionEnd)}`;
+                      const nextCursor = selectionStart + clip.length;
+                      applyEdit({
+                        value: nextValue,
+                        selectionStart: nextCursor,
+                        selectionEnd: nextCursor,
+                      });
+                    } catch {
+                      showNotice('Clipboard paste blocked by browser — press Ctrl+V');
+                    }
+                  }}
+                  className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.08] hover:text-white text-left cursor-pointer"
+                >
+                  <span className="flex items-center gap-2">
+                    <ClipboardPaste className="w-3.5 h-3.5 text-neutral-400" />
+                    <span>Paste</span>
+                  </span>
+                  <span className="font-mono-code text-[10px] text-neutral-500">Ctrl+V</span>
+                </button>
+              )}
+
+              <div className="my-1 border-t border-white/[0.07]" />
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setEditorContextMenu(null);
+                  setAiAgentOpen(true);
+                  if (!fullScreen) {
+                    onToggleFullScreen(true);
+                  }
+                  window.requestAnimationFrame(() => {
+                    const el = textareaRef.current;
+                    if (el) {
+                      el.setSelectionRange(selectionStart, selectionEnd);
+                    }
+                    updateCursorStatsFromOffsets(draft, selectionStart, selectionEnd);
+                  });
+                }}
+                className="w-full px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-blue-600/25 text-blue-200 hover:text-white text-left cursor-pointer"
+              >
+                <span className="flex items-center gap-2">
+                  <MessageSquare className="w-3.5 h-3.5 text-blue-400" />
+                  <span>
+                    {hasSelection ? 'Ask AI Agent About Selection' : 'Ask AI Agent'}
+                  </span>
+                </span>
+              </button>
+            </div>
+          );
+        })()}
       </div>
     );
   };
@@ -2722,6 +3450,33 @@ export function RemoteCodeEditor({
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
+            {file && isEditable && (
+              <button
+                type="button"
+                disabled={formatting}
+                onClick={() => {
+                  if (selectionRange.end > selectionRange.start) {
+                    void handleFormatSelection(selectionRange.start, selectionRange.end);
+                  } else {
+                    void handleFormatDocument();
+                  }
+                }}
+                title={
+                  selectionRange.end > selectionRange.start
+                    ? 'Format Selected Lines (Shift+Alt+F)'
+                    : 'Format Document (Shift+Alt+F)'
+                }
+                className="inline-flex items-center gap-1 px-1.5 py-1 rounded border border-white/10 text-[11px] font-medium text-neutral-300 hover:text-white hover:bg-white/10 disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap"
+              >
+                {formatting ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Wand2 className="w-3 h-3 text-blue-400" />
+                )}
+                <span>Format</span>
+              </button>
+            )}
+
             {file && isEditable && (
               <button
                 type="button"
@@ -2832,6 +3587,33 @@ export function RemoteCodeEditor({
               {languageLabel} · {lineCount.toLocaleString()} lines ·{' '}
               {formatBytes(new Blob([draft]).size)}
             </span>
+          )}
+
+          {file && isEditable && (
+            <button
+              type="button"
+              disabled={formatting}
+              onClick={() => {
+                if (selectionRange.end > selectionRange.start) {
+                  void handleFormatSelection(selectionRange.start, selectionRange.end);
+                } else {
+                  void handleFormatDocument();
+                }
+              }}
+              title={
+                selectionRange.end > selectionRange.start
+                  ? 'Format Selection (Shift+Alt+F)'
+                  : 'Format Document (Shift+Alt+F)'
+              }
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-200 hover:bg-white/10 disabled:opacity-45 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {formatting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+              ) : (
+                <Wand2 className="w-3.5 h-3.5 text-blue-400" />
+              )}
+              <span>{selectionRange.end > selectionRange.start ? 'Format Selection' : 'Format'}</span>
+            </button>
           )}
 
           {file && isEditable && (
@@ -3241,7 +4023,7 @@ export function RemoteCodeEditor({
           <span>{languageLabel}</span>
         </div>
         <div className="hidden sm:block text-neutral-500">
-          Ctrl+S Save · Ctrl+Shift+S Save As · Ctrl+F Find · Ctrl+H Replace · Ctrl+G Line · Ctrl+/ Comment · Shift+Alt+F Format
+          Ctrl+S Save · Ctrl+F Find · Ctrl+H Replace · Ctrl+Shift+L Select All · Ctrl+/ Comment · Shift+Alt+F Format
         </div>
       </footer>
     </div>
