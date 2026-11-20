@@ -59,7 +59,24 @@ import {
 } from '../utils/codeAgentClient';
 import { formatRelativeDate } from '../utils/markdown';
 import { highlightCodeToHtml } from '../utils/codeHighlight';
-import type { RemoteDirEntry, RemoteFilePreview } from './ProjectTreeView';
+import {
+  DraggedRemoteEntry,
+  getFileIconColorClass,
+  REMOTE_ENTRY_DRAG_MIME,
+  RemoteDirEntry,
+  RemoteFilePreview,
+} from './ProjectTreeView';
+
+interface DroppedContextFile {
+  id: string;
+  path: string;
+  name: string;
+  isDirectory?: boolean;
+  content?: string;
+  loading?: boolean;
+  error?: string;
+  source: 'remote' | 'local';
+}
 
 export interface StagedDiffPayload {
   edits?: CodeAgentEditHunk[];
@@ -702,7 +719,10 @@ export function CodeAgentPanel({
   const [loadingStatus, setLoadingStatus] = useState('Analyzing code...');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastAppliedTurnId, setLastAppliedTurnId] = useState<string | null>(null);
+  const [attachedFiles, setAttachedFiles] = useState<DroppedContextFile[]>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
 
+  const dragDepthRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -843,10 +863,20 @@ export function CodeAgentPanel({
       const text = (overridePrompt ?? promptInput).trim();
       if (!text || loading) return;
 
+      const validAttached = attachedFiles.filter(
+        (item) => !item.error && !item.loading && typeof item.content === 'string'
+      );
+      const attachedMeta = attachedFiles
+        .filter((item) => !item.error)
+        .map((item) => ({ name: item.name, path: item.path }));
+
       const effectiveMode = modeOverride ?? agentMode;
       const userTurnId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const historyPayload: CodeAgentMessage[] = messages.slice(-12).map((m) => {
         let content = m.content;
+        if (m.attachedFiles && m.attachedFiles.length > 0) {
+          content = `[Attached files: ${m.attachedFiles.map((f) => f.path).join(', ')}]\n${content}`;
+        }
         if (m.role === 'assistant' && m.fileOperations && m.fileOperations.length > 0) {
           const touched = m.fileOperations.map((o) => `${o.operation}:${o.path}`).join(', ');
           content = `${content}\n[Files touched: ${touched}]`;
@@ -875,6 +905,7 @@ export function CodeAgentPanel({
               createdAt: Date.now(),
               taskMode,
               agentMode: effectiveMode,
+              attachedFiles: attachedMeta.length > 0 ? attachedMeta : undefined,
             },
           ],
         };
@@ -882,6 +913,9 @@ export function CodeAgentPanel({
 
       if (!overridePrompt) {
         setPromptInput('');
+      }
+      if (attachedMeta.length > 0) {
+        setAttachedFiles([]);
       }
       setLoading(true);
       setLoadingStatus(
@@ -894,8 +928,13 @@ export function CodeAgentPanel({
         const activeSelection =
           scopeToSelection && selectedText.trim().length > 0 ? selectedText : undefined;
 
-        // 1. Pre-load probable related files from imports/mentions over SSH
+        // 1. Seed related files with explicitly dragged-and-dropped context files, then heuristic candidates
         const relatedMap = new Map<string, string>();
+        for (const att of validAttached) {
+          if (att.path && att.path !== file?.path && typeof att.content === 'string') {
+            relatedMap.set(att.path, att.content.slice(0, 24000));
+          }
+        }
         const initialCandidates = findCandidateRelatedFiles(
           file?.path,
           file && !file.isBinary ? draft : undefined,
@@ -908,8 +947,15 @@ export function CodeAgentPanel({
         const buildRelatedPayload = (): CodeAgentRelatedFile[] =>
           Array.from(relatedMap.entries()).map(([p, c]) => ({ path: p, content: c }));
 
+        const promptWithAttachments =
+          attachedMeta.length > 0
+            ? `[User attached context files via drag & drop: ${attachedMeta
+                .map((f) => f.path)
+                .join(', ')}]\n\n${text}`
+            : text;
+
         let res = await requestCodeAgent({
-          prompt: text,
+          prompt: promptWithAttachments,
           model: selectedModel,
           taskMode,
           agentMode: effectiveMode,
@@ -944,7 +990,7 @@ export function CodeAgentPanel({
           if (relatedMap.size > prevSize) {
             setLoadingStatus('Generating targeted updates across files...');
             res = await requestCodeAgent({
-              prompt: text,
+              prompt: promptWithAttachments,
               model: selectedModel,
               taskMode,
               agentMode: effectiveMode,
@@ -1039,7 +1085,226 @@ export function CodeAgentPanel({
       onStageFileOperations,
       isEditable,
       onStageInlineDiff,
+      attachedFiles,
     ]
+  );
+
+  const attachRemoteEntry = useCallback(
+    async (entry: DraggedRemoteEntry) => {
+      const cleanPath = entry.path.trim();
+      if (!cleanPath) return;
+      const chipId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      if (entry.isDirectory) {
+        const cached = dirCache[cleanPath];
+        const summaryContent =
+          cached && cached.length > 0
+            ? `Directory contents of ${cleanPath}:\n` +
+              cached.map((c) => (c.isDirectory ? `${c.name}/` : c.name)).join('\n')
+            : `Directory reference: ${cleanPath}`;
+        setAttachedFiles((prev) => {
+          const withoutDup = prev.filter((item) => item.path !== cleanPath);
+          return [
+            ...withoutDup,
+            {
+              id: chipId,
+              path: cleanPath,
+              name: `${entry.name}/`,
+              isDirectory: true,
+              content: summaryContent,
+              loading: false,
+              source: 'remote',
+            },
+          ];
+        });
+        return;
+      }
+
+      if (file && file.path === cleanPath && !file.isBinary) {
+        setAttachedFiles((prev) => {
+          const withoutDup = prev.filter((item) => item.path !== cleanPath);
+          return [
+            ...withoutDup,
+            {
+              id: chipId,
+              path: cleanPath,
+              name: entry.name || file.name,
+              content: draft.slice(0, 24000),
+              loading: false,
+              source: 'remote',
+            },
+          ];
+        });
+        return;
+      }
+
+      setAttachedFiles((prev) => {
+        const withoutDup = prev.filter((item) => item.path !== cleanPath);
+        return [
+          ...withoutDup,
+          {
+            id: chipId,
+            path: cleanPath,
+            name: entry.name || cleanPath.split('/').pop() || cleanPath,
+            loading: Boolean(onReadRemoteFile),
+            source: 'remote',
+          },
+        ];
+      });
+
+      if (!onReadRemoteFile) return;
+
+      try {
+        const loaded = await onReadRemoteFile(cleanPath);
+        setAttachedFiles((prev) =>
+          prev.map((item) =>
+            item.id === chipId
+              ? loaded.isBinary
+                ? { ...item, loading: false, error: 'Binary file cannot be attached as text' }
+                : { ...item, loading: false, content: (loaded.content || '').slice(0, 24000) }
+              : item
+          )
+        );
+      } catch (err) {
+        setAttachedFiles((prev) =>
+          prev.map((item) =>
+            item.id === chipId
+              ? {
+                  ...item,
+                  loading: false,
+                  error: err instanceof Error ? err.message : 'Unable to read dropped file',
+                }
+              : item
+          )
+        );
+      }
+    },
+    [dirCache, draft, file, onReadRemoteFile]
+  );
+
+  const handlePanelDragEnter = useCallback((e: React.DragEvent) => {
+    const types = Array.from(e.dataTransfer?.types || []);
+    const supported =
+      types.includes(REMOTE_ENTRY_DRAG_MIME) ||
+      types.includes('Files') ||
+      types.includes('text/plain');
+    if (!supported) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDragOver(true);
+  }, []);
+
+  const handlePanelDragOver = useCallback((e: React.DragEvent) => {
+    const types = Array.from(e.dataTransfer?.types || []);
+    const supported =
+      types.includes(REMOTE_ENTRY_DRAG_MIME) ||
+      types.includes('Files') ||
+      types.includes('text/plain');
+    if (!supported) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    if (!isDragOver) setIsDragOver(true);
+  }, [isDragOver]);
+
+  const handlePanelDragLeave = useCallback(() => {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handlePanelDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepthRef.current = 0;
+      setIsDragOver(false);
+
+      const rawRemote = e.dataTransfer.getData(REMOTE_ENTRY_DRAG_MIME);
+      if (rawRemote) {
+        try {
+          const parsed = JSON.parse(rawRemote) as DraggedRemoteEntry;
+          if (parsed && typeof parsed.path === 'string') {
+            await attachRemoteEntry(parsed);
+            promptInputRef.current?.focus();
+            return;
+          }
+        } catch {
+          // fall through to other drop formats
+        }
+      }
+
+      const droppedLocalFiles = Array.from(e.dataTransfer.files || []).slice(0, 5);
+      if (droppedLocalFiles.length > 0) {
+        for (const localFile of droppedLocalFiles) {
+          const chipId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          if (localFile.size > 524288) {
+            setAttachedFiles((prev) => [
+              ...prev.filter((item) => item.name !== localFile.name),
+              {
+                id: chipId,
+                path: localFile.name,
+                name: localFile.name,
+                error: 'File exceeds 512 KB attachment limit',
+                source: 'local',
+              },
+            ]);
+            continue;
+          }
+          try {
+            const text = await localFile.text();
+            if (text.slice(0, 1024).includes('\0')) {
+              setAttachedFiles((prev) => [
+                ...prev.filter((item) => item.name !== localFile.name),
+                {
+                  id: chipId,
+                  path: localFile.name,
+                  name: localFile.name,
+                  error: 'Binary file cannot be attached as text',
+                  source: 'local',
+                },
+              ]);
+            } else {
+              setAttachedFiles((prev) => [
+                ...prev.filter((item) => item.name !== localFile.name),
+                {
+                  id: chipId,
+                  path: localFile.name,
+                  name: localFile.name,
+                  content: text.slice(0, 24000),
+                  source: 'local',
+                },
+              ]);
+            }
+          } catch {
+            setAttachedFiles((prev) => [
+              ...prev.filter((item) => item.name !== localFile.name),
+              {
+                id: chipId,
+                path: localFile.name,
+                name: localFile.name,
+                error: 'Unable to read local file',
+                source: 'local',
+              },
+            ]);
+          }
+        }
+        promptInputRef.current?.focus();
+        return;
+      }
+
+      const plainPath = e.dataTransfer.getData('text/plain').trim();
+      if (plainPath && (plainPath.startsWith('/') || plainPath.startsWith('~/'))) {
+        const name = plainPath.split('/').filter(Boolean).pop() || plainPath;
+        await attachRemoteEntry({
+          path: plainPath,
+          name,
+          isDirectory: false,
+        });
+        promptInputRef.current?.focus();
+      }
+    },
+    [attachRemoteEntry]
   );
 
   const handleExecutePlan = useCallback(
@@ -1062,9 +1327,22 @@ export function CodeAgentPanel({
   return (
     <aside
       data-code-agent-panel="true"
+      onDragEnter={handlePanelDragEnter}
+      onDragOver={handlePanelDragOver}
+      onDragLeave={handlePanelDragLeave}
+      onDrop={(e) => void handlePanelDrop(e)}
       style={{ width: `${width}px` }}
       className="shrink-0 border-l border-white/[0.08] bg-[#121217] flex flex-col min-h-0 relative"
     >
+      {isDragOver && (
+        <div className="absolute inset-2 z-30 rounded-xl border-2 border-dashed border-blue-400/85 bg-blue-950/75 backdrop-blur-[2px] flex flex-col items-center justify-center gap-2 p-4 text-center pointer-events-none">
+          <FileCode2 className="w-8 h-8 text-blue-300" />
+          <p className="text-[13px] font-semibold text-white">Drop file to attach to AI Agent</p>
+          <p className="text-[11.5px] text-blue-200/80">
+            The file content will be added as context for your next prompt.
+          </p>
+        </div>
+      )}
       {/* Header */}
       <div className="shrink-0 px-3 py-2 border-b border-white/[0.08] flex items-center justify-between gap-2 bg-[#14141b]">
         <div className="flex items-center gap-1.5 min-w-0">
@@ -1393,18 +1671,32 @@ export function CodeAgentPanel({
               <span className="font-mono-code text-neutral-200">
                 {file ? file.name : currentRemotePath || 'this workspace'}
               </span>{' '}
-              and related project files. Use <strong className="text-neutral-200">Plan</strong> to
-              review a step-by-step architecture plan first, or{' '}
-              <strong className="text-neutral-200">Auto</strong> to generate multi-file diffs, new
-              folders, and new files directly for line-by-line review.
+              and related project files. Drag and drop any file here to attach it as context, use{' '}
+              <strong className="text-neutral-200">Plan</strong> to review a step-by-step
+              architecture plan first, or <strong className="text-neutral-200">Auto</strong> to
+              generate multi-file diffs, new folders, and new files directly.
             </p>
           </div>
         ) : (
           messages.map((msg) =>
             msg.role === 'user' ? (
               <div key={msg.id} className="flex justify-end">
-                <div className="max-w-[90%] rounded-xl rounded-tr-sm bg-blue-600/20 border border-blue-500/30 px-3 py-2 text-[12.5px] text-neutral-100 whitespace-pre-wrap leading-relaxed">
-                  {msg.content}
+                <div className="max-w-[90%] rounded-xl rounded-tr-sm bg-blue-600/20 border border-blue-500/30 px-3 py-2 text-[12.5px] text-neutral-100 whitespace-pre-wrap leading-relaxed space-y-1.5">
+                  {msg.attachedFiles && msg.attachedFiles.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pb-1 border-b border-blue-400/20">
+                      {msg.attachedFiles.map((att) => (
+                        <span
+                          key={att.path}
+                          title={att.path}
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-blue-500/20 border border-blue-400/30 font-mono-code text-[10.5px] text-blue-100"
+                        >
+                          <FileCode2 className="w-3 h-3 text-blue-300 shrink-0" />
+                          <span className="truncate max-w-[160px]">{att.name}</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div>{msg.content}</div>
                 </div>
               </div>
             ) : (
@@ -1611,6 +1903,45 @@ export function CodeAgentPanel({
           }}
           className="rounded-lg border border-white/12 bg-[#0c0c10] focus-within:border-blue-500 transition-colors p-2 space-y-1.5"
         >
+          {attachedFiles.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1 pb-1.5 border-b border-white/[0.08]">
+              {attachedFiles.map((att) => (
+                <div
+                  key={att.id}
+                  title={att.error ? `${att.path} — ${att.error}` : att.path}
+                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[11px] max-w-full ${
+                    att.error
+                      ? 'border-red-500/40 bg-red-500/12 text-red-200'
+                      : 'border-blue-500/35 bg-blue-500/12 text-blue-100'
+                  }`}
+                >
+                  {att.loading ? (
+                    <Loader2 className="w-3 h-3 animate-spin text-blue-300 shrink-0" />
+                  ) : att.error ? (
+                    <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />
+                  ) : (
+                    <FileCode2
+                      className={`w-3 h-3 shrink-0 ${
+                        att.isDirectory ? 'text-sky-400' : getFileIconColorClass(att.name)
+                      }`}
+                    />
+                  )}
+                  <span className="font-mono-code truncate max-w-[160px]">{att.name}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAttachedFiles((prev) => prev.filter((item) => item.id !== att.id))
+                    }
+                    title={`Remove ${att.name}`}
+                    className="p-0.5 rounded text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer shrink-0"
+                  >
+                    <X className="w-2.5 h-2.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <textarea
             ref={promptInputRef}
             rows={3}
@@ -1624,17 +1955,17 @@ export function CodeAgentPanel({
             }}
             placeholder={
               agentMode === 'plan'
-                ? 'Describe your goal — AI will draft a multi-file plan first...'
+                ? 'Describe your goal or drop files here — AI will draft a plan first...'
                 : file
-                ? `Ask AI to edit ${file.name}, update related files, or create folders/files...`
-                : 'Ask AI to create folders/files or update project code...'
+                ? `Ask AI about ${file.name} or drop files here to attach...`
+                : 'Drag & drop files here or ask AI to create folders/files...'
             }
             aria-label="AI Code Agent prompt"
             className="w-full resize-none bg-transparent text-[12.5px] text-neutral-100 placeholder:text-neutral-500 focus:outline-none leading-relaxed"
           />
           <div className="flex items-center justify-between gap-2">
             <span className="text-[10.5px] text-neutral-500">
-              {agentMode === 'plan' ? 'Plan mode' : 'Auto mode'} · Enter to send
+              {agentMode === 'plan' ? 'Plan mode' : 'Auto mode'} · Drop files or Enter to send
             </span>
             <button
               type="submit"

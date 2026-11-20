@@ -199,7 +199,12 @@ export function SshTerminalView({
   const [loadingDirs, setLoadingDirs] = useState<Record<string, boolean>>({});
   const [truncatedDirs, setTruncatedDirs] = useState<Record<string, boolean>>({});
   const [dirError, setDirError] = useState<string | null>(null);
-  const [previewFile, setPreviewFile] = useState<RemoteFilePreview | null>(null);
+  const [openFiles, setOpenFiles] = useState<RemoteFilePreview[]>([]);
+  const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const previewFile = useMemo(
+    () => openFiles.find((f) => f.path === activeFilePath) ?? null,
+    [openFiles, activeFilePath]
+  );
   const [fileLoading, setFileLoading] = useState(false);
   const [editorFullScreen, setEditorFullScreen] = useState(false);
   const [savingFile, setSavingFile] = useState(false);
@@ -311,6 +316,10 @@ export function SshTerminalView({
   } | null>(null);
   const currentRemotePathRef = useRef<string>('');
   currentRemotePathRef.current = currentRemotePath;
+  const openFilesRef = useRef<RemoteFilePreview[]>(openFiles);
+  openFilesRef.current = openFiles;
+  const activeFilePathRef = useRef<string | null>(activeFilePath);
+  activeFilePathRef.current = activeFilePath;
   const selectedProfileIdRef = useRef<string | null>(null);
   selectedProfileIdRef.current = selectedProfileId;
   const profilesRef = useRef<SshProfile[]>(profiles);
@@ -733,7 +742,8 @@ export function SshTerminalView({
     setLoadingDirs({});
     setTruncatedDirs({});
     pendingDirReqRef.current.clear();
-    setPreviewFile(null);
+    setOpenFiles([]);
+    setActiveFilePath(null);
     setEditorFullScreen(false);
     setSavingFile(false);
     setSaveFileError(null);
@@ -762,11 +772,11 @@ export function SshTerminalView({
       setLoadingDirs((prev) => ({ ...prev, [loadKey]: true }));
       setDirError(null);
       if (options?.openFullScreen) {
-        setPreviewFile(null);
+        setActiveFilePath(null);
         setCreatingInDir(null);
         setEditorFullScreen(true);
       } else if (mode === 'root' && !options?.keepPreview) {
-        setPreviewFile(null);
+        setActiveFilePath(null);
         setEditorFullScreen(false);
         setCreatingInDir(null);
       }
@@ -975,8 +985,44 @@ export function SshTerminalView({
     });
   }, [requestListDir]);
 
+  const upsertOpenFile = useCallback((nextFile: RemoteFilePreview, activate = true) => {
+    setOpenFiles((prev) => {
+      const idx = prev.findIndex((f) => f.path === nextFile.path);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = nextFile;
+        return next;
+      }
+      return [...prev, nextFile];
+    });
+    if (activate) {
+      setActiveFilePath(nextFile.path);
+    }
+  }, []);
+
+  const closeOpenFileTab = useCallback((targetPath: string) => {
+    setOpenFiles((prev) => {
+      const idx = prev.findIndex((f) => f.path === targetPath);
+      if (idx === -1) return prev;
+      const next = prev.filter((f) => f.path !== targetPath);
+      if (activeFilePathRef.current === targetPath) {
+        const replacement = next[idx] ?? next[idx - 1] ?? null;
+        setActiveFilePath(replacement ? replacement.path : null);
+      }
+      return next;
+    });
+    setSaveFileError(null);
+  }, []);
+
   const requestReadFile = useCallback(
-    (filePath: string, options?: { openFullScreen?: boolean }) => {
+    (filePath: string, options?: { openFullScreen?: boolean; forceReload?: boolean }) => {
+      if (!options?.forceReload && openFilesRef.current.some((f) => f.path === filePath)) {
+        setActiveFilePath(filePath);
+        if (options?.openFullScreen) {
+          setEditorFullScreen(true);
+        }
+        return;
+      }
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const reqId = `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1119,7 +1165,8 @@ export function SshTerminalView({
     setLoadingDirs({});
     setTruncatedDirs({});
     pendingDirReqRef.current.clear();
-    setPreviewFile(null);
+    setOpenFiles([]);
+    setActiveFilePath(null);
     setEditorFullScreen(false);
     setSavingFile(false);
     setSaveFileError(null);
@@ -1294,7 +1341,7 @@ export function SshTerminalView({
         setFileLoading(false);
         setSaveFileError(null);
         setLastSavedAt(null);
-        setPreviewFile(preview);
+        upsertOpenFile(preview, true);
         if (openFullScreenOnLoadRef.current) {
           openFullScreenOnLoadRef.current = false;
           setEditorFullScreen(true);
@@ -1331,19 +1378,20 @@ export function SshTerminalView({
           const savedSize = Number(msg.size ?? new Blob([asyncPending.content]).size);
           setLastSavedAt(Number(msg.savedAt || Date.now()));
           const fileName = savedPath.split('/').pop() || 'file';
-          setPreviewFile((prev) => {
-            if (prev && prev.path === savedPath) {
-              return {
-                path: savedPath,
-                name: fileName,
-                content: asyncPending.content,
-                size: savedSize,
-                truncated: false,
-                isBinary: false,
-              };
-            }
-            return prev;
-          });
+          setOpenFiles((prev) =>
+            prev.map((f) =>
+              f.path === savedPath
+                ? {
+                    path: savedPath,
+                    name: fileName,
+                    content: asyncPending.content,
+                    size: savedSize,
+                    truncated: false,
+                    isBinary: false,
+                  }
+                : f
+            )
+          );
           const parentDir = savedPath ? getParentPosixPath(savedPath) : '';
           if (
             parentDir &&
@@ -1369,19 +1417,25 @@ export function SshTerminalView({
         setLastSavedAt(Number(msg.savedAt || Date.now()));
 
         const fileName = savedPath.split('/').pop() || 'file';
-        setPreviewFile((prev) => {
-          if (pending?.isNewFile || !prev || prev.path === savedPath) {
-            return {
-              path: savedPath,
-              name: fileName,
-              content: savedContent,
-              size: savedSize,
-              truncated: false,
-              isBinary: false,
-            };
+        const updatedPreview: RemoteFilePreview = {
+          path: savedPath,
+          name: fileName,
+          content: savedContent,
+          size: savedSize,
+          truncated: false,
+          isBinary: false,
+        };
+        if (savedPath) {
+          if (pending?.isNewFile || openFilesRef.current.length === 0) {
+            upsertOpenFile(updatedPreview, true);
+          } else {
+            setOpenFiles((prev) =>
+              prev.some((f) => f.path === savedPath)
+                ? prev.map((f) => (f.path === savedPath ? updatedPreview : f))
+                : prev
+            );
           }
-          return prev;
-        });
+        }
 
         const parentDir = savedPath ? getParentPosixPath(savedPath) : currentRemotePathRef.current;
         if (parentDir) {
@@ -1525,7 +1579,8 @@ export function SshTerminalView({
           setDirBrowserOpen(false);
           setOpenDirPromptOpen(false);
           setEditorFullScreen(false);
-          setPreviewFile(null);
+          setOpenFiles([]);
+          setActiveFilePath(null);
           setGitStatus(null);
           setGitError(null);
           if (msg.message) {
@@ -1553,7 +1608,8 @@ export function SshTerminalView({
         setOpenDirPromptOpen(false);
         setDirBrowserOpen(false);
         setEditorFullScreen(false);
-        setPreviewFile(null);
+        setOpenFiles([]);
+        setActiveFilePath(null);
         setGitStatus(null);
         setGitError(null);
       }
@@ -2649,6 +2705,7 @@ export function SshTerminalView({
                 {previewFile || editorFullScreen ? (
                   <RemoteCodeEditor
                     file={previewFile}
+                    openFiles={openFiles}
                     fullScreen={editorFullScreen}
                     saving={savingFile}
                     saveError={saveFileError}
@@ -2663,14 +2720,16 @@ export function SshTerminalView({
                     onToggleFullScreen={setEditorFullScreen}
                     onCloseFile={() => {
                       setEditorFullScreen(false);
-                      setPreviewFile(null);
+                      setActiveFilePath(null);
                       setSaveFileError(null);
                     }}
+                    onSelectTab={(targetPath) => setActiveFilePath(targetPath)}
+                    onCloseTab={closeOpenFileTab}
                     onSaveFile={(filePath, nextContent) => requestWriteFile(filePath, nextContent)}
                     onSaveAsFile={(targetPath, nextContent) =>
                       requestWriteFile(targetPath, nextContent, true)
                     }
-                    onReloadFile={(filePath) => requestReadFile(filePath)}
+                    onReloadFile={(filePath) => requestReadFile(filePath, { forceReload: true })}
                     onToggleDir={handleToggleTreeDir}
                     onNavigateRootDir={(dirPath) =>
                       requestListDir(dirPath, { mode: 'root', keepPreview: true })
@@ -2694,7 +2753,40 @@ export function SshTerminalView({
                     onSaveToNote={handleSaveRemoteFileToNote}
                   />
                 ) : (
-                  <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
+                  <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    {openFiles.length > 0 && (
+                      <div
+                        role="tablist"
+                        aria-label="Open files"
+                        className="shrink-0 h-8 border-b border-white/[0.08] bg-[#111116] flex items-stretch overflow-x-auto"
+                      >
+                        {openFiles.map((tab) => (
+                          <div
+                            key={tab.path}
+                            role="tab"
+                            aria-selected={false}
+                            onClick={() => setActiveFilePath(tab.path)}
+                            title={tab.path}
+                            className="shrink-0 max-w-[160px] flex items-center gap-1 pl-2 pr-1 border-r border-white/[0.06] bg-[#14141a] text-neutral-300 hover:text-white hover:bg-[#191922] cursor-pointer select-none"
+                          >
+                            <span className="font-mono-code text-[11px] truncate">{tab.name}</span>
+                            <button
+                              type="button"
+                              aria-label={`Close ${tab.name}`}
+                              title={`Close ${tab.name}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                closeOpenFileTab(tab.path);
+                              }}
+                              className="p-0.5 rounded text-neutral-500 hover:text-white hover:bg-white/15 cursor-pointer shrink-0"
+                            >
+                              <X className="w-2.5 h-2.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5">
                     {fileLoading && (
                       <div className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-neutral-400">
                         <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
@@ -2730,6 +2822,7 @@ export function SshTerminalView({
                       onCancelNewFile={() => setCreatingInDir(null)}
                       showFileSize
                     />
+                    </div>
                   </div>
                 )}
               </aside>

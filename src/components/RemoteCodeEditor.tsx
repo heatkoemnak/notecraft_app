@@ -62,14 +62,29 @@ import {
 import { CodeAgentPanel, StagedDiffPayload } from './CodeAgentPanel';
 import { GitSourceControlPanel } from './GitSourceControlPanel';
 import {
+  DraggedRemoteEntry,
   getFileIconColorClass,
   ProjectTreeView,
+  REMOTE_ENTRY_DRAG_MIME,
   RemoteDirEntry,
   RemoteFilePreview,
 } from './ProjectTreeView';
 import { RemotePathInput } from './RemotePathInput';
 
 export type { RemoteDirEntry, RemoteFilePreview };
+
+interface TabPreservedState {
+  draft: string;
+  savedContent: string;
+  history: {
+    stack: HistorySnapshot[];
+    index: number;
+    lastInputAt: number;
+  };
+  cursorPos: { line: number; col: number };
+  selectionRange: { start: number; end: number };
+  scrollTop: number;
+}
 
 interface HistorySnapshot {
   value: string;
@@ -79,6 +94,7 @@ interface HistorySnapshot {
 
 interface RemoteCodeEditorProps {
   file: RemoteFilePreview | null;
+  openFiles: RemoteFilePreview[];
   fullScreen: boolean;
   saving: boolean;
   saveError: string | null;
@@ -92,6 +108,8 @@ interface RemoteCodeEditorProps {
   truncatedDirs: Record<string, boolean>;
   onToggleFullScreen: (next: boolean) => void;
   onCloseFile: () => void;
+  onSelectTab: (path: string) => void;
+  onCloseTab: (path: string) => void;
   onSaveFile: (path: string, nextContent: string) => void;
   onSaveAsFile: (targetPath: string, nextContent: string) => void;
   onReloadFile: (path: string) => void;
@@ -167,6 +185,7 @@ function detectLanguageLabel(filename: string): string {
 
 export function RemoteCodeEditor({
   file,
+  openFiles,
   fullScreen,
   saving,
   saveError,
@@ -180,6 +199,8 @@ export function RemoteCodeEditor({
   truncatedDirs,
   onToggleFullScreen,
   onCloseFile,
+  onSelectTab,
+  onCloseTab,
   onSaveFile,
   onSaveAsFile,
   onReloadFile,
@@ -264,6 +285,7 @@ export function RemoteCodeEditor({
   const [pendingAction, setPendingAction] = useState<
     | { type: 'switch-file'; path: string }
     | { type: 'close-file' }
+    | { type: 'close-tab'; path: string }
     | { type: 'exit-fullscreen' }
     | null
   >(null);
@@ -297,6 +319,16 @@ export function RemoteCodeEditor({
   const saveAsInputRef = useRef<HTMLInputElement>(null);
   const trackedChangesRef = useRef<TrackedFileChange[]>(trackedChanges);
   trackedChangesRef.current = trackedChanges;
+  const tabStatesRef = useRef<Record<string, TabPreservedState>>({});
+  const prevActiveFileRef = useRef<{ path: string; draft: string; content: string } | null>(null);
+  const activeDraftRef = useRef(draft);
+  activeDraftRef.current = draft;
+  const activeCursorRef = useRef(cursorPos);
+  activeCursorRef.current = cursorPos;
+  const activeSelectionRef = useRef(selectionRange);
+  activeSelectionRef.current = selectionRange;
+  const activeScrollTopRef = useRef(editorScrollTop);
+  activeScrollTopRef.current = editorScrollTop;
 
   const showNotice = useCallback((msg: string) => {
     setActionNotice(msg);
@@ -315,13 +347,47 @@ export function RemoteCodeEditor({
     setExplorerOpen(true);
   }, [requestedSidebarTab]);
 
-  // Reset draft & history when switching files or reloading from server, preserving tracked multi-file hunks
+  // Prune closed tabs from preserved per-tab state
   useEffect(() => {
-    const initial = file?.content ?? '';
-    setDraft(initial);
+    const openSet = new Set(openFiles.map((f) => f.path));
+    for (const cachedPath of Object.keys(tabStatesRef.current)) {
+      if (!openSet.has(cachedPath)) {
+        delete tabStatesRef.current[cachedPath];
+      }
+    }
+  }, [openFiles]);
+
+  // Switch or reload file while preserving unsaved drafts & undo history per open tab
+  useEffect(() => {
+    const prev = prevActiveFileRef.current;
+    if (prev && prev.path !== file?.path && openFiles.some((f) => f.path === prev.path)) {
+      tabStatesRef.current[prev.path] = {
+        draft: activeDraftRef.current,
+        savedContent: prev.content,
+        history: {
+          stack: [...historyRef.current.stack],
+          index: historyRef.current.index,
+          lastInputAt: historyRef.current.lastInputAt,
+        },
+        cursorPos: { ...activeCursorRef.current },
+        selectionRange: { ...activeSelectionRef.current },
+        scrollTop: activeScrollTopRef.current,
+      };
+    }
+
+    const nextPath = file?.path ?? null;
+    const nextContent = file?.content ?? '';
+    const existingTabState = nextPath ? tabStatesRef.current[nextPath] : undefined;
+    const sameFileSaved =
+      prev &&
+      nextPath === prev.path &&
+      activeDraftRef.current === nextContent;
+
     setPendingAction(null);
     setPreviewingNewFile(null);
     setGitDiffView(null);
+    setSaveAsOpen(false);
+    setSaveAsPath(nextPath ?? '');
 
     const matchingTracked = file
       ? trackedChangesRef.current.find(
@@ -330,29 +396,92 @@ export function RemoteCodeEditor({
       : undefined;
     setPendingHunks(matchingTracked ? matchingTracked.hunks : []);
 
-    setSaveAsOpen(false);
-    setSaveAsPath(file?.path ?? '');
-    setCursorPos({ line: 1, col: 1 });
-    setSelectionRange({ start: 0, end: 0 });
-    setEditorScrollTop(0);
-    historyRef.current = {
-      stack: [{ value: initial, selectionStart: 0, selectionEnd: 0 }],
-      index: 0,
-      lastInputAt: 0,
-    };
-    setHistoryMeta({ canUndo: false, canRedo: false });
+    if (nextPath && sameFileSaved) {
+      // File just saved: keep current draft/cursor/undo history and update saved baseline
+      tabStatesRef.current[nextPath] = {
+        draft: activeDraftRef.current,
+        savedContent: nextContent,
+        history: {
+          stack: [...historyRef.current.stack],
+          index: historyRef.current.index,
+          lastInputAt: historyRef.current.lastInputAt,
+        },
+        cursorPos: { ...activeCursorRef.current },
+        selectionRange: { ...activeSelectionRef.current },
+        scrollTop: activeScrollTopRef.current,
+      };
+      prevActiveFileRef.current = file
+        ? { path: file.path, draft: activeDraftRef.current, content: file.content }
+        : null;
+      return;
+    }
 
-    if (textareaRef.current) {
-      textareaRef.current.scrollTop = 0;
-      textareaRef.current.scrollLeft = 0;
+    if (nextPath && existingTabState && existingTabState.savedContent === nextContent) {
+      setDraft(existingTabState.draft);
+      setCursorPos(existingTabState.cursorPos);
+      setSelectionRange(existingTabState.selectionRange);
+      setEditorScrollTop(existingTabState.scrollTop);
+      historyRef.current = {
+        stack: [...existingTabState.history.stack],
+        index: existingTabState.history.index,
+        lastInputAt: existingTabState.history.lastInputAt,
+      };
+      setHistoryMeta({
+        canUndo: existingTabState.history.index > 0,
+        canRedo: existingTabState.history.index < existingTabState.history.stack.length - 1,
+      });
+      window.requestAnimationFrame(() => {
+        if (textareaRef.current) {
+          textareaRef.current.scrollTop = existingTabState.scrollTop;
+        }
+        if (preRef.current) {
+          preRef.current.scrollTop = existingTabState.scrollTop;
+        }
+        if (gutterRef.current) {
+          gutterRef.current.scrollTop = existingTabState.scrollTop;
+        }
+      });
+    } else {
+      setDraft(nextContent);
+      setCursorPos({ line: 1, col: 1 });
+      setSelectionRange({ start: 0, end: 0 });
+      setEditorScrollTop(0);
+      historyRef.current = {
+        stack: [{ value: nextContent, selectionStart: 0, selectionEnd: 0 }],
+        index: 0,
+        lastInputAt: 0,
+      };
+      setHistoryMeta({ canUndo: false, canRedo: false });
+      if (nextPath) {
+        tabStatesRef.current[nextPath] = {
+          draft: nextContent,
+          savedContent: nextContent,
+          history: {
+            stack: [{ value: nextContent, selectionStart: 0, selectionEnd: 0 }],
+            index: 0,
+            lastInputAt: 0,
+          },
+          cursorPos: { line: 1, col: 1 },
+          selectionRange: { start: 0, end: 0 },
+          scrollTop: 0,
+        };
+      }
+      if (textareaRef.current) {
+        textareaRef.current.scrollTop = 0;
+        textareaRef.current.scrollLeft = 0;
+      }
+      if (preRef.current) {
+        preRef.current.scrollTop = 0;
+        preRef.current.scrollLeft = 0;
+      }
+      if (gutterRef.current) {
+        gutterRef.current.scrollTop = 0;
+      }
     }
-    if (preRef.current) {
-      preRef.current.scrollTop = 0;
-      preRef.current.scrollLeft = 0;
-    }
-    if (gutterRef.current) {
-      gutterRef.current.scrollTop = 0;
-    }
+
+    prevActiveFileRef.current = file
+      ? { path: file.path, draft: existingTabState?.draft ?? nextContent, content: file.content }
+      : null;
   }, [file?.path, file?.content]);
 
   useEffect(() => {
@@ -1546,6 +1675,19 @@ export function RemoteCodeEditor({
     onCreateNewFile(full);
   };
 
+  const isPathDirty = useCallback(
+    (targetPath: string): boolean => {
+      const target = openFiles.find((f) => f.path === targetPath);
+      if (!target || target.isBinary || target.truncated) return false;
+      if (file && file.path === targetPath) {
+        return draft !== target.content;
+      }
+      const preserved = tabStatesRef.current[targetPath];
+      return Boolean(preserved && preserved.draft !== target.content);
+    },
+    [openFiles, file, draft]
+  );
+
   const handleAttemptCloseFile = () => {
     if (isDirty) {
       setPendingAction({ type: 'close-file' });
@@ -1556,11 +1698,23 @@ export function RemoteCodeEditor({
 
   const handleAttemptSelectFile = (targetPath: string) => {
     if (file && targetPath === file.path) return;
-    if (isDirty) {
-      setPendingAction({ type: 'switch-file', path: targetPath });
+    if (openFiles.some((f) => f.path === targetPath)) {
+      onSelectTab(targetPath);
     } else {
       onOpenFile(targetPath);
     }
+  };
+
+  const handleAttemptCloseTab = (targetPath: string) => {
+    if (isPathDirty(targetPath)) {
+      if (!file || file.path !== targetPath) {
+        onSelectTab(targetPath);
+      }
+      setPendingAction({ type: 'close-tab', path: targetPath });
+      return;
+    }
+    delete tabStatesRef.current[targetPath];
+    onCloseTab(targetPath);
   };
 
   const handleResolvePending = (decision: 'save' | 'discard' | 'cancel') => {
@@ -1576,6 +1730,9 @@ export function RemoteCodeEditor({
       onOpenFile(act.path);
     } else if (act.type === 'close-file') {
       onCloseFile();
+    } else if (act.type === 'close-tab') {
+      delete tabStatesRef.current[act.path];
+      onCloseTab(act.path);
     } else if (act.type === 'exit-fullscreen') {
       onToggleFullScreen(false);
     }
@@ -1634,6 +1791,86 @@ export function RemoteCodeEditor({
     },
     [onRunGit, gitStatus?.repoRoot, currentRemotePath, showNotice]
   );
+
+  const renderTabBar = () => {
+    if (openFiles.length === 0) return null;
+    return (
+      <div
+        role="tablist"
+        aria-label="Open remote files"
+        className="shrink-0 h-9 border-b border-white/[0.08] bg-[#111116] flex items-stretch overflow-x-auto"
+      >
+        {openFiles.map((tab) => {
+          const isActiveTab = Boolean(file && file.path === tab.path && !gitDiffView && !previewingNewFile);
+          const tabDirty = isPathDirty(tab.path);
+          return (
+            <div
+              key={tab.path}
+              role="tab"
+              aria-selected={isActiveTab}
+              draggable
+              onDragStart={(e) => {
+                e.stopPropagation();
+                const payload: DraggedRemoteEntry = {
+                  path: tab.path,
+                  name: tab.name,
+                  isDirectory: false,
+                  size: tab.size,
+                };
+                e.dataTransfer.setData(REMOTE_ENTRY_DRAG_MIME, JSON.stringify(payload));
+                e.dataTransfer.setData('text/plain', tab.path);
+                e.dataTransfer.effectAllowed = 'copy';
+              }}
+              onMouseDown={(e) => {
+                if (e.button === 1) {
+                  e.preventDefault();
+                  handleAttemptCloseTab(tab.path);
+                }
+              }}
+              onClick={() => {
+                setGitDiffView(null);
+                setPreviewingNewFile(null);
+                if (!file || file.path !== tab.path) {
+                  onSelectTab(tab.path);
+                }
+              }}
+              title={`${tab.path} (drag to AI Agent or click × to close)`}
+              className={`group shrink-0 max-w-[200px] flex items-center gap-1.5 pl-2.5 pr-1.5 border-r select-none cursor-pointer transition-colors ${
+                isActiveTab
+                  ? 'bg-[#0c0c10] text-white border-t-2 border-t-blue-500 border-r-white/[0.08]'
+                  : 'bg-[#14141a] text-neutral-400 hover:text-neutral-200 hover:bg-[#191922] border-t-2 border-t-transparent border-r-white/[0.06]'
+              }`}
+            >
+              <FileText className={`w-3.5 h-3.5 shrink-0 ${getFileIconColorClass(tab.name)}`} />
+              <span className="font-mono-code text-[11.5px] truncate">{tab.name}</span>
+              {tabDirty && (
+                <span
+                  title="Unsaved changes"
+                  className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
+                />
+              )}
+              <button
+                type="button"
+                aria-label={`Close ${tab.name}`}
+                title={`Close ${tab.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleAttemptCloseTab(tab.path);
+                }}
+                className={`p-0.5 rounded transition-colors cursor-pointer shrink-0 ${
+                  isActiveTab
+                    ? 'text-neutral-400 hover:text-white hover:bg-white/15'
+                    : 'text-neutral-500 hover:text-white hover:bg-white/15'
+                }`}
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   const renderCodeArea = (isFull: boolean) => {
     if (gitDiffView) {
@@ -2530,6 +2767,7 @@ export function RemoteCodeEditor({
           </div>
         </div>
 
+        {renderTabBar()}
         {renderCodeArea(false)}
       </div>
     );
@@ -2638,7 +2876,28 @@ export function RemoteCodeEditor({
           <button
             type="button"
             onClick={() => setAiAgentOpen((p) => !p)}
-            title={aiAgentOpen ? 'Hide AI Code Agent' : 'Open AI Code Agent'}
+            onDragEnter={(e) => {
+              const types = Array.from(e.dataTransfer?.types || []);
+              if (
+                !aiAgentOpen &&
+                (types.includes(REMOTE_ENTRY_DRAG_MIME) ||
+                  types.includes('Files') ||
+                  types.includes('text/plain'))
+              ) {
+                setAiAgentOpen(true);
+              }
+            }}
+            onDragOver={(e) => {
+              const types = Array.from(e.dataTransfer?.types || []);
+              if (
+                types.includes(REMOTE_ENTRY_DRAG_MIME) ||
+                types.includes('Files') ||
+                types.includes('text/plain')
+              ) {
+                e.preventDefault();
+              }
+            }}
+            title={aiAgentOpen ? 'Hide AI Code Agent' : 'Open AI Code Agent (or drag a file here)'}
             className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
               aiAgentOpen
                 ? 'border-blue-500/50 bg-blue-500/20 text-blue-200'
@@ -2908,7 +3167,10 @@ export function RemoteCodeEditor({
           </>
         )}
 
-        {renderCodeArea(true)}
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
+          {renderTabBar()}
+          {renderCodeArea(true)}
+        </div>
 
         {aiAgentOpen && (
           <>

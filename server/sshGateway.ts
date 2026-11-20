@@ -242,6 +242,11 @@ export function attachSshWebSocketServer(
       }
     };
 
+    const normalizePosixClean = (p: string): string => {
+      const n = path.posix.normalize(p || '/');
+      return n.length > 1 && n.endsWith('/') ? n.slice(0, -1) : n;
+    };
+
     const getFileClient = async (): Promise<SshClient> => {
       if (!sshClient) {
         throw new Error('SSH is not connected.');
@@ -256,21 +261,46 @@ export function attachSshWebSocketServer(
         return fileClientPromise;
       }
 
+      const mainClientRef = sshClient;
+      const cfg = { ...activeConnectConfig, readyTimeout: 12000 };
+      const authMode = activeAuthType;
+      const pass = activePassword;
+
       fileClientPromise = new Promise<SshClient>((resolve) => {
+        let settled = false;
+        let fc: SshClient | null = null;
+        const finishFallback = () => {
+          if (settled) return;
+          settled = true;
+          fileClientPromise = null;
+          if (fc) {
+            try {
+              fc.removeAllListeners();
+              fc.end();
+            } catch {
+              // ignore
+            }
+          }
+          resolve(sshClient || mainClientRef);
+        };
+
         try {
-          const fc = new SshClient();
-          let settled = false;
+          fc = new SshClient();
 
           fc.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
-            if (activeAuthType === 'password' && prompts.length > 0) {
-              finish(prompts.map(() => activePassword));
+            if (authMode === 'password' && prompts.length > 0) {
+              finish(prompts.map(() => pass));
             } else {
               finish([]);
             }
           });
 
           fc.on('ready', () => {
-            if (settled) return;
+            if (settled || !fc) return;
+            if (sshClient !== mainClientRef) {
+              finishFallback();
+              return;
+            }
             settled = true;
             fileClient = fc;
             fileClientPromise = null;
@@ -283,19 +313,11 @@ export function attachSshWebSocketServer(
             resolve(fc);
           });
 
-          fc.on('error', () => {
-            if (!settled) {
-              settled = true;
-              fileClientPromise = null;
-              // If secondary connection is refused, fall back to main sshClient
-              resolve(sshClient || fc);
-            }
-          });
-
-          fc.connect({ ...activeConnectConfig, readyTimeout: 10000 });
+          fc.on('error', finishFallback);
+          fc.on('close', finishFallback);
+          fc.connect(cfg);
         } catch {
-          fileClientPromise = null;
-          resolve(sshClient);
+          finishFallback();
         }
       });
 
@@ -340,33 +362,121 @@ export function attachSshWebSocketServer(
         const trimmed = (rawPath || '').trim();
         if (!trimmed || trimmed === '~') {
           sftp.realpath('.', (err, absPath) => {
-            if (!err && absPath) resolve(absPath);
+            if (!err && absPath) resolve(normalizePosixClean(absPath));
             else resolve('/');
           });
           return;
         }
         if (trimmed.startsWith('~/')) {
           sftp.realpath('.', (homeErr, homePath) => {
-            const home = (!homeErr && homePath) ? homePath : '/';
+            const home = !homeErr && homePath ? normalizePosixClean(homePath) : '/';
             const joined = path.posix.join(home, trimmed.slice(2));
             sftp.realpath(joined, (err, absPath) => {
-              if (!err && absPath) resolve(absPath);
-              else resolve(joined);
+              if (!err && absPath) resolve(normalizePosixClean(absPath));
+              else resolve(normalizePosixClean(joined));
             });
           });
           return;
         }
         if (trimmed.startsWith('/')) {
-          const norm = path.posix.normalize(trimmed);
+          const norm = normalizePosixClean(trimmed);
           sftp.realpath(norm, (err, absPath) => {
-            if (!err && absPath) resolve(absPath);
+            if (!err && absPath) resolve(normalizePosixClean(absPath));
             else resolve(norm);
           });
           return;
         }
         sftp.realpath(trimmed, (err, absPath) => {
-          if (!err && absPath) resolve(absPath);
-          else resolve(path.posix.normalize(trimmed));
+          if (!err && absPath) resolve(normalizePosixClean(absPath));
+          else resolve(normalizePosixClean(trimmed));
+        });
+      });
+
+    const execViaShellChannel = (
+      client: SshClient,
+      cmd: string,
+      timeoutMs = 25000
+    ): Promise<{ stdout: string; stderr: string; code: number }> =>
+      new Promise((resolve, reject) => {
+        client.shell({ term: 'dumb', cols: 220, rows: 40 }, (err, stream) => {
+          if (err || !stream) {
+            reject(err || new Error('Failed to open shell channel.'));
+            return;
+          }
+          const marker = `__NC_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const startTag = `${marker}_START`;
+          const endTag = `${marker}_END:`;
+          let rawOutput = '';
+          let settled = false;
+          const MAX_OUTPUT = 2 * 1024 * 1024;
+
+          const finishWithOutput = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try {
+              stream.close();
+            } catch {
+              // ignore
+            }
+            const startIdx = rawOutput.indexOf(startTag);
+            const afterStart =
+              startIdx === -1 ? rawOutput : rawOutput.slice(startIdx + startTag.length);
+            const endIdx = afterStart.lastIndexOf(endTag);
+            if (endIdx === -1) {
+              resolve({ stdout: afterStart.trim(), stderr: '', code: 0 });
+              return;
+            }
+            const body = afterStart.slice(0, endIdx).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+            const exitLine = afterStart.slice(endIdx + endTag.length).trim().split(/\s+/)[0] || '0';
+            const code = Number.parseInt(exitLine, 10);
+            resolve({
+              stdout: body.replace(/\r\n/g, '\n'),
+              stderr: '',
+              code: Number.isFinite(code) ? code : 0,
+            });
+          };
+
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try {
+              stream.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error('Remote command timed out.'));
+          }, timeoutMs);
+
+          stream.on('data', (chunk: Buffer) => {
+            if (rawOutput.length < MAX_OUTPUT) {
+              rawOutput += chunk.toString('utf8');
+            }
+            const sIdx = rawOutput.indexOf(startTag);
+            if (sIdx !== -1) {
+              const eIdx = rawOutput.indexOf(endTag, sIdx + startTag.length);
+              if (eIdx !== -1 && rawOutput.indexOf('\n', eIdx) !== -1) {
+                finishWithOutput();
+              }
+            }
+          });
+          stream.on('close', finishWithOutput);
+          stream.on('error', (streamErr: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(streamErr);
+          });
+
+          const cmdB64 = Buffer.from(cmd, 'utf8').toString('base64');
+          const wrapped = [
+            `stty -echo 2>/dev/null || true`,
+            `printf '\\n%s\\n' ${quoteShellArg(startTag)}`,
+            `eval "$(printf '%s' ${quoteShellArg(cmdB64)} | base64 -d 2>/dev/null || printf '%s' ${quoteShellArg(cmdB64)} | python3 -c 'import sys,base64;sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())')"`,
+            `printf '\\n%s%d\\n' ${quoteShellArg(endTag)} $?`,
+            `exit`,
+          ].join('\n');
+          stream.write(`${wrapped}\n`);
         });
       });
 
@@ -377,7 +487,7 @@ export function attachSshWebSocketServer(
       const execute = async () => {
         const client = await getFileClient();
         return new Promise<{ stdout: string; stderr: string; code: number }>((resolve, reject) => {
-          let retried = false;
+          let retryCount = 0;
 
           const attempt = () => {
             if (!sshClient) {
@@ -386,9 +496,25 @@ export function attachSshWebSocketServer(
             }
             client.exec(cmd, (err, stream) => {
               if (err) {
-                if (!retried && err.message?.includes('Channel open failure')) {
-                  retried = true;
-                  setTimeout(attempt, 300);
+                const isChanFailure = Boolean(err.message?.includes('Channel open failure'));
+                if (isChanFailure && retryCount === 0) {
+                  retryCount += 1;
+                  // If an open SFTP session is occupying MaxSessions=1 on fileClient, close it and retry exec
+                  if (sftpSession) {
+                    try {
+                      sftpSession.end();
+                    } catch {
+                      // ignore
+                    }
+                    sftpSession = null;
+                    sftpFailedPermanently = true;
+                  }
+                  setTimeout(attempt, 200);
+                  return;
+                }
+                if (isChanFailure && client !== sshClient) {
+                  // Server may restrict 'exec' channels on fileClient while allowing 'shell' channels
+                  execViaShellChannel(client, cmd, timeoutMs).then(resolve).catch(() => reject(err));
                   return;
                 }
                 reject(err);
@@ -449,72 +575,120 @@ export function attachSshWebSocketServer(
       if (!trimmed || trimmed === '~') {
         const res = await execOnSsh(`sh -c 'cd ~ 2>/dev/null && pwd || echo "/"'`, 8000);
         const out = res.stdout.trim().split('\n')[0];
-        return out || '/';
+        return out ? normalizePosixClean(out) : '/';
       }
       if (trimmed.startsWith('/') && !trimmed.includes('..') && !trimmed.includes('~')) {
-        return path.posix.normalize(trimmed);
+        return normalizePosixClean(trimmed);
       }
       if (trimmed.startsWith('~/')) {
         const homeRes = await execOnSsh(`sh -c 'cd ~ 2>/dev/null && pwd || echo "/"'`, 8000);
         const home = homeRes.stdout.trim().split('\n')[0] || '/';
-        return path.posix.join(home, trimmed.slice(2));
+        return normalizePosixClean(path.posix.join(home, trimmed.slice(2)));
       }
       const qPath = quoteShellArg(trimmed);
       const res = await execOnSsh(`sh -c 'cd ${qPath} 2>/dev/null && pwd || echo ${qPath}'`, 8000);
       const out = res.stdout.trim().split('\n')[0];
-      return out || path.posix.normalize(trimmed);
+      return normalizePosixClean(out || trimmed);
     };
 
-    const listDirShell = async (resolvedPath: string) => {
-      // 1. Try python3 first if available
-      try {
-        const pathB64 = Buffer.from(resolvedPath, 'utf8').toString('base64');
-        const pyScript = [
-          `import os, json, stat, base64`,
-          `p = base64.b64decode('${pathB64}').decode('utf-8')`,
-          `entries = []`,
-          `for name in os.listdir(p):`,
-          `    if name == '.' or name == '..': continue`,
-          `    fp = os.path.join(p, name)`,
-          `    try:`,
-          `        st = os.lstat(fp)`,
-          `        is_sym = stat.S_ISLNK(st.st_mode)`,
-          `        is_dir = stat.S_ISDIR(st.st_mode)`,
-          `        if is_sym:`,
-          `            try: is_dir = os.path.isdir(fp)`,
-          `            except: pass`,
-          `        entries.append({'name': name, 'path': fp, 'isDirectory': is_dir, 'size': st.st_size if not is_dir else 0, 'modifiedAt': int(st.st_mtime * 1000)})`,
-          `    except: pass`,
-          `entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))`,
-          `print(json.dumps(entries[:300]))`
-        ].join('\n');
-        const res = await execOnSsh(`python3 -c ${quoteShellArg(pyScript)}`, 12000);
-        if (res.code === 0 && res.stdout.trim().startsWith('[')) {
-          return JSON.parse(res.stdout.trim()) as Array<{
+    const resolveAndListDirShell = async (rawPath?: string) => {
+      const rawTrimmed = (rawPath || '').trim() || '~';
+      const pathB64 = Buffer.from(rawTrimmed, 'utf8').toString('base64');
+      const pyScript = [
+        `import os, json, stat, base64`,
+        `raw = base64.b64decode('${pathB64}').decode('utf-8').strip()`,
+        `p = os.path.abspath(os.path.expanduser(raw or '~'))`,
+        `try:`,
+        `    if not os.path.exists(p):`,
+        `        print(json.dumps({'error': f'Directory not found: {p}'}))`,
+        `    elif not os.path.isdir(p):`,
+        `        print(json.dumps({'error': f'Not a directory: {p}'}))`,
+        `    else:`,
+        `        entries = []`,
+        `        names = os.listdir(p)`,
+        `        for name in names:`,
+        `            if name == '.' or name == '..': continue`,
+        `            fp = os.path.join(p, name)`,
+        `            try:`,
+        `                st = os.lstat(fp)`,
+        `                is_sym = stat.S_ISLNK(st.st_mode)`,
+        `                is_dir = stat.S_ISDIR(st.st_mode)`,
+        `                if is_sym:`,
+        `                    try: is_dir = os.path.isdir(fp)`,
+        `                    except: pass`,
+        `                entries.append({'name': name, 'path': fp, 'isDirectory': is_dir, 'size': st.st_size if not is_dir else 0, 'modifiedAt': int(st.st_mtime * 1000)})`,
+        `            except: pass`,
+        `        entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))`,
+        `        print(json.dumps({'path': p, 'entries': entries[:300], 'truncated': len(entries) > 300}))`,
+        `except Exception as e:`,
+        `    print(json.dumps({'error': str(e)}))`,
+      ].join('\n');
+
+      let posixTargetExpr: string;
+      if (rawTrimmed === '~') {
+        posixTargetExpr = `"$HOME"`;
+      } else if (rawTrimmed.startsWith('~/')) {
+        posixTargetExpr = `"$HOME/${rawTrimmed.slice(2).replace(/(["\\$`])/g, '\\$1')}"`;
+      } else {
+        posixTargetExpr = quoteShellArg(rawTrimmed);
+      }
+
+      const combinedScript = [
+        `if command -v python3 >/dev/null 2>&1; then`,
+        `  python3 -c ${quoteShellArg(pyScript)}`,
+        `else`,
+        `  cd ${posixTargetExpr} || exit 1`,
+        `  PWD_VAL=$(pwd)`,
+        `  printf '__NC_PWD__:%s\\n' "$PWD_VAL"`,
+        `  ls -1ap`,
+        `fi`,
+      ].join('\n');
+
+      const res = await execOnSsh(`sh -c ${quoteShellArg(combinedScript)}`, 15000);
+      const out = res.stdout.trim();
+
+      if (out.startsWith('{')) {
+        const parsed = JSON.parse(out) as {
+          error?: string;
+          path?: string;
+          entries?: Array<{
             name: string;
             path: string;
             isDirectory: boolean;
             size: number;
             modifiedAt: number | null;
           }>;
+          truncated?: boolean;
+        };
+        if (parsed.error) {
+          throw new Error(parsed.error);
         }
-      } catch {
-        // Fall through to POSIX ls
+        return {
+          path: normalizePosixClean(parsed.path || rawTrimmed),
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+          truncated: Boolean(parsed.truncated),
+        };
       }
 
-      // 2. Pure POSIX shell fallback (works on EVERY Unix/Linux/BusyBox/macOS machine)
-      const qPath = quoteShellArg(resolvedPath);
-      const script = `cd ${qPath} 2>/dev/null || exit 1; ls -1ap`;
-      const res = await execOnSsh(`sh -c ${quoteShellArg(script)}`, 12000);
       if (res.code !== 0) {
-        throw new Error(res.stderr.trim() || `Cannot access directory: ${resolvedPath}`);
+        throw new Error(res.stderr.trim() || `Cannot access directory: ${rawTrimmed}`);
       }
-      const lines = res.stdout
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l && l !== './' && l !== '../');
 
-      const entries = lines.slice(0, 300).map((line) => {
+      const lines = res.stdout.split('\n');
+      let resolvedPath = rawTrimmed;
+      const entryLines: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith('__NC_PWD__:')) {
+          resolvedPath = normalizePosixClean(line.slice('__NC_PWD__:'.length).trim() || rawTrimmed);
+        } else {
+          const clean = line.trim();
+          if (clean && clean !== './' && clean !== '../') {
+            entryLines.push(clean);
+          }
+        }
+      }
+
+      const entries = entryLines.slice(0, 300).map((line) => {
         const isDirectory = line.endsWith('/');
         const name = isDirectory ? line.slice(0, -1) : line;
         return {
@@ -530,7 +704,12 @@ export function attachSshWebSocketServer(
         if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
-      return entries;
+
+      return {
+        path: resolvedPath,
+        entries,
+        truncated: entryLines.length > 300,
+      };
     };
 
     const readFileShell = async (resolvedPath: string) => {
@@ -738,9 +917,10 @@ export function attachSshWebSocketServer(
               truncated = filtered.length > 300;
               resolvedEntries = resolvedEntries.slice(0, 300);
             } catch (sftpErr) {
-              resolvedPath = await resolvePathShell(requestedPath);
-              resolvedEntries = await listDirShell(resolvedPath);
-              truncated = false;
+              const shellRes = await resolveAndListDirShell(requestedPath);
+              resolvedPath = shellRes.path;
+              resolvedEntries = shellRes.entries;
+              truncated = shellRes.truncated;
             }
 
             sendJson(ws, {
@@ -1034,67 +1214,18 @@ export function attachSshWebSocketServer(
             ? (msg.payload as Record<string, unknown>)
             : {};
 
-        const execOnSsh = (
-          cmd: string,
-          timeoutMs = 20000
-        ): Promise<{ stdout: string; stderr: string; code: number }> =>
-          new Promise((resolve, reject) => {
-            if (!sshClient) {
-              reject(new Error('SSH is not connected.'));
-              return;
-            }
-            sshClient.exec(cmd, (err, stream) => {
-              if (err || !stream) {
-                reject(err || new Error('Failed to execute remote git command.'));
-                return;
-              }
-              let stdout = '';
-              let stderr = '';
-              let settled = false;
-              const MAX_OUTPUT = 1024 * 1024;
-              const timer = setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                try {
-                  stream.close();
-                } catch {
-                  // ignore
-                }
-                reject(new Error('Git command timed out.'));
-              }, timeoutMs);
-
-              stream.on('data', (chunk: Buffer) => {
-                if (stdout.length < MAX_OUTPUT) {
-                  stdout += chunk.toString('utf8');
-                }
-              });
-              stream.stderr?.on('data', (chunk: Buffer) => {
-                if (stderr.length < MAX_OUTPUT) {
-                  stderr += chunk.toString('utf8');
-                }
-              });
-              stream.on('close', (code: number | null) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                resolve({ stdout, stderr, code: typeof code === 'number' ? code : 0 });
-              });
-              stream.on('error', (streamErr: Error) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                reject(streamErr);
-              });
-            });
-          });
-
         void (async () => {
           try {
             if (!sshClient) {
               throw new Error('SSH is not connected.');
             }
-            const sftp = await getSftp();
-            const cwd = await resolveSftpPath(sftp, rawCwd || '~');
+            let cwd = '';
+            try {
+              const sftp = await getSftp();
+              cwd = await resolveSftpPath(sftp, rawCwd || '~');
+            } catch {
+              cwd = await resolvePathShell(rawCwd || '~');
+            }
             const qCwd = quoteShellArg(cwd);
 
             if (action === 'status') {
@@ -1605,6 +1736,9 @@ export function attachSshWebSocketServer(
 
         client.on('ready', () => {
           if (sshClient !== client) return;
+          activeConnectConfig = { ...config };
+          activeAuthType = authType;
+          activePassword = password;
           client.shell(
             {
               term: 'xterm-256color',

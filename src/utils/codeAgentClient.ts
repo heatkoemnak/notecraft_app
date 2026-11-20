@@ -130,6 +130,7 @@ export interface CodeAgentChatTurn {
   model?: string;
   provider?: 'gemini' | 'groq';
   fileNameHint?: string;
+  attachedFiles?: Array<{ name: string; path: string }>;
 }
 
 export interface CodeAgentHistorySession {

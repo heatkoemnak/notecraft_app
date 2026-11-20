@@ -28,6 +28,15 @@ export interface RemoteFilePreview {
   isBinary: boolean;
 }
 
+export const REMOTE_ENTRY_DRAG_MIME = 'application/x-notecraft-remote-entry';
+
+export interface DraggedRemoteEntry {
+  path: string;
+  name: string;
+  isDirectory: boolean;
+  size?: number;
+}
+
 export function getFileIconColorClass(filename: string): string {
   const lower = filename.toLowerCase();
   if (lower === 'dockerfile' || lower.startsWith('dockerfile.')) return 'text-sky-400';
@@ -183,6 +192,19 @@ export function ProjectTreeView({
       return (
         <React.Fragment key={entry.path}>
           <div
+            draggable={creatingInDir !== entry.path}
+            onDragStart={(e) => {
+              e.stopPropagation();
+              const payload: DraggedRemoteEntry = {
+                path: entry.path,
+                name: entry.name,
+                isDirectory: entry.isDirectory,
+                size: entry.size,
+              };
+              e.dataTransfer.setData(REMOTE_ENTRY_DRAG_MIME, JSON.stringify(payload));
+              e.dataTransfer.setData('text/plain', entry.path);
+              e.dataTransfer.effectAllowed = 'copy';
+            }}
             style={{ paddingLeft: `${depth * 14 + 6}px` }}
             className={`group relative flex items-center justify-between gap-1 pr-1.5 py-[3px] rounded-[5px] transition-colors ${
               isSelected
