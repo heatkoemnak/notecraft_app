@@ -1931,7 +1931,7 @@ export function RemoteCodeEditor({
     }
 
     // Tab / Shift+Tab Indent
-    if (e.key === 'Tab') {
+    if (!mod && !e.altKey && e.key === 'Tab') {
       e.preventDefault();
       applyEdit(indentLines(draft, start, end, e.shiftKey));
     }
@@ -3503,7 +3503,7 @@ export function RemoteCodeEditor({
             <button
               type="button"
               onClick={() => onToggleFullScreen(true)}
-              title="Open in Full Screen Code Editor"
+              title="Open in Full Screen Code Editor (Alt+Tab)"
               className="p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 cursor-pointer"
             >
               <Maximize2 className="w-3.5 h-3.5" />
@@ -3699,7 +3699,7 @@ export function RemoteCodeEditor({
                 onToggleFullScreen(false);
               }
             }}
-            title="Exit Full Screen Editor (Esc)"
+            title="Exit Full Screen Editor (Alt+Tab / Esc)"
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-white/10 text-[12px] font-medium text-neutral-200 hover:bg-white/10 transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             <Minimize2 className="w-3.5 h-3.5" />
@@ -4023,7 +4023,7 @@ export function RemoteCodeEditor({
           <span>{languageLabel}</span>
         </div>
         <div className="hidden sm:block text-neutral-500">
-          Ctrl+S Save · Ctrl+F Find · Ctrl+H Replace · Ctrl+Shift+L Select All · Ctrl+/ Comment · Shift+Alt+F Format
+          Ctrl+S Save · Ctrl+F Find · Ctrl+Shift+L Select All · Ctrl+/ Comment · Shift+Alt+F Format · Alt+Tab Full Screen
         </div>
       </footer>
     </div>

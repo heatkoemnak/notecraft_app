@@ -61,6 +61,7 @@ async function syncApi(url: string, method: 'POST' | 'PATCH' | 'DELETE', body?: 
 }
 
 const THEME_STORAGE_KEY = 'notecraft.theme.v1';
+const ACTIVE_FILTER_SESSION_KEY = 'notecraft.activeFilter.v1';
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -69,6 +70,31 @@ function readStorage<T>(key: string, fallback: T): T {
     return JSON.parse(raw) as T;
   } catch {
     return fallback;
+  }
+}
+
+function readActiveFilter(): SidebarFilter {
+  if (typeof window === 'undefined') return { type: 'all' };
+  try {
+    const raw = window.sessionStorage.getItem(ACTIVE_FILTER_SESSION_KEY);
+    if (!raw) return { type: 'all' };
+    const parsed = JSON.parse(raw) as Partial<SidebarFilter> | null;
+    if (!parsed || typeof parsed !== 'object') return { type: 'all' };
+    if (
+      parsed.type === 'all' ||
+      parsed.type === 'starred' ||
+      parsed.type === 'snippets' ||
+      parsed.type === 'ssh' ||
+      parsed.type === 'database'
+    ) {
+      return { type: parsed.type };
+    }
+    if (parsed.type === 'folder' && typeof parsed.folderId === 'string' && parsed.folderId) {
+      return { type: 'folder', folderId: parsed.folderId };
+    }
+    return { type: 'all' };
+  } catch {
+    return { type: 'all' };
   }
 }
 
@@ -103,7 +129,15 @@ export default function App() {
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
 
-  const [filter, setFilter] = useState<SidebarFilter>({ type: 'all' });
+  const [filter, setFilter] = useState<SidebarFilter>(readActiveFilter);
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(ACTIVE_FILTER_SESSION_KEY, JSON.stringify(filter));
+    } catch {
+      // ignore storage errors
+    }
+  }, [filter]);
+
   const [viewMode, setViewMode] = useState<ViewMode>('read');
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1024 : true

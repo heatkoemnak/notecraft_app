@@ -80,6 +80,85 @@ interface SshTerminalViewProps {
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
+const SSH_LIVE_SESSION_STORAGE_KEY = 'notecraft.ssh.liveSession.v1';
+
+interface StoredSshLiveSession {
+  sessionId: string;
+  userId: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: SshAuthType;
+  selectedProfileId: string | null;
+  dirBrowserOpen: boolean;
+  currentRemotePath: string;
+  pathInput: string;
+  openFilePaths: string[];
+  activeFilePath: string | null;
+  editorFullScreen: boolean;
+}
+
+function readStoredLiveSession(userId: string): StoredSshLiveSession | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(SSH_LIVE_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredSshLiveSession> | null;
+    if (
+      !parsed ||
+      typeof parsed.sessionId !== 'string' ||
+      !parsed.sessionId ||
+      parsed.userId !== userId ||
+      typeof parsed.host !== 'string' ||
+      !parsed.host ||
+      typeof parsed.username !== 'string' ||
+      !parsed.username
+    ) {
+      return null;
+    }
+    return {
+      sessionId: parsed.sessionId,
+      userId: parsed.userId,
+      host: parsed.host,
+      port: Number(parsed.port || 22) || 22,
+      username: parsed.username,
+      authType: parsed.authType === 'privateKey' ? 'privateKey' : 'password',
+      selectedProfileId:
+        typeof parsed.selectedProfileId === 'string' ? parsed.selectedProfileId : null,
+      dirBrowserOpen: Boolean(parsed.dirBrowserOpen),
+      currentRemotePath:
+        typeof parsed.currentRemotePath === 'string' ? parsed.currentRemotePath : '',
+      pathInput: typeof parsed.pathInput === 'string' ? parsed.pathInput : '',
+      openFilePaths: Array.isArray(parsed.openFilePaths)
+        ? parsed.openFilePaths.filter((p): p is string => typeof p === 'string' && p.length > 0)
+        : [],
+      activeFilePath:
+        typeof parsed.activeFilePath === 'string' ? parsed.activeFilePath : null,
+      editorFullScreen: Boolean(parsed.editorFullScreen),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredLiveSession(session: StoredSshLiveSession) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(SSH_LIVE_SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearStoredLiveSession() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.removeItem(SSH_LIVE_SESSION_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function quotePosixPath(p: string): string {
   return `'${p.replace(/'/g, `'"'"'`)}'`;
 }
@@ -326,6 +405,22 @@ export function SshTerminalView({
   profilesRef.current = profiles;
   const isActiveRef = useRef<boolean>(isActive);
   isActiveRef.current = isActive;
+  const sessionIdRef = useRef<string | null>(null);
+  const currentUserIdRef = useRef<string>(currentUser.id);
+  currentUserIdRef.current = currentUser.id;
+  const storageModeRef = useRef<StorageBackendMode>(storageMode);
+  storageModeRef.current = storageMode;
+  const authTypeRef = useRef<SshAuthType>(authType);
+  authTypeRef.current = authType;
+  const editorFullScreenRef = useRef<boolean>(editorFullScreen);
+  editorFullScreenRef.current = editorFullScreen;
+  const attachWebSocketHandlersRef = useRef<
+    (
+      ws: WebSocket,
+      targetInfo: { host: string; port: number; username: string },
+      restoreUi?: StoredSshLiveSession | null
+    ) => void
+  >(() => {});
   const copySelectionRef = useRef<() => Promise<boolean>>(async () => false);
   const pasteClipboardRef = useRef<() => Promise<void>>(async () => {});
   const requestListDirRef = useRef<
@@ -349,6 +444,40 @@ export function SshTerminalView({
       target: connectedTarget,
     });
   }, [status, connectedTarget, onConnectionStateChange]);
+
+  // Persist active SSH session metadata & workspace state in sessionStorage across tab refreshes
+  useEffect(() => {
+    if (status !== 'connected' || !sessionIdRef.current) return;
+    writeStoredLiveSession({
+      sessionId: sessionIdRef.current,
+      userId: currentUser.id,
+      host: host.trim(),
+      port: Number(port || 22) || 22,
+      username: username.trim() || 'root',
+      authType,
+      selectedProfileId,
+      dirBrowserOpen,
+      currentRemotePath,
+      pathInput,
+      openFilePaths: openFiles.map((f) => f.path),
+      activeFilePath,
+      editorFullScreen,
+    });
+  }, [
+    status,
+    currentUser.id,
+    host,
+    port,
+    username,
+    authType,
+    selectedProfileId,
+    dirBrowserOpen,
+    currentRemotePath,
+    pathInput,
+    openFiles,
+    activeFilePath,
+    editorFullScreen,
+  ]);
 
   // Keep SSH WebSocket warm through reverse proxies while user switches to Database or Notes
   useEffect(() => {
@@ -383,6 +512,44 @@ export function SshTerminalView({
       cancelled = true;
     };
   }, [storageMode, currentUser.id]);
+
+  const previewFileRef = useRef<RemoteFilePreview | null>(previewFile);
+  previewFileRef.current = previewFile;
+
+  // Toggle Full-Screen Code Editor <-> Compact Drawer / Terminal via Alt+Tab
+  useEffect(() => {
+    const handleAltTab = (e: KeyboardEvent) => {
+      if (!isActiveRef.current || statusRef.current !== 'connected') return;
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        e.altKey &&
+        (e.key === 'Tab' || e.code === 'Tab')
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditorFullScreen((prev) => {
+          const next = !prev;
+          if (next) {
+            setDirBrowserOpen(true);
+            if (!currentRemotePathRef.current) {
+              requestListDirRef.current('', { mode: 'root' });
+            }
+          } else {
+            window.requestAnimationFrame(() => {
+              if (!previewFileRef.current) {
+                termRef.current?.focus();
+              }
+            });
+          }
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', handleAltTab, true);
+    return () => window.removeEventListener('keydown', handleAltTab, true);
+  }, []);
 
   // Close terminal context menu on outside click
   useEffect(() => {
@@ -500,11 +667,65 @@ export function SshTerminalView({
 
     window.requestAnimationFrame(safeFit);
 
-    term.writeln('\x1b[1;34mNoteCraft SSH Terminal\x1b[0m');
-    term.writeln(
-      '\x1b[90mEnter an SSH command (e.g. ssh user@host -p 22) or pick a saved server to begin.\x1b[0m'
-    );
-    term.writeln('');
+    const storedSession = readStoredLiveSession(currentUserIdRef.current);
+    if (storedSession) {
+      sessionIdRef.current = storedSession.sessionId;
+      setHost(storedSession.host);
+      setPort(String(storedSession.port));
+      setUsername(storedSession.username);
+      setAuthType(storedSession.authType);
+      if (storedSession.selectedProfileId) {
+        setSelectedProfileId(storedSession.selectedProfileId);
+      }
+      setCommandInput(
+        formatSshCommand({
+          username: storedSession.username,
+          host: storedSession.host,
+          port: storedSession.port,
+        })
+      );
+      setStatus('connecting');
+      setStatusMessage(
+        `Reattaching to ${storedSession.username}@${storedSession.host}:${storedSession.port}...`
+      );
+      term.writeln(
+        `\x1b[90mReattaching to ${storedSession.username}@${storedSession.host}:${storedSession.port}...\x1b[0m`
+      );
+
+      const resumeWs = new WebSocket(buildSshWebSocketUrl());
+      wsRef.current = resumeWs;
+      attachWebSocketHandlersRef.current(
+        resumeWs,
+        {
+          host: storedSession.host,
+          port: storedSession.port,
+          username: storedSession.username,
+        },
+        storedSession
+      );
+      resumeWs.onopen = () => {
+        if (wsRef.current !== resumeWs) return;
+        try {
+          fitAddon.fit();
+        } catch {
+          // ignore
+        }
+        resumeWs.send(
+          JSON.stringify({
+            type: 'resume',
+            sessionId: storedSession.sessionId,
+            cols: term.cols || 100,
+            rows: term.rows || 30,
+          })
+        );
+      };
+    } else {
+      term.writeln('\x1b[1;34mNoteCraft SSH Terminal\x1b[0m');
+      term.writeln(
+        '\x1b[90mEnter an SSH command (e.g. ssh user@host -p 22) or pick a saved server to begin.\x1b[0m'
+      );
+      term.writeln('');
+    }
 
     const inputDisposable = term.onData((data) => {
       const ws = wsRef.current;
@@ -594,13 +815,15 @@ export function SshTerminalView({
       inputDisposable.dispose();
       selectionDisposable.dispose();
       osc7Disposable.dispose();
-      if (wsRef.current) {
+      const activeWs = wsRef.current;
+      // Clear wsRef BEFORE closing so unmount/StrictMode/refresh does not wipe sessionStorage
+      wsRef.current = null;
+      if (activeWs) {
         try {
-          wsRef.current.close();
+          activeWs.close();
         } catch {
           // ignore
         }
-        wsRef.current = null;
       }
       term.dispose();
       termRef.current = null;
@@ -710,7 +933,10 @@ export function SshTerminalView({
   const closeSocket = useCallback(
     (sendDisconnectMsg = true) => {
       rejectPendingAsyncRequests('SSH connection closed.');
+      sessionIdRef.current = null;
+      clearStoredLiveSession();
       const ws = wsRef.current;
+      wsRef.current = null;
       if (!ws) return;
       try {
         if (sendDisconnectMsg && ws.readyState === WebSocket.OPEN) {
@@ -720,7 +946,6 @@ export function SshTerminalView({
       } catch {
         // ignore
       }
-      wsRef.current = null;
     },
     [rejectPendingAsyncRequests]
   );
@@ -1121,6 +1346,604 @@ export function SshTerminalView({
     }
   };
 
+  const attachWebSocketHandlers = useCallback(
+    (
+      ws: WebSocket,
+      targetInfo: { host: string; port: number; username: string },
+      restoreUi?: StoredSshLiveSession | null
+    ) => {
+      ws.onmessage = (event) => {
+        if (wsRef.current !== ws) return;
+        let msg: {
+          type?: string;
+          data?: string;
+          status?: ConnectionStatus;
+          sessionId?: string;
+          message?: string;
+          reason?: string;
+          scrollback?: string;
+          host?: string;
+          port?: number;
+          username?: string;
+          requestId?: string;
+          path?: string;
+          entries?: RemoteDirEntry[];
+          truncated?: boolean;
+          error?: string;
+          name?: string;
+          content?: string;
+          size?: number;
+          isBinary?: boolean;
+          savedAt?: number;
+          action?: string;
+        };
+        try {
+          msg = JSON.parse(String(event.data));
+        } catch {
+          return;
+        }
+
+        if (msg.type === 'data' && typeof msg.data === 'string') {
+          termRef.current?.write(msg.data);
+          return;
+        }
+
+        if (msg.type === 'dirListing') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncDirReqsRef.current.get(msg.requestId)
+            : undefined;
+          const resolvedPath = msg.path || '/';
+          const entries = Array.isArray(msg.entries) ? msg.entries : [];
+
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncDirReqsRef.current.delete(msg.requestId);
+            setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
+            setTruncatedDirs((prev) => ({
+              ...prev,
+              [resolvedPath]: Boolean(msg.truncated),
+            }));
+            asyncPending.resolve({
+              path: resolvedPath,
+              entries,
+              truncated: Boolean(msg.truncated),
+            });
+            return;
+          }
+
+          const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
+          if (msg.requestId) {
+            pendingDirReqRef.current.delete(msg.requestId);
+          }
+
+          setLoadingDirs((prev) => {
+            const next = { ...prev };
+            if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
+            delete next[resolvedPath];
+            delete next['__root__'];
+            return next;
+          });
+          setDirError(null);
+          setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
+          setTruncatedDirs((prev) => ({
+            ...prev,
+            [resolvedPath]: Boolean(msg.truncated),
+          }));
+
+          if (!reqInfo || reqInfo.mode === 'root') {
+            setCurrentRemotePath(resolvedPath);
+            setPathInput(resolvedPath);
+          } else {
+            setExpandedDirs((prev) => ({ ...prev, [resolvedPath]: true }));
+          }
+          return;
+        }
+
+        if (msg.type === 'dirError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncDirReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncDirReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Unable to list remote directory.'));
+            return;
+          }
+
+          const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
+          if (msg.requestId) {
+            pendingDirReqRef.current.delete(msg.requestId);
+          }
+          setLoadingDirs((prev) => {
+            const next = { ...prev };
+            if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
+            delete next['__root__'];
+            return next;
+          });
+          setDirError(msg.error || 'Unable to list remote directory.');
+          return;
+        }
+
+        if (msg.type === 'fileContent') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncFileReqsRef.current.get(msg.requestId)
+            : undefined;
+          const preview: RemoteFilePreview = {
+            path: msg.path || '',
+            name: msg.name || 'file',
+            content: msg.content || '',
+            size: Number(msg.size || 0),
+            truncated: Boolean(msg.truncated),
+            isBinary: Boolean(msg.isBinary),
+          };
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncFileReqsRef.current.delete(msg.requestId);
+            asyncPending.resolve(preview);
+            return;
+          }
+
+          if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
+          setFileLoading(false);
+          setSaveFileError(null);
+          setLastSavedAt(null);
+          upsertOpenFile(preview, true);
+          if (openFullScreenOnLoadRef.current) {
+            openFullScreenOnLoadRef.current = false;
+            setEditorFullScreen(true);
+          }
+          return;
+        }
+
+        if (msg.type === 'fileError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncFileReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncFileReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Unable to read remote file.'));
+            return;
+          }
+
+          if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
+          openFullScreenOnLoadRef.current = false;
+          setFileLoading(false);
+          setDirError(msg.error || 'Unable to read remote file.');
+          return;
+        }
+
+        if (msg.type === 'writeFileResult') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncWriteReqsRef.current.delete(msg.requestId);
+            const savedPath = msg.path || '';
+            const savedSize = Number(msg.size ?? new Blob([asyncPending.content]).size);
+            setLastSavedAt(Number(msg.savedAt || Date.now()));
+            const fileName = savedPath.split('/').pop() || 'file';
+            setOpenFiles((prev) =>
+              prev.map((f) =>
+                f.path === savedPath
+                  ? {
+                      path: savedPath,
+                      name: fileName,
+                      content: asyncPending.content,
+                      size: savedSize,
+                      truncated: false,
+                      isBinary: false,
+                    }
+                  : f
+              )
+            );
+            const parentDir = savedPath ? getParentPosixPath(savedPath) : '';
+            if (
+              parentDir &&
+              (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
+            ) {
+              requestListDir(parentDir, {
+                mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
+                keepPreview: true,
+              });
+            }
+            asyncPending.resolve({ path: savedPath, size: savedSize });
+            return;
+          }
+
+          if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
+          setSavingFile(false);
+          setSaveFileError(null);
+          const pending = pendingSaveDraftRef.current;
+          pendingSaveDraftRef.current = null;
+          const savedPath = msg.path || pending?.path || '';
+          const savedContent = pending?.content ?? '';
+          const savedSize = Number(msg.size ?? new Blob([savedContent]).size);
+          setLastSavedAt(Number(msg.savedAt || Date.now()));
+
+          const fileName = savedPath.split('/').pop() || 'file';
+          const updatedPreview: RemoteFilePreview = {
+            path: savedPath,
+            name: fileName,
+            content: savedContent,
+            size: savedSize,
+            truncated: false,
+            isBinary: false,
+          };
+          if (savedPath) {
+            if (pending?.isNewFile || openFilesRef.current.length === 0) {
+              upsertOpenFile(updatedPreview, true);
+            } else {
+              setOpenFiles((prev) =>
+                prev.some((f) => f.path === savedPath)
+                  ? prev.map((f) => (f.path === savedPath ? updatedPreview : f))
+                  : prev
+              );
+            }
+          }
+
+          const parentDir = savedPath ? getParentPosixPath(savedPath) : currentRemotePathRef.current;
+          if (parentDir) {
+            const isRoot = parentDir === currentRemotePathRef.current;
+            requestListDir(parentDir, {
+              mode: isRoot ? 'root' : 'expand',
+              keepPreview: true,
+            });
+          }
+          return;
+        }
+
+        if (msg.type === 'writeFileError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncWriteReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Unable to save remote file.'));
+            return;
+          }
+
+          if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
+          setSavingFile(false);
+          pendingSaveDraftRef.current = null;
+          setSaveFileError(msg.error || 'Unable to save remote file.');
+          return;
+        }
+
+        if (msg.type === 'createDirResult') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
+            : undefined;
+          const createdDir = msg.path || '';
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
+            const parentDir = createdDir ? getParentPosixPath(createdDir) : '';
+            if (
+              parentDir &&
+              (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
+            ) {
+              requestListDir(parentDir, {
+                mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
+                keepPreview: true,
+              });
+            }
+            asyncPending.resolve({ path: createdDir });
+          }
+          return;
+        }
+
+        if (msg.type === 'createDirError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Unable to create remote directory.'));
+          }
+          return;
+        }
+
+        if (msg.type === 'gitResult') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncGitReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncGitReqsRef.current.delete(msg.requestId);
+            const resultData =
+              (msg as unknown as { data?: Record<string, unknown> }).data ?? {};
+            asyncPending.resolve(resultData);
+          }
+          return;
+        }
+
+        if (msg.type === 'gitError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncGitReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncGitReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Git command failed.'));
+          }
+          return;
+        }
+
+        if (msg.type === 'resumed') {
+          const resumedSessionId =
+            typeof msg.sessionId === 'string' && msg.sessionId
+              ? msg.sessionId
+              : restoreUi?.sessionId || null;
+          sessionIdRef.current = resumedSessionId;
+          const resolvedHost = msg.host || targetInfo.host;
+          const resolvedPort = Number(msg.port || targetInfo.port || 22);
+          const resolvedUser = msg.username || targetInfo.username;
+
+          setHost(resolvedHost);
+          setPort(String(resolvedPort));
+          setUsername(resolvedUser);
+          if (restoreUi?.authType) {
+            setAuthType(restoreUi.authType);
+          }
+          if (restoreUi && restoreUi.selectedProfileId !== undefined) {
+            setSelectedProfileId(restoreUi.selectedProfileId);
+          }
+          setCommandInput(
+            formatSshCommand({
+              username: resolvedUser,
+              host: resolvedHost,
+              port: resolvedPort,
+            })
+          );
+
+          setStatus('connected');
+          setStatusMessage(
+            msg.message || `Connected to ${resolvedUser}@${resolvedHost}:${resolvedPort}`
+          );
+          setConnectedTarget(`${resolvedUser}@${resolvedHost}:${resolvedPort}`);
+          setOpenDirPromptError(null);
+          setOpenDirPromptOpen(false);
+
+          const term = termRef.current;
+          if (term) {
+            term.reset();
+            if (typeof msg.scrollback === 'string' && msg.scrollback.length > 0) {
+              term.write(msg.scrollback);
+            }
+          }
+
+          if (restoreUi) {
+            const hadWorkspace = Boolean(
+              restoreUi.currentRemotePath ||
+                restoreUi.dirBrowserOpen ||
+                restoreUi.openFilePaths.length > 0 ||
+                restoreUi.editorFullScreen
+            );
+            if (restoreUi.dirBrowserOpen) {
+              setDirBrowserOpen(true);
+            }
+            if (restoreUi.currentRemotePath) {
+              setCurrentRemotePath(restoreUi.currentRemotePath);
+              setPathInput(restoreUi.pathInput || restoreUi.currentRemotePath);
+              requestListDir(restoreUi.currentRemotePath, {
+                mode: 'root',
+                keepPreview: true,
+              });
+            } else if (restoreUi.dirBrowserOpen) {
+              requestListDir('', { mode: 'root', keepPreview: true });
+            }
+
+            if (restoreUi.openFilePaths.length > 0) {
+              void (async () => {
+                const restoredFiles: RemoteFilePreview[] = [];
+                for (const filePath of restoreUi.openFilePaths) {
+                  try {
+                    const loaded = await readRemoteFileAsync(filePath);
+                    restoredFiles.push(loaded);
+                  } catch {
+                    // ignore missing or inaccessible file on restore
+                  }
+                }
+                if (wsRef.current !== ws || restoredFiles.length === 0) return;
+                setOpenFiles(restoredFiles);
+                const preferredActive =
+                  restoreUi.activeFilePath &&
+                  restoredFiles.some((f) => f.path === restoreUi.activeFilePath)
+                    ? restoreUi.activeFilePath
+                    : restoredFiles[0].path;
+                setActiveFilePath(preferredActive);
+                if (restoreUi.editorFullScreen) {
+                  setEditorFullScreen(true);
+                }
+              })();
+            } else if (restoreUi.editorFullScreen) {
+              setEditorFullScreen(true);
+            }
+
+            if (!hadWorkspace) {
+              setOpenDirPromptInput('~');
+              setHomeQuickDirs([]);
+              setOpenDirPromptOpen(true);
+              void listRemoteDirAsync('~')
+                .then(({ path: homePath, entries }) => {
+                  setOpenDirPromptInput((cur) => (!cur || cur === '~' ? homePath : cur));
+                  setHomeQuickDirs(entries.filter((entry) => entry.isDirectory).slice(0, 8));
+                })
+                .catch(() => {
+                  // ignore pre-fetch error
+                });
+            }
+          }
+
+          if (!restoreUi?.editorFullScreen) {
+            window.requestAnimationFrame(() => termRef.current?.focus());
+          }
+          return;
+        }
+
+        if (msg.type === 'resumeFailed') {
+          sessionIdRef.current = null;
+          clearStoredLiveSession();
+          rejectPendingAsyncRequests(msg.reason || 'Previous SSH session expired.');
+          setConnectedTarget(null);
+          setDirBrowserOpen(false);
+          setOpenDirPromptOpen(false);
+          setEditorFullScreen(false);
+          setOpenFiles([]);
+          setActiveFilePath(null);
+          setGitStatus(null);
+          setGitError(null);
+          setStatus('disconnected');
+          setStatusMessage(
+            msg.reason || 'Previous SSH session expired. Enter your credentials to reconnect.'
+          );
+          termRef.current?.writeln(
+            `\r\n\x1b[33m[${msg.reason || 'Previous SSH session expired. Please reconnect.'}]\x1b[0m`
+          );
+          wsRef.current = null;
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+
+        if (msg.type === 'status' && msg.status) {
+          setStatus(msg.status);
+          if (msg.message) setStatusMessage(msg.message);
+
+          if (msg.status === 'connected') {
+            const nextSessionId =
+              typeof msg.sessionId === 'string' && msg.sessionId ? msg.sessionId : null;
+            if (nextSessionId) {
+              sessionIdRef.current = nextSessionId;
+            }
+            const resolvedHost = msg.host || targetInfo.host;
+            const resolvedPort = Number(msg.port || targetInfo.port || 22);
+            const resolvedUser = msg.username || targetInfo.username;
+            const targetLabel = `${resolvedUser}@${resolvedHost}:${resolvedPort}`;
+            setConnectedTarget(targetLabel);
+            if (nextSessionId) {
+              writeStoredLiveSession({
+                sessionId: nextSessionId,
+                userId: currentUserIdRef.current,
+                host: resolvedHost,
+                port: resolvedPort,
+                username: resolvedUser,
+                authType: authTypeRef.current,
+                selectedProfileId: selectedProfileIdRef.current,
+                dirBrowserOpen: dirBrowserOpenRef.current,
+                currentRemotePath: currentRemotePathRef.current,
+                pathInput: currentRemotePathRef.current,
+                openFilePaths: openFilesRef.current.map((f) => f.path),
+                activeFilePath: activeFilePathRef.current,
+                editorFullScreen: editorFullScreenRef.current,
+              });
+            }
+            setOpenDirPromptError(null);
+            setOpenDirPromptInput('~');
+            setHomeQuickDirs([]);
+            setOpenDirPromptOpen(true);
+
+            void listRemoteDirAsync('~')
+              .then(({ path: homePath, entries }) => {
+                setOpenDirPromptInput((cur) => (!cur || cur === '~' ? homePath : cur));
+                setHomeQuickDirs(entries.filter((entry) => entry.isDirectory).slice(0, 8));
+              })
+              .catch(() => {
+                // ignore pre-fetch error; user can type any directory
+              });
+
+            // Update lastConnectedAt if a saved profile is active
+            const activeId = selectedProfileIdRef.current;
+            const existing = activeId
+              ? profilesRef.current.find((p) => p.id === activeId)
+              : null;
+            if (existing) {
+              void saveSshProfile(storageModeRef.current, currentUserIdRef.current, {
+                ...existing,
+                lastConnectedAt: Date.now(),
+              }).then((updated) => {
+                setProfiles((prev) =>
+                  prev.map((p) => (p.id === updated.id ? updated : p))
+                );
+              });
+            }
+          } else if (msg.status === 'error') {
+            sessionIdRef.current = null;
+            clearStoredLiveSession();
+            rejectPendingAsyncRequests(msg.message || 'SSH connection error.');
+            setConnectedTarget(null);
+            setOpenDirPromptOpen(false);
+            if (msg.message) {
+              termRef.current?.writeln(`\x1b[31m✖ ${msg.message}\x1b[0m`);
+            }
+          } else if (msg.status === 'disconnected') {
+            sessionIdRef.current = null;
+            clearStoredLiveSession();
+            rejectPendingAsyncRequests(msg.message || 'SSH disconnected.');
+            clearConnectionFields();
+            setConnectedTarget(null);
+            setDirBrowserOpen(false);
+            setOpenDirPromptOpen(false);
+            setEditorFullScreen(false);
+            setOpenFiles([]);
+            setActiveFilePath(null);
+            setGitStatus(null);
+            setGitError(null);
+            if (msg.message) {
+              termRef.current?.writeln(`\r\n\x1b[90m[${msg.message}]\x1b[0m`);
+            }
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        if (wsRef.current !== ws) return;
+        rejectPendingAsyncRequests('WebSocket connection to SSH gateway failed.');
+        setStatus('error');
+        setStatusMessage('WebSocket connection to SSH gateway failed.');
+        setConnectedTarget(null);
+      };
+
+      ws.onclose = () => {
+        if (wsRef.current !== ws) return;
+        const wasConnected = statusRef.current === 'connected';
+        sessionIdRef.current = null;
+        clearStoredLiveSession();
+        rejectPendingAsyncRequests('WebSocket connection closed.');
+        wsRef.current = null;
+        if (wasConnected) {
+          clearConnectionFields();
+          setOpenDirPromptOpen(false);
+          setDirBrowserOpen(false);
+          setEditorFullScreen(false);
+          setOpenFiles([]);
+          setActiveFilePath(null);
+          setGitStatus(null);
+          setGitError(null);
+        }
+        setStatus((prev) => (prev === 'error' ? 'error' : 'disconnected'));
+        setConnectedTarget(null);
+      };
+    },
+    [
+      clearConnectionFields,
+      listRemoteDirAsync,
+      readRemoteFileAsync,
+      rejectPendingAsyncRequests,
+      requestListDir,
+      upsertOpenFile,
+    ]
+  );
+
+  attachWebSocketHandlersRef.current = attachWebSocketHandlers;
+
   const handleConnect = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
 
@@ -1184,6 +2007,12 @@ export function SshTerminalView({
     const ws = new WebSocket(buildSshWebSocketUrl());
     wsRef.current = ws;
 
+    attachWebSocketHandlers(ws, {
+      host: targetHost,
+      port: targetPort,
+      username: targetUser,
+    });
+
     ws.onopen = () => {
       if (wsRef.current !== ws) return;
       try {
@@ -1207,414 +2036,6 @@ export function SshTerminalView({
           rows,
         })
       );
-    };
-
-    ws.onmessage = (event) => {
-      if (wsRef.current !== ws) return;
-      let msg: {
-        type?: string;
-        data?: string;
-        status?: ConnectionStatus;
-        message?: string;
-        host?: string;
-        port?: number;
-        username?: string;
-        requestId?: string;
-        path?: string;
-        entries?: RemoteDirEntry[];
-        truncated?: boolean;
-        error?: string;
-        name?: string;
-        content?: string;
-        size?: number;
-        isBinary?: boolean;
-        savedAt?: number;
-        action?: string;
-      };
-      try {
-        msg = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-
-      if (msg.type === 'data' && typeof msg.data === 'string') {
-        termRef.current?.write(msg.data);
-        return;
-      }
-
-      if (msg.type === 'dirListing') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncDirReqsRef.current.get(msg.requestId)
-          : undefined;
-        const resolvedPath = msg.path || '/';
-        const entries = Array.isArray(msg.entries) ? msg.entries : [];
-
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncDirReqsRef.current.delete(msg.requestId);
-          setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
-          setTruncatedDirs((prev) => ({
-            ...prev,
-            [resolvedPath]: Boolean(msg.truncated),
-          }));
-          asyncPending.resolve({
-            path: resolvedPath,
-            entries,
-            truncated: Boolean(msg.truncated),
-          });
-          return;
-        }
-
-        const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
-        if (msg.requestId) {
-          pendingDirReqRef.current.delete(msg.requestId);
-        }
-
-        setLoadingDirs((prev) => {
-          const next = { ...prev };
-          if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
-          delete next[resolvedPath];
-          delete next['__root__'];
-          return next;
-        });
-        setDirError(null);
-        setDirCache((prev) => ({ ...prev, [resolvedPath]: entries }));
-        setTruncatedDirs((prev) => ({
-          ...prev,
-          [resolvedPath]: Boolean(msg.truncated),
-        }));
-
-        if (!reqInfo || reqInfo.mode === 'root') {
-          setCurrentRemotePath(resolvedPath);
-          setPathInput(resolvedPath);
-        } else {
-          setExpandedDirs((prev) => ({ ...prev, [resolvedPath]: true }));
-        }
-        return;
-      }
-
-      if (msg.type === 'dirError') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncDirReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncDirReqsRef.current.delete(msg.requestId);
-          asyncPending.reject(new Error(msg.error || 'Unable to list remote directory.'));
-          return;
-        }
-
-        const reqInfo = msg.requestId ? pendingDirReqRef.current.get(msg.requestId) : undefined;
-        if (msg.requestId) {
-          pendingDirReqRef.current.delete(msg.requestId);
-        }
-        setLoadingDirs((prev) => {
-          const next = { ...prev };
-          if (reqInfo?.requestedPath) delete next[reqInfo.requestedPath];
-          delete next['__root__'];
-          return next;
-        });
-        setDirError(msg.error || 'Unable to list remote directory.');
-        return;
-      }
-
-      if (msg.type === 'fileContent') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncFileReqsRef.current.get(msg.requestId)
-          : undefined;
-        const preview: RemoteFilePreview = {
-          path: msg.path || '',
-          name: msg.name || 'file',
-          content: msg.content || '',
-          size: Number(msg.size || 0),
-          truncated: Boolean(msg.truncated),
-          isBinary: Boolean(msg.isBinary),
-        };
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncFileReqsRef.current.delete(msg.requestId);
-          asyncPending.resolve(preview);
-          return;
-        }
-
-        if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
-        setFileLoading(false);
-        setSaveFileError(null);
-        setLastSavedAt(null);
-        upsertOpenFile(preview, true);
-        if (openFullScreenOnLoadRef.current) {
-          openFullScreenOnLoadRef.current = false;
-          setEditorFullScreen(true);
-        }
-        return;
-      }
-
-      if (msg.type === 'fileError') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncFileReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncFileReqsRef.current.delete(msg.requestId);
-          asyncPending.reject(new Error(msg.error || 'Unable to read remote file.'));
-          return;
-        }
-
-        if (msg.requestId && msg.requestId !== fileReqIdRef.current) return;
-        openFullScreenOnLoadRef.current = false;
-        setFileLoading(false);
-        setDirError(msg.error || 'Unable to read remote file.');
-        return;
-      }
-
-      if (msg.type === 'writeFileResult') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncWriteReqsRef.current.delete(msg.requestId);
-          const savedPath = msg.path || '';
-          const savedSize = Number(msg.size ?? new Blob([asyncPending.content]).size);
-          setLastSavedAt(Number(msg.savedAt || Date.now()));
-          const fileName = savedPath.split('/').pop() || 'file';
-          setOpenFiles((prev) =>
-            prev.map((f) =>
-              f.path === savedPath
-                ? {
-                    path: savedPath,
-                    name: fileName,
-                    content: asyncPending.content,
-                    size: savedSize,
-                    truncated: false,
-                    isBinary: false,
-                  }
-                : f
-            )
-          );
-          const parentDir = savedPath ? getParentPosixPath(savedPath) : '';
-          if (
-            parentDir &&
-            (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
-          ) {
-            requestListDir(parentDir, {
-              mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
-              keepPreview: true,
-            });
-          }
-          asyncPending.resolve({ path: savedPath, size: savedSize });
-          return;
-        }
-
-        if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
-        setSavingFile(false);
-        setSaveFileError(null);
-        const pending = pendingSaveDraftRef.current;
-        pendingSaveDraftRef.current = null;
-        const savedPath = msg.path || pending?.path || '';
-        const savedContent = pending?.content ?? '';
-        const savedSize = Number(msg.size ?? new Blob([savedContent]).size);
-        setLastSavedAt(Number(msg.savedAt || Date.now()));
-
-        const fileName = savedPath.split('/').pop() || 'file';
-        const updatedPreview: RemoteFilePreview = {
-          path: savedPath,
-          name: fileName,
-          content: savedContent,
-          size: savedSize,
-          truncated: false,
-          isBinary: false,
-        };
-        if (savedPath) {
-          if (pending?.isNewFile || openFilesRef.current.length === 0) {
-            upsertOpenFile(updatedPreview, true);
-          } else {
-            setOpenFiles((prev) =>
-              prev.some((f) => f.path === savedPath)
-                ? prev.map((f) => (f.path === savedPath ? updatedPreview : f))
-                : prev
-            );
-          }
-        }
-
-        const parentDir = savedPath ? getParentPosixPath(savedPath) : currentRemotePathRef.current;
-        if (parentDir) {
-          const isRoot = parentDir === currentRemotePathRef.current;
-          requestListDir(parentDir, {
-            mode: isRoot ? 'root' : 'expand',
-            keepPreview: true,
-          });
-        }
-        return;
-      }
-
-      if (msg.type === 'writeFileError') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncWriteReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncWriteReqsRef.current.delete(msg.requestId);
-          asyncPending.reject(new Error(msg.error || 'Unable to save remote file.'));
-          return;
-        }
-
-        if (msg.requestId && msg.requestId !== writeReqIdRef.current) return;
-        setSavingFile(false);
-        pendingSaveDraftRef.current = null;
-        setSaveFileError(msg.error || 'Unable to save remote file.');
-        return;
-      }
-
-      if (msg.type === 'createDirResult') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
-          : undefined;
-        const createdDir = msg.path || '';
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
-          const parentDir = createdDir ? getParentPosixPath(createdDir) : '';
-          if (
-            parentDir &&
-            (parentDir === currentRemotePathRef.current || Boolean(dirCacheRef.current[parentDir]))
-          ) {
-            requestListDir(parentDir, {
-              mode: parentDir === currentRemotePathRef.current ? 'root' : 'expand',
-              keepPreview: true,
-            });
-          }
-          asyncPending.resolve({ path: createdDir });
-        }
-        return;
-      }
-
-      if (msg.type === 'createDirError') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncMkdirReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncMkdirReqsRef.current.delete(msg.requestId);
-          asyncPending.reject(new Error(msg.error || 'Unable to create remote directory.'));
-        }
-        return;
-      }
-
-      if (msg.type === 'gitResult') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncGitReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncGitReqsRef.current.delete(msg.requestId);
-          const resultData =
-            (msg as unknown as { data?: Record<string, unknown> }).data ?? {};
-          asyncPending.resolve(resultData);
-        }
-        return;
-      }
-
-      if (msg.type === 'gitError') {
-        const asyncPending = msg.requestId
-          ? pendingAsyncGitReqsRef.current.get(msg.requestId)
-          : undefined;
-        if (asyncPending && msg.requestId) {
-          window.clearTimeout(asyncPending.timer);
-          pendingAsyncGitReqsRef.current.delete(msg.requestId);
-          asyncPending.reject(new Error(msg.error || 'Git command failed.'));
-        }
-        return;
-      }
-
-      if (msg.type === 'status' && msg.status) {
-        setStatus(msg.status);
-        if (msg.message) setStatusMessage(msg.message);
-
-        if (msg.status === 'connected') {
-          const targetLabel = `${msg.username || targetUser}@${msg.host || targetHost}:${
-            msg.port || targetPort
-          }`;
-          setConnectedTarget(targetLabel);
-          setOpenDirPromptError(null);
-          setOpenDirPromptInput('~');
-          setHomeQuickDirs([]);
-          setOpenDirPromptOpen(true);
-
-          void listRemoteDirAsync('~')
-            .then(({ path: homePath, entries }) => {
-              setOpenDirPromptInput((cur) => (!cur || cur === '~' ? homePath : cur));
-              setHomeQuickDirs(entries.filter((entry) => entry.isDirectory).slice(0, 8));
-            })
-            .catch(() => {
-              // ignore pre-fetch error; user can type any directory
-            });
-
-          // Update lastConnectedAt if a saved profile is active
-          const activeId = selectedProfileIdRef.current;
-          const existing = activeId
-            ? profilesRef.current.find((p) => p.id === activeId)
-            : null;
-          if (existing) {
-            void saveSshProfile(storageMode, currentUser.id, {
-              ...existing,
-              lastConnectedAt: Date.now(),
-            }).then((updated) => {
-              setProfiles((prev) =>
-                prev.map((p) => (p.id === updated.id ? updated : p))
-              );
-            });
-          }
-        } else if (msg.status === 'error') {
-          rejectPendingAsyncRequests(msg.message || 'SSH connection error.');
-          setConnectedTarget(null);
-          setOpenDirPromptOpen(false);
-          if (msg.message) {
-            termRef.current?.writeln(`\x1b[31m✖ ${msg.message}\x1b[0m`);
-          }
-        } else if (msg.status === 'disconnected') {
-          rejectPendingAsyncRequests(msg.message || 'SSH disconnected.');
-          clearConnectionFields();
-          setConnectedTarget(null);
-          setDirBrowserOpen(false);
-          setOpenDirPromptOpen(false);
-          setEditorFullScreen(false);
-          setOpenFiles([]);
-          setActiveFilePath(null);
-          setGitStatus(null);
-          setGitError(null);
-          if (msg.message) {
-            termRef.current?.writeln(`\r\n\x1b[90m[${msg.message}]\x1b[0m`);
-          }
-        }
-      }
-    };
-
-    ws.onerror = () => {
-      if (wsRef.current !== ws) return;
-      rejectPendingAsyncRequests('WebSocket connection to SSH gateway failed.');
-      setStatus('error');
-      setStatusMessage('WebSocket connection to SSH gateway failed.');
-      setConnectedTarget(null);
-    };
-
-    ws.onclose = () => {
-      if (wsRef.current !== ws) return;
-      const wasConnected = statusRef.current === 'connected';
-      rejectPendingAsyncRequests('WebSocket connection closed.');
-      wsRef.current = null;
-      if (wasConnected) {
-        clearConnectionFields();
-        setOpenDirPromptOpen(false);
-        setDirBrowserOpen(false);
-        setEditorFullScreen(false);
-        setOpenFiles([]);
-        setActiveFilePath(null);
-        setGitStatus(null);
-        setGitError(null);
-      }
-      setStatus((prev) => (prev === 'error' ? 'error' : 'disconnected'));
-      setConnectedTarget(null);
     };
   };
 
@@ -2604,7 +3025,7 @@ export function SshTerminalView({
                         setEditorFullScreen(true);
                       }}
                       disabled={!currentRemotePath}
-                      title="Open project explorer & editor in Full Screen"
+                      title="Open project explorer & editor in Full Screen (Alt+Tab)"
                       className="p-1 rounded text-blue-300 hover:text-white hover:bg-blue-500/20 disabled:opacity-35 cursor-pointer"
                     >
                       <Maximize2 className="w-3.5 h-3.5" />
