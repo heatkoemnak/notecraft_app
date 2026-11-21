@@ -38,10 +38,9 @@ services:
       PGPASSWORD: ${PGPASSWORD:-notecraft_secret_password}
       PGDATABASE: ${PGDATABASE:-notecraft}
       PGSSL: "false"
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-AQ.Ab8RN6K7Bbv0w6zjQ0kQoBNY6VeNNEWK5DPKSjwb-kCQCZ3jLQ}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-AQ.Ab8RN6K7Bbv0w6zjQ0kQoBNY6VeNNEWK5DPKSjwb-kCQCZ3jLQ}
     ports:
       - "8080:3000"
 
