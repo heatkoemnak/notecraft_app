@@ -833,6 +833,8 @@ export function CodeAgentPanel({
   const dragDepthRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  const agentModeRef = useRef<CodeAgentMode>(agentMode);
+  agentModeRef.current = agentMode;
 
   // Ensure activeSessionId always points to an existing session
   const activeSession = useMemo(() => {
@@ -927,6 +929,18 @@ export function CodeAgentPanel({
     [activeSession?.id, currentRemotePath, agentMode]
   );
 
+  const selectAgentMode = useCallback(
+    (nextMode: CodeAgentMode) => {
+      agentModeRef.current = nextMode;
+      setAgentMode(nextMode);
+      savePreferredAgentMode(nextMode);
+      updateActiveSession((sess) =>
+        sess.mode === nextMode ? sess : { ...sess, mode: nextMode }
+      );
+    },
+    [updateActiveSession]
+  );
+
   const handleNewChat = useCallback(() => {
     const fresh = createEmptySession(currentRemotePath || '/', agentMode);
     setSessions((prev) => [fresh, ...prev.slice(0, 29)]);
@@ -993,7 +1007,7 @@ export function CodeAgentPanel({
         .filter((item) => !item.error)
         .map((item) => ({ name: item.name, path: item.path }));
 
-      const effectiveMode = modeOverride ?? agentMode;
+      const effectiveMode = modeOverride ?? agentModeRef.current;
       const userTurnId = `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const historyPayload: CodeAgentMessage[] = messages.slice(-12).map((m) => {
         let content = m.content;
@@ -1686,38 +1700,34 @@ export function CodeAgentPanel({
           <div
             role="group"
             aria-label="Agent execution mode"
-            className="inline-flex rounded-md border border-white/12 bg-[#0c0c10] p-0.5 shrink-0"
+            className="inline-flex rounded-md border border-white/12 bg-[#0c0c10] p-0.5 shrink-0 select-none"
           >
             <button
               type="button"
-              onClick={() => {
-                setAgentMode('plan');
-                savePreferredAgentMode('plan');
-              }}
+              aria-pressed={agentMode === 'plan'}
+              onClick={() => selectAgentMode('plan')}
               title="Plan mode: outline steps across files/folders before generating edits"
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium whitespace-nowrap transition-colors cursor-pointer ${
                 agentMode === 'plan'
                   ? 'bg-blue-600 text-white'
                   : 'text-neutral-400 hover:text-white'
               }`}
             >
-              <ListChecks className="w-3 h-3" />
+              <ListChecks className="w-3 h-3 shrink-0" />
               <span>Plan</span>
             </button>
             <button
               type="button"
-              onClick={() => {
-                setAgentMode('auto');
-                savePreferredAgentMode('auto');
-              }}
+              aria-pressed={agentMode === 'auto'}
+              onClick={() => selectAgentMode('auto')}
               title="Auto mode: immediately generate multi-file changes, folders & new files for review"
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium whitespace-nowrap transition-colors cursor-pointer ${
                 agentMode === 'auto'
                   ? 'bg-emerald-600 text-white'
                   : 'text-neutral-400 hover:text-white'
               }`}
             >
-              <Zap className="w-3 h-3" />
+              <Zap className="w-3 h-3 shrink-0" />
               <span>Auto</span>
             </button>
           </div>
@@ -2102,7 +2112,7 @@ export function CodeAgentPanel({
                       void handleSend(
                         lastUser.content,
                         lastUser.taskMode || 'chat',
-                        lastUser.agentMode
+                        agentModeRef.current
                       );
                     }
                   }}

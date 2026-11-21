@@ -648,7 +648,7 @@ function parseAgentPayload(
   return {
     reply,
     mode: 'auto',
-    plan,
+    plan: [],
     fileOperations,
     requestedFiles,
     searchQueries,
@@ -980,15 +980,7 @@ export async function runCodeAgent(input: CodeAgentInput): Promise<CodeAgentResu
         400
       );
     }
-    try {
-      return await runWithGemini(input);
-    } catch (err) {
-      const isTransient = err instanceof CodeAgentError && (err.status === 503 || err.status === 429);
-      if (isTransient && groqReady) {
-        return runWithGroq(input, getDefaultGroqModel());
-      }
-      throw err;
-    }
+    return await runWithGemini(input);
   }
 
   return runWithGroq(input, requested);
