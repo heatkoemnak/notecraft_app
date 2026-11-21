@@ -235,8 +235,8 @@ export function retrieveRelevantKnowledge(
     return { retrieved: [], catalogSummary: '', expandedTerms: [] };
   }
 
-  const maxItems = params.maxItems ?? 8;
-  const maxTotalChars = params.maxTotalChars ?? 18000;
+  const maxItems = params.maxItems ?? 5;
+  const maxTotalChars = params.maxTotalChars ?? 9000;
 
   const combinedQueryText = [
     params.query || '',

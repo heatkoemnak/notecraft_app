@@ -23,6 +23,7 @@ import {
   Plus,
   RotateCcw,
   ScanSearch,
+  Search,
   Send,
   Sparkles,
   Trash2,
@@ -39,6 +40,7 @@ import type {
 import { KNOWLEDGE_CATEGORY_META } from '../types/knowledge';
 import type { StorageBackendMode } from '../utils/authClient';
 import {
+  AgentActionStep,
   buildLoadedProjectTreeSummary,
   CodeAgentChatTurn,
   CodeAgentEditHunk,
@@ -764,6 +766,138 @@ function RetrievedContextBar({
   );
 }
 
+function formatStepDuration(startedAt: number, finishedAt?: number): string {
+  if (!finishedAt || finishedAt < startedAt) return '';
+  const ms = finishedAt - startedAt;
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function getActionStepIcon(kind: AgentActionStep['kind'], status: AgentActionStep['status']) {
+  if (status === 'running') {
+    return <Loader2 className="w-3 h-3 animate-spin text-blue-400 shrink-0" />;
+  }
+  if (status === 'error') {
+    return <AlertCircle className="w-3 h-3 text-red-400 shrink-0" />;
+  }
+  switch (kind) {
+    case 'knowledge':
+      return <BookOpen className="w-3 h-3 text-emerald-400 shrink-0" />;
+    case 'search':
+      return <Search className="w-3 h-3 text-sky-400 shrink-0" />;
+    case 'read':
+      return <FileCode2 className="w-3 h-3 text-amber-400 shrink-0" />;
+    case 'stage':
+      return <Sparkles className="w-3 h-3 text-emerald-400 shrink-0" />;
+    case 'think':
+      return <Bot className="w-3 h-3 text-blue-400 shrink-0" />;
+    default:
+      return <Check className="w-3 h-3 text-emerald-400 shrink-0" />;
+  }
+}
+
+function ActionProcessTimeline({
+  steps,
+  live = false,
+}: {
+  steps?: AgentActionStep[];
+  live?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(live);
+  if (!steps || steps.length === 0) return null;
+
+  const isExpanded = live || expanded;
+  const firstStart = steps[0].startedAt;
+  const lastEnd = steps[steps.length - 1].finishedAt;
+  const totalDurationMs = lastEnd && lastEnd >= firstStart ? lastEnd - firstStart : 0;
+
+  const activeStep = steps.find((s) => s.status === 'running') || steps[steps.length - 1];
+
+  return (
+    <div
+      className={`rounded-lg border overflow-hidden ${
+        live
+          ? 'border-blue-500/35 bg-[#111521]'
+          : 'mb-2 border-white/[0.08] bg-[#10121a]'
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => !live && setExpanded((prev) => !prev)}
+        className={`w-full px-2.5 py-1.5 flex items-center justify-between gap-2 text-left text-[11px] ${
+          live
+            ? 'text-blue-100 bg-blue-500/10'
+            : 'text-neutral-300 hover:text-white cursor-pointer'
+        }`}
+      >
+        <span className="inline-flex items-center gap-1.5 min-w-0">
+          {!live &&
+            (isExpanded ? (
+              <ChevronDown className="w-3 h-3 text-neutral-400 shrink-0" />
+            ) : (
+              <ChevronRight className="w-3 h-3 text-neutral-400 shrink-0" />
+            ))}
+          {live ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
+          ) : (
+            <Check className="w-3 h-3 text-emerald-400 shrink-0" />
+          )}
+          <span className="font-medium truncate">
+            {live ? activeStep?.label || 'Working...' : `Action Process · ${steps.length} steps`}
+          </span>
+        </span>
+        {!live && totalDurationMs > 0 && (
+          <span className="font-mono-code text-[10px] text-neutral-500 shrink-0 tabular-nums">
+            {(totalDurationMs / 1000).toFixed(1)}s
+          </span>
+        )}
+      </button>
+
+      {isExpanded && (
+        <div
+          className={`px-2.5 py-2 space-y-1.5 ${
+            live ? 'border-t border-blue-500/20' : 'border-t border-white/[0.06]'
+          }`}
+        >
+          {steps.map((step) => {
+            const dur = formatStepDuration(step.startedAt, step.finishedAt);
+            return (
+              <div key={step.id} className="flex items-start justify-between gap-2 text-[11px]">
+                <div className="flex items-start gap-1.5 min-w-0">
+                  <span className="mt-0.5">{getActionStepIcon(step.kind, step.status)}</span>
+                  <div className="min-w-0">
+                    <div
+                      className={`leading-snug ${
+                        step.status === 'running'
+                          ? 'text-white font-medium'
+                          : step.status === 'error'
+                          ? 'text-red-300'
+                          : 'text-neutral-300'
+                      }`}
+                    >
+                      {step.label}
+                    </div>
+                    {step.detail && (
+                      <div className="font-mono-code text-[10px] text-neutral-400 break-words">
+                        {step.detail}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {dur && (
+                  <span className="font-mono-code text-[10px] text-neutral-500 shrink-0 tabular-nums mt-0.5">
+                    {dur}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function CodeAgentPanel({
   width,
   file,
@@ -820,7 +954,7 @@ export function CodeAgentPanel({
   const [promptInput, setPromptInput] = useState('');
   const [scopeToSelection, setScopeToSelection] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [loadingStatus, setLoadingStatus] = useState('Analyzing code...');
+  const [liveActionSteps, setLiveActionSteps] = useState<AgentActionStep[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastAppliedTurnId, setLastAppliedTurnId] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<DroppedContextFile[]>([]);
@@ -894,7 +1028,7 @@ export function CodeAgentPanel({
     if (scrollContainerRef.current) {
       scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
     }
-  }, [messages.length, loading]);
+  }, [messages.length, loading, liveActionSteps.length]);
 
   const projectTreeSummary = useMemo(
     () =>
@@ -1055,11 +1189,42 @@ export function CodeAgentPanel({
         setAttachedFiles([]);
       }
       setLoading(true);
-      setLoadingStatus(
-        effectiveMode === 'plan'
-          ? 'Drafting workspace implementation plan...'
-          : 'Reading related files & preparing changes...'
-      );
+      const actionLog: AgentActionStep[] = [];
+      const syncActionLog = () => {
+        setLiveActionSteps(actionLog.map((s) => ({ ...s })));
+      };
+      const startActionStep = (
+        kind: AgentActionStep['kind'],
+        label: string,
+        detail?: string
+      ): string => {
+        const stepId = `step-${actionLog.length + 1}-${Date.now()}`;
+        actionLog.push({
+          id: stepId,
+          kind,
+          label,
+          detail,
+          status: 'running',
+          startedAt: Date.now(),
+        });
+        syncActionLog();
+        return stepId;
+      };
+      const finishActionStep = (
+        stepId: string,
+        status: 'done' | 'error' = 'done',
+        detail?: string,
+        label?: string
+      ) => {
+        const target = actionLog.find((s) => s.id === stepId);
+        if (!target) return;
+        target.status = status;
+        target.finishedAt = Date.now();
+        if (detail !== undefined) target.detail = detail;
+        if (label !== undefined) target.label = label;
+        syncActionLog();
+      };
+      syncActionLog();
 
       try {
         const activeSelection =
@@ -1067,6 +1232,11 @@ export function CodeAgentPanel({
         const activeKnowledge = knowledgeEntries.filter((entry) => entry.enabled);
 
         // 1. Seed related files with explicitly dragged-and-dropped context files, then heuristic candidates
+        const ctxStepId = startActionStep(
+          'context',
+          'Collecting workspace & file context',
+          file ? `Active: ${file.name}` : `Workspace: ${currentRemotePath || '/'}`
+        );
         const relatedMap = new Map<string, string>();
         const inspectedFilesSet = new Set<string>();
         const collectedSearchQueries: string[] = [];
@@ -1091,6 +1261,17 @@ export function CodeAgentPanel({
         for (const key of relatedMap.keys()) {
           if (!key.startsWith('[')) inspectedFilesSet.add(key);
         }
+        const ctxDetails: string[] = [];
+        if (file) ctxDetails.push(file.name);
+        if (validAttached.length > 0) ctxDetails.push(`${validAttached.length} attached`);
+        if (inspectedFilesSet.size > (file ? 1 : 0)) {
+          ctxDetails.push(`${inspectedFilesSet.size} related file${inspectedFilesSet.size === 1 ? '' : 's'}`);
+        }
+        finishActionStep(
+          ctxStepId,
+          'done',
+          ctxDetails.length > 0 ? ctxDetails.join(' · ') : currentRemotePath || 'workspace'
+        );
 
         const buildRelatedPayload = (): CodeAgentRelatedFile[] =>
           Array.from(relatedMap.entries()).map(([p, c]) => ({ path: p, content: c }));
@@ -1122,10 +1303,49 @@ export function CodeAgentPanel({
             history: historyPayload,
           });
 
+        const selectedModelLabel =
+          models.find((m) => m.id === selectedModel)?.label || selectedModel;
+        const kbStepId =
+          activeKnowledge.length > 0
+            ? startActionStep(
+                'knowledge',
+                'Matching MAQSU ERP system knowledge',
+                `Checking ${activeKnowledge.length} active KB docs`
+              )
+            : null;
+        const thinkStepId = startActionStep(
+          'think',
+          effectiveMode === 'plan'
+            ? `Analyzing & drafting plan (${selectedModelLabel})`
+            : `Analyzing implementation (${selectedModelLabel})`,
+          `${effectiveMode.toUpperCase()} mode`
+        );
+
         let res = await runAgentPass();
 
-        // 2. Multi-pass live SSH inspection loop: execute searchQueries + requestedFiles before final output
-        for (let pass = 0; pass < 2; pass += 1) {
+        if (kbStepId) {
+          const matchedCount = res.retrievedKnowledge?.length || 0;
+          finishActionStep(
+            kbStepId,
+            'done',
+            matchedCount > 0
+              ? `Loaded ${matchedCount} docs: ${res.retrievedKnowledge!
+                  .slice(0, 3)
+                  .map((k) => k.title)
+                  .join(', ')}`
+              : `${activeKnowledge.length} docs checked`
+          );
+        }
+        finishActionStep(
+          thinkStepId,
+          'done',
+          res.searchQueries?.length || res.requestedFiles?.length
+            ? 'Requested live codebase inspection first'
+            : res.summary || 'Analysis complete'
+        );
+
+        // 2. Single live SSH inspection pass: execute searchQueries + requestedFiles before final output
+        for (let pass = 0; pass < 1; pass += 1) {
           const hasRequestedFiles = Boolean(res.requestedFiles && res.requestedFiles.length > 0);
           const hasSearchQueries = Boolean(res.searchQueries && res.searchQueries.length > 0);
           const hasFinalOutput =
@@ -1142,17 +1362,26 @@ export function CodeAgentPanel({
             const freshQueries = res.searchQueries
               .map((q) => q.trim())
               .filter((q) => q && !collectedSearchQueries.includes(q))
-              .slice(0, 6);
+              .slice(0, 4);
 
             if (freshQueries.length > 0) {
               collectedSearchQueries.push(...freshQueries);
-              setLoadingStatus(
-                `Searching ERP codebase (${freshQueries.slice(0, 2).join(', ')})...`
+              const searchStepId = startActionStep(
+                'search',
+                'Searching SSH codebase',
+                freshQueries.join(', ')
               );
               try {
                 const matches = await onSearchWorkspace(
                   freshQueries,
                   currentRemotePath || undefined
+                );
+                finishActionStep(
+                  searchStepId,
+                  'done',
+                  `${freshQueries.join(', ')} → ${matches.length} match${
+                    matches.length === 1 ? '' : 'es'
+                  }`
                 );
                 if (matches.length > 0) {
                   const searchSummary = matches
@@ -1160,7 +1389,7 @@ export function CodeAgentPanel({
                     .join('\n');
                   const searchKey = `[Workspace Search Results #${pass + 1}]`;
                   if (!relatedMap.has(searchKey)) {
-                    relatedMap.set(searchKey, searchSummary.slice(0, 14000));
+                    relatedMap.set(searchKey, searchSummary.slice(0, 10000));
                     gatheredNewContext = true;
                   }
 
@@ -1177,33 +1406,59 @@ export function CodeAgentPanel({
                       ) {
                         seenMatchPaths.add(m.path);
                         matchedPaths.push(m.path);
-                        if (matchedPaths.length >= 5) break;
+                        if (matchedPaths.length >= 4) break;
                       }
                     }
                     if (matchedPaths.length > 0) {
+                      const readStepId = startActionStep(
+                        'read',
+                        `Inspecting ${matchedPaths.length} matched file${
+                          matchedPaths.length === 1 ? '' : 's'
+                        } via SSH`,
+                        matchedPaths.map((p) => p.split('/').pop() || p).join(', ')
+                      );
                       const beforeSize = relatedMap.size;
                       await gatherRelatedFiles(matchedPaths, relatedMap);
-                      if (relatedMap.size > beforeSize) {
+                      const loadedDelta = relatedMap.size - beforeSize;
+                      finishActionStep(
+                        readStepId,
+                        'done',
+                        `Loaded ${loadedDelta} file${loadedDelta === 1 ? '' : 's'}: ${matchedPaths
+                          .map((p) => p.split('/').pop() || p)
+                          .join(', ')}`
+                      );
+                      if (loadedDelta > 0) {
                         gatheredNewContext = true;
                       }
                     }
                   }
                 }
-              } catch {
-                // continue with any requestedFiles
+              } catch (searchErr) {
+                finishActionStep(
+                  searchStepId,
+                  'error',
+                  searchErr instanceof Error ? searchErr.message : 'Workspace search failed'
+                );
               }
             }
           }
 
           if (hasRequestedFiles && onReadRemoteFile && res.requestedFiles) {
-            const beforeSize = relatedMap.size;
-            setLoadingStatus(
-              `Inspecting ${res.requestedFiles.length} existing file${
-                res.requestedFiles.length === 1 ? '' : 's'
-              } via SSH...`
+            const reqList = res.requestedFiles;
+            const reqStepId = startActionStep(
+              'read',
+              `Reading ${reqList.length} requested file${reqList.length === 1 ? '' : 's'} via SSH`,
+              reqList.map((p) => p.split('/').pop() || p).join(', ')
             );
-            await gatherRelatedFiles(res.requestedFiles, relatedMap);
-            if (relatedMap.size > beforeSize) {
+            const beforeSize = relatedMap.size;
+            await gatherRelatedFiles(reqList, relatedMap);
+            const loadedDelta = relatedMap.size - beforeSize;
+            finishActionStep(
+              reqStepId,
+              'done',
+              `Loaded ${loadedDelta} file${loadedDelta === 1 ? '' : 's'}`
+            );
+            if (loadedDelta > 0) {
               gatheredNewContext = true;
             }
           }
@@ -1216,12 +1471,54 @@ export function CodeAgentPanel({
             break;
           }
 
-          setLoadingStatus('Synthesizing plan & changes from existing code...');
+          const synthStepId = startActionStep(
+            'think',
+            effectiveMode === 'plan'
+              ? 'Synthesizing implementation plan from inspected code'
+              : 'Generating code changes from inspected implementation',
+            `${inspectedFilesSet.size} file${inspectedFilesSet.size === 1 ? '' : 's'} in context`
+          );
           res = await runAgentPass();
+          finishActionStep(synthStepId, 'done', res.summary || 'Synthesis complete');
         }
 
         const turnId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const fileOps = res.fileOperations ?? [];
+
+        // Stage multi-file operations (and/or inline diffs) when in Auto mode
+        if (effectiveMode === 'auto') {
+          if (fileOps.length > 0) {
+            const stageStepId = startActionStep(
+              'stage',
+              `Staging ${fileOps.length} workspace file operation${
+                fileOps.length === 1 ? '' : 's'
+              }`,
+              fileOps.map((o) => `${o.operation}: ${o.path.split('/').pop() || o.path}`).join(', ')
+            );
+            await onStageFileOperations(fileOps, turnId, res.summary);
+            finishActionStep(stageStepId, 'done', 'Ready for diff review / Accept');
+          } else if (
+            file &&
+            isEditable &&
+            res.targetAction !== 'create-file' &&
+            res.targetAction !== 'none' &&
+            ((res.edits && res.edits.length > 0) || Boolean(res.proposedCode))
+          ) {
+            const stageStepId = startActionStep(
+              'stage',
+              'Staging inline editor diff',
+              file.name
+            );
+            onStageInlineDiff({
+              edits: res.edits,
+              proposedCode: res.proposedCode,
+              targetAction: res.targetAction,
+              summary: res.summary,
+              turnId,
+            });
+            finishActionStep(stageStepId, 'done', 'Highlighted in editor');
+          }
+        }
 
         const assistantTurn: CodeAgentChatTurn = {
           id: turnId,
@@ -1243,6 +1540,7 @@ export function CodeAgentPanel({
           retrievedKnowledge: res.retrievedKnowledge,
           inspectedFiles: Array.from(inspectedFilesSet),
           searchQueries: collectedSearchQueries.length > 0 ? collectedSearchQueries : undefined,
+          actionSteps: actionLog.map((s) => ({ ...s })),
         };
 
         updateActiveSession((sess) => ({
@@ -1250,37 +1548,25 @@ export function CodeAgentPanel({
           updatedAt: Date.now(),
           messages: [...sess.messages, assistantTurn],
         }));
-
-        // Stage multi-file operations (and/or inline diffs) when in Auto mode
-        if (effectiveMode === 'auto') {
-          if (fileOps.length > 0) {
-            await onStageFileOperations(fileOps, turnId, res.summary);
-          } else if (
-            file &&
-            isEditable &&
-            res.targetAction !== 'create-file' &&
-            res.targetAction !== 'none' &&
-            ((res.edits && res.edits.length > 0) || Boolean(res.proposedCode))
-          ) {
-            onStageInlineDiff({
-              edits: res.edits,
-              proposedCode: res.proposedCode,
-              targetAction: res.targetAction,
-              summary: res.summary,
-              turnId,
-            });
-          }
-        }
       } catch (err) {
+        const runningStep = actionLog.find((s) => s.status === 'running');
+        if (runningStep) {
+          finishActionStep(
+            runningStep.id,
+            'error',
+            err instanceof Error ? err.message : 'Request failed'
+          );
+        }
         setErrorMsg(err instanceof Error ? err.message : 'AI Code Agent failed to respond.');
       } finally {
         setLoading(false);
+        setLiveActionSteps([]);
       }
     },
     [
       promptInput,
       loading,
-      agentMode,
+      models,
       messages,
       updateActiveSession,
       currentRemotePath,
@@ -1968,6 +2254,8 @@ export function CodeAgentPanel({
                   )}
                 </div>
 
+                <ActionProcessTimeline steps={msg.actionSteps} live={false} />
+
                 <RetrievedContextBar
                   retrievedKnowledge={msg.retrievedKnowledge}
                   inspectedFiles={msg.inspectedFiles}
@@ -2091,12 +2379,7 @@ export function CodeAgentPanel({
           )
         )}
 
-        {loading && (
-          <div className="rounded-xl border border-white/[0.08] bg-[#16161d] px-3 py-2.5 flex items-center gap-2 text-[12px] text-neutral-300">
-            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
-            <span>{loadingStatus}</span>
-          </div>
-        )}
+        {loading && <ActionProcessTimeline steps={liveActionSteps} live />}
 
         {errorMsg && (
           <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12px] text-red-200 flex items-start gap-2">

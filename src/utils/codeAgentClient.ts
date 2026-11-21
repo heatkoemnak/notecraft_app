@@ -124,6 +124,16 @@ export interface TrackedFileChange {
   turnId: string;
 }
 
+export interface AgentActionStep {
+  id: string;
+  kind: 'context' | 'knowledge' | 'search' | 'read' | 'think' | 'stage';
+  label: string;
+  detail?: string;
+  status: 'running' | 'done' | 'error';
+  startedAt: number;
+  finishedAt?: number;
+}
+
 export interface CodeAgentChatTurn {
   id: string;
   role: 'user' | 'assistant';
@@ -146,6 +156,7 @@ export interface CodeAgentChatTurn {
   retrievedKnowledge?: CodeAgentRetrievedKnowledgeRef[];
   inspectedFiles?: string[];
   searchQueries?: string[];
+  actionSteps?: AgentActionStep[];
 }
 
 export interface CodeAgentHistorySession {

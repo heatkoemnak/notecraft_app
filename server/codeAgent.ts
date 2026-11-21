@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { RetrievedKnowledgeItem } from './erpKnowledge.ts';
 import {
   getConfiguredGroqApiKey,
@@ -198,11 +198,10 @@ function buildSystemInstruction(input: CodeAgentInput): string {
   const inspectionRules = [
     'MANDATORY SYSTEM KNOWLEDGE & PRE-IMPLEMENTATION INSPECTION RULES:',
     '- If "Retrieved System Knowledge Base" is provided below (e.g. MAQSU ERP architecture, Database Structure, Business Logic, Development Rules, Development History), treat it as authoritative domain guidance and obey ALL Development Rules and "Things to Avoid".',
-    '- INSPECT EXISTING IMPLEMENTATION BEFORE WRITING CODE: When implementing, extending, or fixing an existing ERP/project feature (for example: adding a field, editing a model like `vehicle.visit`, modifying XML views, security ACLs/rules, or integrating Sales/Inventory/Accounting), NEVER guess existing model fields, XML external IDs, `inherit_id` refs, or file paths.',
-    '- If those existing files (`__manifest__.py`, model `.py`, XML views, `security/ir.model.access.csv`, `ir.rule`, or related Sales/Inventory hooks) are NOT already present in Active File or Related Project Files Context:',
-    '  * Return `"searchQueries"` (up to 4 short grep patterns such as `"vehicle.visit"`, `"vehicle_visit"`, `"ir.model.access"`, `"sale.order"`) and/or `"requestedFiles"` (up to 6 known paths) with `"plan": []`, `"fileOperations": []`, `"edits": []`, `"proposedCode": null`, `"targetAction": "none"`.',
-    '  * The IDE will run SSH search & read the matching files automatically and re-invoke you with the real source code!',
-    '- Only stop requesting context once you have inspected the relevant model(s), view(s), security file(s), manifest, and integration points (or if workspace search results already show no workspace/files exist).',
+    '- INSPECT EXISTING IMPLEMENTATION BEFORE WRITING CODE: When implementing, extending, or fixing a specific module feature (e.g. adding a field to `vehicle.visit`, modifying XML views, security ACLs/rules, or Sales/Inventory hooks), do NOT guess existing field names or XML IDs.',
+    '- ONLY if the task requires inspecting/editing existing files that are NOT already in Active File or Related Project Files Context (and NOT for simple greetings, general Q&A, or when active file/knowledge is sufficient):',
+    '  * Return `"searchQueries"` (2–4 targeted grep terms like `"vehicle.visit"`, `"ir.model.access"`) and/or `"requestedFiles"` (up to 4 paths) with `"plan": []`, `"fileOperations": []`, `"edits": []`, `"proposedCode": null`, `"targetAction": "none"`.',
+    '- Once Search Results or Related Files are present, immediately proceed to answer/plan/edit on the next turn without extra inspection rounds.',
   ].join('\n');
 
   const modeRules =
@@ -242,8 +241,8 @@ function buildSystemInstruction(input: CodeAgentInput): string {
     '',
     'OUTPUT SCHEMA (respond ONLY with valid JSON):',
     '{',
-    '  "reply": string (concise technical Markdown; do NOT paste whole unchanged files),',
-    '  "summary": string (< 12 words summarizing plan, inspection request, or changes),',
+    '  "reply": string (CONCISE technical Markdown: 2–6 short sentences or crisp bullets; NEVER write long essays or repeat code from fileOperations/edits),',
+    '  "summary": string (< 10 words),',
     '  "plan": [{"title": string, "description": string, "action": "create-dir" | "create-file" | "edit-file" | "verify", "targetPath": string}],',
     '  "searchQueries": [string],',
     '  "requestedFiles": [string],',
@@ -306,10 +305,10 @@ function buildContextPrompt(input: CodeAgentInput): string {
     parts.push(header);
 
     if (typeof input.fileContent === 'string') {
-      const clipped = input.fileContent.slice(0, 30000);
-      const wasClipped = input.fileContent.length > 30000;
+      const clipped = input.fileContent.slice(0, 24000);
+      const wasClipped = input.fileContent.length > 24000;
       parts.push(
-        `Active File Content${wasClipped ? ' (truncated to 30,000 chars)' : ''}:\n\`\`\`\n${clipped}\n\`\`\``
+        `Active File Content${wasClipped ? ' (truncated to 24,000 chars)' : ''}:\n\`\`\`\n${clipped}\n\`\`\``
       );
     }
   } else {
@@ -318,9 +317,9 @@ function buildContextPrompt(input: CodeAgentInput): string {
 
   if (Array.isArray(input.relatedFiles) && input.relatedFiles.length > 0) {
     const relatedBlocks = input.relatedFiles
-      .slice(0, 12)
+      .slice(0, 8)
       .map((rf) => {
-        const body = (rf.content || '').slice(0, 14000);
+        const body = (rf.content || '').slice(0, 9000);
         return `Related File / Inspection Context: ${rf.path}\n\`\`\`\n${body}\n\`\`\``;
       });
     parts.push(`Related Project Files & Search Context:\n\n${relatedBlocks.join('\n\n')}`);
@@ -703,6 +702,10 @@ async function runWithGemini(input: CodeAgentInput): Promise<CodeAgentResult> {
       contents,
       config: {
         systemInstruction,
+        maxOutputTokens: 4096,
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -852,8 +855,8 @@ async function callGroqChat(
   try {
     const body: Record<string, unknown> = {
       model,
-      temperature: 0.25,
-      max_tokens: 6144,
+      temperature: 0.2,
+      max_tokens: 4096,
       messages,
     };
     if (useJsonFormat) {
