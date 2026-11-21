@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   AlertCircle,
+  BookOpen,
   Bot,
   Check,
   CheckCheck,
@@ -21,6 +22,7 @@ import {
   Play,
   Plus,
   RotateCcw,
+  ScanSearch,
   Send,
   Sparkles,
   Trash2,
@@ -29,6 +31,13 @@ import {
   X,
   Zap,
 } from 'lucide-react';
+import type {
+  ErpWorkspaceScanResult,
+  KnowledgeEntry,
+  WorkspaceSearchMatch,
+} from '../types/knowledge';
+import { KNOWLEDGE_CATEGORY_META } from '../types/knowledge';
+import type { StorageBackendMode } from '../utils/authClient';
 import {
   buildLoadedProjectTreeSummary,
   CodeAgentChatTurn,
@@ -40,6 +49,7 @@ import {
   CodeAgentModelOption,
   CodeAgentPlanStep,
   CodeAgentRelatedFile,
+  CodeAgentRetrievedKnowledgeRef,
   CodeAgentTargetAction,
   CodeAgentTaskMode,
   FALLBACK_CODE_AGENT_MODELS,
@@ -57,8 +67,10 @@ import {
   savePreferredCodeAgentModel,
   TrackedFileChange,
 } from '../utils/codeAgentClient';
-import { formatRelativeDate } from '../utils/markdown';
 import { highlightCodeToHtml } from '../utils/codeHighlight';
+import { fetchKnowledgeEntries } from '../utils/knowledgeClient';
+import { formatRelativeDate } from '../utils/markdown';
+import { KnowledgeTrainingModal } from './KnowledgeTrainingModal';
 import {
   DraggedRemoteEntry,
   getFileIconColorClass,
@@ -101,7 +113,11 @@ export interface CodeAgentPanelProps {
   canUndo: boolean;
   trackedChanges: TrackedFileChange[];
   applyingTrackedChanges?: boolean;
+  storageMode?: StorageBackendMode;
+  userId?: string;
   onReadRemoteFile?: (filePath: string) => Promise<RemoteFilePreview>;
+  onSearchWorkspace?: (queries: string[], rootPath?: string) => Promise<WorkspaceSearchMatch[]>;
+  onScanErpWorkspace?: (rootPath?: string) => Promise<ErpWorkspaceScanResult>;
   onStageFileOperations: (
     operations: CodeAgentFileOperation[],
     turnId: string,
@@ -664,6 +680,90 @@ function ProposedCodeCard({
   );
 }
 
+function RetrievedContextBar({
+  retrievedKnowledge,
+  inspectedFiles,
+}: {
+  retrievedKnowledge?: CodeAgentRetrievedKnowledgeRef[];
+  inspectedFiles?: string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const kbCount = retrievedKnowledge?.length || 0;
+  const fileCount = inspectedFiles?.length || 0;
+  if (kbCount === 0 && fileCount === 0) return null;
+
+  return (
+    <div className="mb-2 rounded-lg border border-white/[0.08] bg-[#10121a] overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((p) => !p)}
+        className="w-full px-2.5 py-1.5 flex items-center justify-between gap-2 text-left text-[10.5px] text-neutral-300 hover:text-white cursor-pointer"
+      >
+        <span className="inline-flex items-center gap-1.5 min-w-0">
+          {open ? (
+            <ChevronDown className="w-3 h-3 text-neutral-400 shrink-0" />
+          ) : (
+            <ChevronRight className="w-3 h-3 text-neutral-400 shrink-0" />
+          )}
+          <BookOpen className="w-3 h-3 text-blue-400 shrink-0" />
+          <span className="truncate">
+            Context used: {kbCount} KB {kbCount === 1 ? 'doc' : 'docs'}
+            {fileCount > 0 ? ` · ${fileCount} inspected file${fileCount === 1 ? '' : 's'}` : ''}
+          </span>
+        </span>
+      </button>
+
+      {open && (
+        <div className="px-2.5 pb-2 pt-1 border-t border-white/[0.06] space-y-1.5 text-[10.5px]">
+          {retrievedKnowledge && retrievedKnowledge.length > 0 && (
+            <div className="space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-neutral-500">
+                Retrieved MAQSU Knowledge
+              </div>
+              {retrievedKnowledge.map((item) => {
+                const meta = KNOWLEDGE_CATEGORY_META[item.category];
+                return (
+                  <div
+                    key={item.id}
+                    className="flex items-start justify-between gap-2 text-neutral-300"
+                  >
+                    <span className="min-w-0 truncate">
+                      <span
+                        className={`inline-block mr-1.5 px-1 py-px rounded border text-[9.5px] ${
+                          meta?.accentClass || 'border-white/15 text-neutral-300'
+                        }`}
+                      >
+                        {meta?.shortLabel || item.category}
+                      </span>
+                      {item.title}
+                    </span>
+                    <span className="text-[10px] text-neutral-500 shrink-0 truncate max-w-[110px]">
+                      {item.reasons[0] || `score ${item.score}`}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {inspectedFiles && inspectedFiles.length > 0 && (
+            <div className="space-y-0.5 pt-1">
+              <div className="text-[10px] uppercase tracking-wider text-neutral-500">
+                SSH Files Inspected
+              </div>
+              {inspectedFiles.map((fp) => (
+                <div key={fp} className="font-mono-code text-[10px] text-sky-300/90 truncate">
+                  {fp}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function CodeAgentPanel({
   width,
   file,
@@ -679,7 +779,11 @@ export function CodeAgentPanel({
   canUndo,
   trackedChanges,
   applyingTrackedChanges = false,
+  storageMode = 'local',
+  userId = 'anonymous',
   onReadRemoteFile,
+  onSearchWorkspace,
+  onScanErpWorkspace,
   onStageFileOperations,
   onReviewTrackedChange,
   onAcceptTrackedChange,
@@ -721,6 +825,10 @@ export function CodeAgentPanel({
   const [lastAppliedTurnId, setLastAppliedTurnId] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<DroppedContextFile[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
+
+  // MAQSU ERP System Knowledge state
+  const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntry[]>([]);
+  const [knowledgeModalOpen, setKnowledgeModalOpen] = useState(false);
 
   const dragDepthRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -764,6 +872,21 @@ export function CodeAgentPanel({
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchKnowledgeEntries(storageMode, userId)
+      .then((loaded) => {
+        if (!active) return;
+        setKnowledgeEntries(loaded);
+      })
+      .catch(() => {
+        // ignore transient load failure
+      });
+    return () => {
+      active = false;
+    };
+  }, [storageMode, userId]);
 
   useEffect(() => {
     if (scrollContainerRef.current) {
@@ -927,12 +1050,20 @@ export function CodeAgentPanel({
       try {
         const activeSelection =
           scopeToSelection && selectedText.trim().length > 0 ? selectedText : undefined;
+        const activeKnowledge = knowledgeEntries.filter((entry) => entry.enabled);
 
         // 1. Seed related files with explicitly dragged-and-dropped context files, then heuristic candidates
         const relatedMap = new Map<string, string>();
+        const inspectedFilesSet = new Set<string>();
+        const collectedSearchQueries: string[] = [];
+
+        if (file?.path) {
+          inspectedFilesSet.add(file.path);
+        }
         for (const att of validAttached) {
           if (att.path && att.path !== file?.path && typeof att.content === 'string') {
             relatedMap.set(att.path, att.content.slice(0, 24000));
+            inspectedFilesSet.add(att.path);
           }
         }
         const initialCandidates = findCandidateRelatedFiles(
@@ -940,9 +1071,12 @@ export function CodeAgentPanel({
           file && !file.isBinary ? draft : undefined,
           text,
           dirCache,
-          5
+          6
         );
         await gatherRelatedFiles(initialCandidates, relatedMap);
+        for (const key of relatedMap.keys()) {
+          if (!key.startsWith('[')) inspectedFilesSet.add(key);
+        }
 
         const buildRelatedPayload = (): CodeAgentRelatedFile[] =>
           Array.from(relatedMap.entries()).map(([p, c]) => ({ path: p, content: c }));
@@ -954,59 +1088,122 @@ export function CodeAgentPanel({
                 .join(', ')}]\n\n${text}`
             : text;
 
-        let res = await requestCodeAgent({
-          prompt: promptWithAttachments,
-          model: selectedModel,
-          taskMode,
-          agentMode: effectiveMode,
-          filePath: file?.path,
-          fileName: file?.name,
-          language: file ? languageLabel : undefined,
-          fileContent: file && !file.isBinary ? draft : undefined,
-          selectedCode: activeSelection,
-          selectionLineRange: activeSelection ? selectionRangeLabel || undefined : undefined,
-          cursorLine: file ? cursorLine : undefined,
-          rootPath: currentRemotePath || undefined,
-          projectTree: projectTreeSummary || undefined,
-          relatedFiles: buildRelatedPayload(),
-          history: historyPayload,
-        });
+        const runAgentPass = () =>
+          requestCodeAgent({
+            prompt: promptWithAttachments,
+            model: selectedModel,
+            taskMode,
+            agentMode: effectiveMode,
+            filePath: file?.path,
+            fileName: file?.name,
+            language: file ? languageLabel : undefined,
+            fileContent: file && !file.isBinary ? draft : undefined,
+            selectedCode: activeSelection,
+            selectionLineRange: activeSelection ? selectionRangeLabel || undefined : undefined,
+            cursorLine: file ? cursorLine : undefined,
+            rootPath: currentRemotePath || undefined,
+            projectTree: projectTreeSummary || undefined,
+            relatedFiles: buildRelatedPayload(),
+            knowledgeEntries: activeKnowledge,
+            history: historyPayload,
+          });
 
-        // 2. If AI explicitly requests additional project files to inspect, read them via SSH and re-run once
-        if (
-          res.requestedFiles &&
-          res.requestedFiles.length > 0 &&
-          onReadRemoteFile &&
-          (!res.fileOperations || res.fileOperations.length === 0) &&
-          (!res.plan || res.plan.length === 0)
-        ) {
-          const prevSize = relatedMap.size;
-          setLoadingStatus(
-            `Reading ${res.requestedFiles.length} related file${
-              res.requestedFiles.length === 1 ? '' : 's'
-            }...`
-          );
-          await gatherRelatedFiles(res.requestedFiles, relatedMap);
-          if (relatedMap.size > prevSize) {
-            setLoadingStatus('Generating targeted updates across files...');
-            res = await requestCodeAgent({
-              prompt: promptWithAttachments,
-              model: selectedModel,
-              taskMode,
-              agentMode: effectiveMode,
-              filePath: file?.path,
-              fileName: file?.name,
-              language: file ? languageLabel : undefined,
-              fileContent: file && !file.isBinary ? draft : undefined,
-              selectedCode: activeSelection,
-              selectionLineRange: activeSelection ? selectionRangeLabel || undefined : undefined,
-              cursorLine: file ? cursorLine : undefined,
-              rootPath: currentRemotePath || undefined,
-              projectTree: projectTreeSummary || undefined,
-              relatedFiles: buildRelatedPayload(),
-              history: historyPayload,
-            });
+        let res = await runAgentPass();
+
+        // 2. Multi-pass live SSH inspection loop: execute searchQueries + requestedFiles before final output
+        for (let pass = 0; pass < 2; pass += 1) {
+          const hasRequestedFiles = Boolean(res.requestedFiles && res.requestedFiles.length > 0);
+          const hasSearchQueries = Boolean(res.searchQueries && res.searchQueries.length > 0);
+          const hasFinalOutput =
+            Boolean(res.fileOperations && res.fileOperations.length > 0) ||
+            Boolean(res.plan && res.plan.length > 0);
+
+          if ((!hasRequestedFiles && !hasSearchQueries) || hasFinalOutput) {
+            break;
           }
+
+          let gatheredNewContext = false;
+
+          if (hasSearchQueries && onSearchWorkspace && res.searchQueries) {
+            const freshQueries = res.searchQueries
+              .map((q) => q.trim())
+              .filter((q) => q && !collectedSearchQueries.includes(q))
+              .slice(0, 6);
+
+            if (freshQueries.length > 0) {
+              collectedSearchQueries.push(...freshQueries);
+              setLoadingStatus(
+                `Searching ERP codebase (${freshQueries.slice(0, 2).join(', ')})...`
+              );
+              try {
+                const matches = await onSearchWorkspace(
+                  freshQueries,
+                  currentRemotePath || undefined
+                );
+                if (matches.length > 0) {
+                  const searchSummary = matches
+                    .map((m) => `${m.path}:${m.line}: ${m.snippet}`)
+                    .join('\n');
+                  const searchKey = `[Workspace Search Results #${pass + 1}]`;
+                  if (!relatedMap.has(searchKey)) {
+                    relatedMap.set(searchKey, searchSummary.slice(0, 14000));
+                    gatheredNewContext = true;
+                  }
+
+                  // Automatically read top unique matched implementation files via SSH
+                  if (onReadRemoteFile) {
+                    const matchedPaths: string[] = [];
+                    const seenMatchPaths = new Set<string>();
+                    for (const m of matches) {
+                      if (
+                        m.path &&
+                        !seenMatchPaths.has(m.path) &&
+                        !relatedMap.has(m.path) &&
+                        m.path !== file?.path
+                      ) {
+                        seenMatchPaths.add(m.path);
+                        matchedPaths.push(m.path);
+                        if (matchedPaths.length >= 5) break;
+                      }
+                    }
+                    if (matchedPaths.length > 0) {
+                      const beforeSize = relatedMap.size;
+                      await gatherRelatedFiles(matchedPaths, relatedMap);
+                      if (relatedMap.size > beforeSize) {
+                        gatheredNewContext = true;
+                      }
+                    }
+                  }
+                }
+              } catch {
+                // continue with any requestedFiles
+              }
+            }
+          }
+
+          if (hasRequestedFiles && onReadRemoteFile && res.requestedFiles) {
+            const beforeSize = relatedMap.size;
+            setLoadingStatus(
+              `Inspecting ${res.requestedFiles.length} existing file${
+                res.requestedFiles.length === 1 ? '' : 's'
+              } via SSH...`
+            );
+            await gatherRelatedFiles(res.requestedFiles, relatedMap);
+            if (relatedMap.size > beforeSize) {
+              gatheredNewContext = true;
+            }
+          }
+
+          for (const key of relatedMap.keys()) {
+            if (!key.startsWith('[')) inspectedFilesSet.add(key);
+          }
+
+          if (!gatheredNewContext) {
+            break;
+          }
+
+          setLoadingStatus('Synthesizing plan & changes from existing code...');
+          res = await runAgentPass();
         }
 
         const turnId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1029,6 +1226,9 @@ export function CodeAgentPanel({
           model: res.model,
           provider: res.provider,
           fileNameHint: file?.name,
+          retrievedKnowledge: res.retrievedKnowledge,
+          inspectedFiles: Array.from(inspectedFilesSet),
+          searchQueries: collectedSearchQueries.length > 0 ? collectedSearchQueries : undefined,
         };
 
         updateActiveSession((sess) => ({
@@ -1081,7 +1281,9 @@ export function CodeAgentPanel({
       selectionRangeLabel,
       cursorLine,
       projectTreeSummary,
+      knowledgeEntries,
       onReadRemoteFile,
+      onSearchWorkspace,
       onStageFileOperations,
       isEditable,
       onStageInlineDiff,
@@ -1351,6 +1553,22 @@ export function CodeAgentPanel({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={() => setKnowledgeModalOpen(true)}
+            title="Train & manage MAQSU ERP System Knowledge Base"
+            className={`inline-flex items-center gap-1 px-1.5 py-1 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+              knowledgeEntries.some((e) => e.enabled)
+                ? 'border border-blue-500/35 bg-blue-500/12 text-blue-200 hover:bg-blue-500/20'
+                : 'border border-white/10 text-neutral-300 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            <BookOpen className="w-3 h-3 text-blue-400 shrink-0" />
+            <span>KB</span>
+            <span className="font-mono-code text-[10px] opacity-80">
+              ({knowledgeEntries.filter((e) => e.enabled).length})
+            </span>
+          </button>
           <button
             type="button"
             onClick={handleNewChat}
@@ -1664,18 +1882,33 @@ export function CodeAgentPanel({
           <div className="rounded-xl border border-white/[0.08] bg-[#16161d] p-3.5 space-y-2.5">
             <div className="flex items-center gap-2 text-[12.5px] font-medium text-white">
               <Wrench className="w-4 h-4 text-blue-400 shrink-0" />
-              <span>Multi-File Code Development Agent</span>
+              <span>MAQSU ERP Code Development Agent</span>
             </div>
             <p className="text-[12px] text-neutral-400 leading-relaxed">
               Work across{' '}
               <span className="font-mono-code text-neutral-200">
                 {file ? file.name : currentRemotePath || 'this workspace'}
               </span>{' '}
-              and related project files. Drag and drop any file here to attach it as context, use{' '}
-              <strong className="text-neutral-200">Plan</strong> to review a step-by-step
-              architecture plan first, or <strong className="text-neutral-200">Auto</strong> to
-              generate multi-file diffs, new folders, and new files directly.
+              with MAQSU ERP system knowledge, live codebase inspection, and multi-file editing.
             </p>
+            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              <button
+                type="button"
+                onClick={() => setKnowledgeModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-blue-500/35 bg-blue-500/12 hover:bg-blue-500/20 text-blue-200 text-[11.5px] font-medium cursor-pointer"
+              >
+                {onScanErpWorkspace ? (
+                  <ScanSearch className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <BookOpen className="w-3.5 h-3.5 text-blue-400" />
+                )}
+                <span>
+                  {knowledgeEntries.length > 0
+                    ? `Manage MAQSU Knowledge (${knowledgeEntries.filter((e) => e.enabled).length} active)`
+                    : 'Train AI on MAQSU ERP'}
+                </span>
+              </button>
+            </div>
           </div>
         ) : (
           messages.map((msg) =>
@@ -1724,6 +1957,11 @@ export function CodeAgentPanel({
                     <span className="font-mono-code truncate max-w-[150px]">{msg.model}</span>
                   )}
                 </div>
+
+                <RetrievedContextBar
+                  retrievedKnowledge={msg.retrievedKnowledge}
+                  inspectedFiles={msg.inspectedFiles}
+                />
 
                 <div className="space-y-2 leading-relaxed break-words">
                   <ReactMarkdown
@@ -1982,6 +2220,17 @@ export function CodeAgentPanel({
           </div>
         </form>
       </div>
+
+      <KnowledgeTrainingModal
+        open={knowledgeModalOpen}
+        storageMode={storageMode}
+        userId={userId}
+        currentRemotePath={currentRemotePath}
+        entries={knowledgeEntries}
+        onEntriesChanged={setKnowledgeEntries}
+        onScanErpWorkspace={onScanErpWorkspace}
+        onClose={() => setKnowledgeModalOpen(false)}
+      />
     </aside>
   );
 }

@@ -148,6 +148,25 @@ export async function ensureSchema(pool: Pool): Promise<void> {
           created_at BIGINT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          system_name TEXT NOT NULL DEFAULT 'MAQSU ERP',
+          category TEXT NOT NULL DEFAULT 'business_logic',
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL,
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          module_name TEXT,
+          models_json TEXT NOT NULL DEFAULT '[]',
+          file_paths_json TEXT NOT NULL DEFAULT '[]',
+          source_type TEXT NOT NULL DEFAULT 'manual',
+          workspace_root TEXT,
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        );
+
         ALTER TABLE folders ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
         ALTER TABLE notes ADD COLUMN IF NOT EXISTS share_token TEXT;
@@ -166,6 +185,7 @@ export async function ensureSchema(pool: Pool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_note_shares_note_id ON note_shares(note_id);
         CREATE INDEX IF NOT EXISTS idx_ssh_profiles_user_id ON ssh_profiles(user_id);
         CREATE INDEX IF NOT EXISTS idx_database_profiles_user_id ON database_profiles(user_id);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entries_user_id ON knowledge_entries(user_id);
       `);
 
       schemaInitialized = true;

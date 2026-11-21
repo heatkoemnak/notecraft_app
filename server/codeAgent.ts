@@ -1,4 +1,5 @@
 import { GoogleGenAI, Type } from '@google/genai';
+import type { RetrievedKnowledgeItem } from './erpKnowledge.ts';
 import {
   getConfiguredGroqApiKey,
   getDefaultGroqModel,
@@ -81,6 +82,8 @@ export interface CodeAgentInput {
   rootPath?: string;
   projectTree?: string;
   relatedFiles?: CodeAgentRelatedFile[];
+  knowledgeContext?: RetrievedKnowledgeItem[];
+  knowledgeCatalog?: string;
   history?: CodeAgentMessage[];
 }
 
@@ -90,6 +93,14 @@ export interface CodeAgentResult {
   plan: CodeAgentPlanStep[];
   fileOperations: CodeAgentFileOperation[];
   requestedFiles: string[];
+  searchQueries: string[];
+  retrievedKnowledge?: Array<{
+    id: string;
+    title: string;
+    category: RetrievedKnowledgeItem['category'];
+    score: number;
+    reasons: string[];
+  }>;
   edits: CodeAgentEditHunk[];
   proposedCode: string | null;
   summary: string;
@@ -184,24 +195,34 @@ function buildSystemInstruction(input: CodeAgentInput): string {
   const agentMode: CodeAgentMode = input.agentMode === 'plan' ? 'plan' : 'auto';
   const hasFile = Boolean(input.fileName?.trim() || input.filePath?.trim());
 
+  const inspectionRules = [
+    'MANDATORY SYSTEM KNOWLEDGE & PRE-IMPLEMENTATION INSPECTION RULES:',
+    '- If "Retrieved System Knowledge Base" is provided below (e.g. MAQSU ERP architecture, Database Structure, Business Logic, Development Rules, Development History), treat it as authoritative domain guidance and obey ALL Development Rules and "Things to Avoid".',
+    '- INSPECT EXISTING IMPLEMENTATION BEFORE WRITING CODE: When implementing, extending, or fixing an existing ERP/project feature (for example: adding a field, editing a model like `vehicle.visit`, modifying XML views, security ACLs/rules, or integrating Sales/Inventory/Accounting), NEVER guess existing model fields, XML external IDs, `inherit_id` refs, or file paths.',
+    '- If those existing files (`__manifest__.py`, model `.py`, XML views, `security/ir.model.access.csv`, `ir.rule`, or related Sales/Inventory hooks) are NOT already present in Active File or Related Project Files Context:',
+    '  * Return `"searchQueries"` (up to 4 short grep patterns such as `"vehicle.visit"`, `"vehicle_visit"`, `"ir.model.access"`, `"sale.order"`) and/or `"requestedFiles"` (up to 6 known paths) with `"plan": []`, `"fileOperations": []`, `"edits": []`, `"proposedCode": null`, `"targetAction": "none"`.',
+    '  * The IDE will run SSH search & read the matching files automatically and re-invoke you with the real source code!',
+    '- Only stop requesting context once you have inspected the relevant model(s), view(s), security file(s), manifest, and integration points (or if workspace search results already show no workspace/files exist).',
+  ].join('\n');
+
   const modeRules =
     agentMode === 'plan'
       ? [
           'ACTIVE WORKSPACE MODE: PLAN MODE',
           '- Do NOT write code edits yet (`fileOperations`: [], `edits`: [], `proposedCode`: null, `targetAction`: "none").',
-          '- Instead, analyze the request, active file, related files, and directory tree, then output a concrete step-by-step implementation plan in `"plan"`.',
+          '- First, if you need to inspect existing codebase files (models, XML views, security CSVs, manifests, integration hooks) before finalizing an accurate plan, emit `"searchQueries"` and/or `"requestedFiles"` with `"plan": []`.',
+          '- Otherwise, output a concrete step-by-step implementation plan in `"plan"` covering models/fields, PostgreSQL/migration impact, XML views, security/ACLs, `__manifest__.py` dependencies, and cross-module integrations (Sales, Inventory, Accounting, etc.).',
           '- Every step in `"plan"` must specify `"title"`, `"description"`, `"action"` ("create-dir" | "create-file" | "edit-file" | "verify"), and `"targetPath"` (POSIX path or relative path from workspace root).',
-          '- Summarize the architecture, files/folders to create or update, and any trade-offs in `"reply"`.',
-          '- If you need to inspect other existing files from the tree before finalizing your plan, list up to 5 paths in `"requestedFiles"` (only paths not already provided in Related Files Context).',
+          '- Summarize the architecture, impacted models/modules, and any trade-offs in `"reply"`.',
         ].join('\n')
       : [
           'ACTIVE WORKSPACE MODE: AUTO MODE',
-          '- Produce concrete, reviewable changes directly in `"fileOperations"` (and `"plan": []`).',
-          '- MULTI-FILE UPDATES: If updating the active file also requires updating imports, types, callers, routes, or styles in OTHER files, include an entry in `"fileOperations"` for EACH affected file!',
-          '- NEED MORE FILE CONTEXT FIRST? If you need the exact contents of existing project files from the Project Explorer Tree (that are not already in Related Files Context) before writing accurate `oldCode` search blocks, return `"requestedFiles": ["path/to/file1", ...]` (max 5 paths) with `"fileOperations": []` so the IDE can automatically fetch them and re-invoke you.',
+          '- Produce concrete, reviewable changes directly in `"fileOperations"` (and `"plan": []`) AFTER inspecting existing files.',
+          '- MULTI-FILE UPDATES: If updating a feature requires changes across Python models, XML views, `security/ir.model.access.csv`, `__manifest__.py`, or related modules (e.g. Sales/Inventory hooks), include an entry in `"fileOperations"` for EACH affected file!',
+          '- NEED MORE FILE CONTEXT FIRST? Return `"searchQueries": ["term1", ...]` and/or `"requestedFiles": ["path/to/file1", ...]` with `"fileOperations": []`, `"edits": []`, `"proposedCode": null`, `"targetAction": "none"` so the IDE fetches matching files via SSH and re-invokes you automatically.',
           '- FOLDER & FILE CREATION: Whenever creating new folders or files is helpful or required:',
           '  * Include `{"operation": "create-dir", "path": "relative/or/abs/dir", "description": "..."}` when creating a standalone directory.',
-          '  * Include `{"operation": "create-file", "path": "relative/or/abs/file.ts", "description": "...", "content": "..."}` when creating a new file (missing parent folders are created automatically).',
+          '  * Include `{"operation": "create-file", "path": "relative/or/abs/file.py", "description": "...", "content": "..."}` when creating a new file (missing parent folders are created automatically).',
           '- TARGETED EDIT HUNKS (DO NOT REWRITE UNCHANGED LINES):',
           '  * For modifying any existing file (active file or related file), use `{"operation": "edit-file", "path": "...", "description": "...", "edits": [{"oldCode": "...", "newCode": "...", "description": "..."}]}`.',
           '  * Each `"oldCode"` MUST copy the exact verbatim existing lines from the provided file content (including indentation and 1–2 surrounding context lines if needed to match uniquely) and `"newCode"` MUST contain ONLY the updated lines.',
@@ -212,16 +233,19 @@ function buildSystemInstruction(input: CodeAgentInput): string {
         ].join('\n');
 
   return [
-    'You are an expert senior software engineer and AI coding agent embedded inside a remote SSH code editor.',
+    'You are an expert senior software engineer and ERP architect embedded inside a remote SSH code editor.',
     `TASK FOCUS: ${TASK_GUIDANCE[taskMode]}`,
+    '',
+    inspectionRules,
     '',
     modeRules,
     '',
     'OUTPUT SCHEMA (respond ONLY with valid JSON):',
     '{',
     '  "reply": string (concise technical Markdown; do NOT paste whole unchanged files),',
-    '  "summary": string (< 12 words summarizing plan or changes),',
+    '  "summary": string (< 12 words summarizing plan, inspection request, or changes),',
     '  "plan": [{"title": string, "description": string, "action": "create-dir" | "create-file" | "edit-file" | "verify", "targetPath": string}],',
+    '  "searchQueries": [string],',
     '  "requestedFiles": [string],',
     '  "fileOperations": [{',
     '    "operation": "edit-file" | "create-file" | "create-dir",',
@@ -242,6 +266,26 @@ function buildSystemInstruction(input: CodeAgentInput): string {
 
 function buildContextPrompt(input: CodeAgentInput): string {
   const parts: string[] = [];
+
+  if (input.knowledgeContext && input.knowledgeContext.length > 0) {
+    const kbBlocks = input.knowledgeContext.map((k) => {
+      const meta = [
+        `Category: ${k.category}`,
+        k.moduleName ? `Module: ${k.moduleName}` : '',
+        k.models && k.models.length > 0 ? `Models: ${k.models.join(', ')}` : '',
+        k.filePaths && k.filePaths.length > 0 ? `Paths: ${k.filePaths.join(', ')}` : '',
+        k.reasons.length > 0 ? `Matched: ${k.reasons.join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join(' | ');
+      return `### ${k.title}\n(${meta})\n${k.content}`;
+    });
+    parts.push(`Retrieved System Knowledge Base:\n\n${kbBlocks.join('\n\n')}`);
+  }
+
+  if (input.knowledgeCatalog?.trim()) {
+    parts.push(`System Knowledge Catalog (All Trained Topics):\n${input.knowledgeCatalog.trim()}`);
+  }
 
   if (input.rootPath?.trim()) {
     parts.push(`Remote Workspace Root: ${input.rootPath.trim()}`);
@@ -274,12 +318,12 @@ function buildContextPrompt(input: CodeAgentInput): string {
 
   if (Array.isArray(input.relatedFiles) && input.relatedFiles.length > 0) {
     const relatedBlocks = input.relatedFiles
-      .slice(0, 6)
+      .slice(0, 12)
       .map((rf) => {
         const body = (rf.content || '').slice(0, 14000);
-        return `Related File: ${rf.path}\n\`\`\`\n${body}\n\`\`\``;
+        return `Related File / Inspection Context: ${rf.path}\n\`\`\`\n${body}\n\`\`\``;
       });
-    parts.push(`Related Project Files Context:\n\n${relatedBlocks.join('\n\n')}`);
+    parts.push(`Related Project Files & Search Context:\n\n${relatedBlocks.join('\n\n')}`);
   }
 
   if (input.selectedCode?.trim()) {
@@ -408,6 +452,21 @@ function sanitizeRequestedFiles(rawFiles: unknown): string[] {
     if (!clean || seen.has(clean)) continue;
     seen.add(clean);
     out.push(clean);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function sanitizeSearchQueries(rawQueries: unknown): string[] {
+  if (!Array.isArray(rawQueries)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const q of rawQueries) {
+    if (typeof q !== 'string') continue;
+    const clean = q.trim().slice(0, 120);
+    if (!clean || seen.has(clean.toLowerCase())) continue;
+    seen.add(clean.toLowerCase());
+    out.push(clean);
     if (out.length >= 5) break;
   }
   return out;
@@ -453,6 +512,14 @@ function parseAgentPayload(
   const mode: CodeAgentMode = input.agentMode === 'plan' ? 'plan' : 'auto';
   const hasFile = Boolean(input.fileName || input.filePath);
 
+  const retrievedKnowledgeMeta = input.knowledgeContext?.map((k) => ({
+    id: k.id,
+    title: k.title,
+    category: k.category,
+    score: k.score,
+    reasons: k.reasons,
+  }));
+
   let parsed: Record<string, unknown>;
   try {
     parsed = extractJsonObject(rawText);
@@ -464,6 +531,8 @@ function parseAgentPayload(
       plan: [],
       fileOperations: [],
       requestedFiles: [],
+      searchQueries: [],
+      retrievedKnowledge: retrievedKnowledgeMeta,
       edits: [],
       proposedCode: null,
       summary: 'AI response',
@@ -481,6 +550,7 @@ function parseAgentPayload(
 
   const plan = sanitizePlanSteps(parsed.plan);
   const requestedFiles = sanitizeRequestedFiles(parsed.requestedFiles);
+  const searchQueries = sanitizeSearchQueries(parsed.searchQueries);
 
   if (mode === 'plan') {
     const summary =
@@ -496,6 +566,8 @@ function parseAgentPayload(
       plan,
       fileOperations: [],
       requestedFiles,
+      searchQueries,
+      retrievedKnowledge: retrievedKnowledgeMeta,
       edits: [],
       proposedCode: null,
       summary,
@@ -569,6 +641,8 @@ function parseAgentPayload(
       ? `Proposed ${edits.length} targeted update${edits.length === 1 ? '' : 's'}`
       : proposedCode
       ? 'Prepared code update'
+      : searchQueries.length > 0 || requestedFiles.length > 0
+      ? 'Inspecting existing implementation'
       : 'Answered coding question';
 
   return {
@@ -577,6 +651,8 @@ function parseAgentPayload(
     plan,
     fileOperations,
     requestedFiles,
+    searchQueries,
+    retrievedKnowledge: retrievedKnowledgeMeta,
     edits,
     proposedCode,
     summary,
@@ -650,6 +726,10 @@ async function runWithGemini(input: CodeAgentInput): Promise<CodeAgentResult> {
               },
             },
             requestedFiles: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+            searchQueries: {
               type: Type.ARRAY,
               items: { type: Type.STRING },
             },

@@ -1,4 +1,5 @@
 import type { RemoteDirEntry } from '../components/ProjectTreeView';
+import type { KnowledgeCategory, KnowledgeEntry } from '../types/knowledge';
 import type { PendingDiffHunk } from './codeDiff';
 
 export type CodeAgentTaskMode =
@@ -81,7 +82,16 @@ export interface CodeAgentRequest {
   rootPath?: string;
   projectTree?: string;
   relatedFiles?: CodeAgentRelatedFile[];
+  knowledgeEntries?: KnowledgeEntry[];
   history?: CodeAgentMessage[];
+}
+
+export interface CodeAgentRetrievedKnowledgeRef {
+  id: string;
+  title: string;
+  category: KnowledgeCategory;
+  score: number;
+  reasons: string[];
 }
 
 export interface CodeAgentResponse {
@@ -90,6 +100,8 @@ export interface CodeAgentResponse {
   plan?: CodeAgentPlanStep[];
   fileOperations?: CodeAgentFileOperation[];
   requestedFiles?: string[];
+  searchQueries?: string[];
+  retrievedKnowledge?: CodeAgentRetrievedKnowledgeRef[];
   edits?: CodeAgentEditHunk[];
   proposedCode: string | null;
   summary: string;
@@ -131,6 +143,9 @@ export interface CodeAgentChatTurn {
   provider?: 'gemini' | 'groq';
   fileNameHint?: string;
   attachedFiles?: Array<{ name: string; path: string }>;
+  retrievedKnowledge?: CodeAgentRetrievedKnowledgeRef[];
+  inspectedFiles?: string[];
+  searchQueries?: string[];
 }
 
 export interface CodeAgentHistorySession {

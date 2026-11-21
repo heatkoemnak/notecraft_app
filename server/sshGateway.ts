@@ -70,6 +70,17 @@ type ClientMessage =
       payload?: unknown;
     }
   | {
+      type: 'searchWorkspace';
+      requestId?: unknown;
+      rootPath?: unknown;
+      queries?: unknown;
+    }
+  | {
+      type: 'scanErpWorkspace';
+      requestId?: unknown;
+      rootPath?: unknown;
+    }
+  | {
       type: 'disconnect';
     }
   | {
@@ -1695,6 +1706,301 @@ export function attachSshWebSocketServer(
               requestId,
               action,
               error: err instanceof Error ? err.message : 'Git command failed.',
+            });
+          }
+        })();
+        return;
+      }
+
+      if (msg.type === 'searchWorkspace') {
+        const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+        const rawRoot = typeof msg.rootPath === 'string' ? msg.rootPath.trim() : '';
+        const queries = Array.isArray(msg.queries)
+          ? msg.queries
+              .filter((q): q is string => typeof q === 'string' && q.trim().length > 0)
+              .map((q) => q.trim().slice(0, 120))
+              .slice(0, 5)
+          : [];
+
+        void (async () => {
+          try {
+            if (!sshClient) {
+              throw new Error('SSH is not connected.');
+            }
+            if (queries.length === 0) {
+              emitJson({ type: 'searchWorkspaceResult', requestId, matches: [] });
+              return;
+            }
+            let rootDir = '';
+            try {
+              const sftp = await getSftp();
+              rootDir = await resolveSftpPath(sftp, rawRoot || '~');
+            } catch {
+              rootDir = await resolvePathShell(rawRoot || '~');
+            }
+
+            const payloadB64 = Buffer.from(
+              JSON.stringify({ rootDir, queries }),
+              'utf8'
+            ).toString('base64');
+
+            const pySearchScript = [
+              `import os, sys, json, base64, re`,
+              `cfg = json.loads(base64.b64decode('${payloadB64}').decode('utf-8'))`,
+              `root = cfg['rootDir']`,
+              `queries = [q.lower() for q in cfg['queries'] if q.strip()]`,
+              `SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', '.idea', '.vscode'}`,
+              `ALLOWED_EXT = {'.py', '.xml', '.csv', '.js', '.jsx', '.ts', '.tsx', '.json', '.yml', '.yaml', '.conf', '.cfg', '.ini', '.md', '.sql', '.sh'}`,
+              `matches = []`,
+              `file_hits = []`,
+              `for dirpath, dirnames, filenames in os.walk(root):`,
+              `    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.git')]`,
+              `    for fname in filenames:`,
+              `        ext = os.path.splitext(fname)[1].lower()`,
+              `        if ext not in ALLOWED_EXT and fname not in ('__manifest__.py', 'odoo.conf', 'Dockerfile'): continue`,
+              `        fpath = os.path.join(dirpath, fname)`,
+              `        low_path = fpath.lower()`,
+              `        if any(q in low_path for q in queries) and len(file_hits) < 20:`,
+              `            file_hits.append({'path': fpath, 'line': 1, 'snippet': '[filename match] ' + os.path.relpath(fpath, root)})`,
+              `        try:`,
+              `            if os.path.getsize(fpath) > 350000: continue`,
+              `            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:`,
+              `                for idx, line in enumerate(f, 1):`,
+              `                    low_line = line.lower()`,
+              `                    if any(q in low_line for q in queries):`,
+              `                        matches.append({'path': fpath, 'line': idx, 'snippet': line.strip()[:180]})`,
+              `                        if len(matches) >= 45: break`,
+              `        except Exception:`,
+              `            pass`,
+              `        if len(matches) >= 45: break`,
+              `    if len(matches) >= 45: break`,
+              `combined = matches + [h for h in file_hits if not any(m['path'] == h['path'] for m in matches)]`,
+              `print(json.dumps({'matches': combined[:50]}))`,
+            ].join('\n');
+
+            const pyRes = await execOnSsh(`python3 -c ${quoteShellArg(pySearchScript)}`, 25000);
+            if (pyRes.code === 0 && pyRes.stdout.trim().startsWith('{')) {
+              const parsed = JSON.parse(pyRes.stdout.trim()) as {
+                matches?: Array<{ path: string; line: number; snippet: string }>;
+              };
+              emitJson({
+                type: 'searchWorkspaceResult',
+                requestId,
+                matches: Array.isArray(parsed.matches) ? parsed.matches : [],
+              });
+              return;
+            }
+
+            // POSIX grep fallback if python3 is unavailable
+            const pattern = queries
+              .map((q) => q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+              .join('\\|');
+            const grepCmd = `cd ${quoteShellArg(rootDir)} && grep -rnIi -E ${quoteShellArg(
+              pattern
+            )} --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=__pycache__ --exclude-dir=.venv . | head -n 45`;
+            const grepRes = await execOnSsh(grepCmd, 20000);
+            const fallbackMatches = (grepRes.stdout || '')
+              .split('\n')
+              .map((line) => {
+                const m = /^(.+?):(\d+):(.*)$/.exec(line);
+                if (!m) return null;
+                const rel = m[1].replace(/^\.\//, '');
+                return {
+                  path: path.posix.join(rootDir, rel),
+                  line: Number(m[2]) || 1,
+                  snippet: (m[3] || '').trim().slice(0, 180),
+                };
+              })
+              .filter(Boolean);
+            emitJson({
+              type: 'searchWorkspaceResult',
+              requestId,
+              matches: fallbackMatches,
+            });
+          } catch (err) {
+            emitJson({
+              type: 'searchWorkspaceError',
+              requestId,
+              error: err instanceof Error ? err.message : 'Workspace search failed.',
+            });
+          }
+        })();
+        return;
+      }
+
+      if (msg.type === 'scanErpWorkspace') {
+        const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+        const rawRoot = typeof msg.rootPath === 'string' ? msg.rootPath.trim() : '';
+
+        void (async () => {
+          try {
+            if (!sshClient) {
+              throw new Error('SSH is not connected.');
+            }
+            let rootDir = '';
+            try {
+              const sftp = await getSftp();
+              rootDir = await resolveSftpPath(sftp, rawRoot || '~');
+            } catch {
+              rootDir = await resolvePathShell(rawRoot || '~');
+            }
+
+            const payloadB64 = Buffer.from(JSON.stringify({ rootDir }), 'utf8').toString('base64');
+            const pyScanScript = [
+              `import os, sys, json, base64, ast, csv, re, subprocess, xml.etree.ElementTree as ET`,
+              `cfg = json.loads(base64.b64decode('${payloadB64}').decode('utf-8'))`,
+              `root = cfg['rootDir']`,
+              `SKIP = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build', '.eggs'}`,
+              `result = {'rootPath': root, 'gitRemote': '', 'gitBranch': '', 'gitBranches': [], 'recentCommits': [], 'configFiles': [], 'modules': [], 'models': [], 'views': [], 'accessRules': [], 'recordRules': []}`,
+              `def run_git(args):`,
+              `    try:`,
+              `        out = subprocess.check_output(['git', '-C', root] + args, stderr=subprocess.DEVNULL, timeout=5)`,
+              `        return out.decode('utf-8', 'ignore').strip()`,
+              `    except Exception:`,
+              `        return ''`,
+              `result['gitRemote'] = run_git(['remote', 'get-url', 'origin'])`,
+              `result['gitBranch'] = run_git(['rev-parse', '--abbrev-ref', 'HEAD'])`,
+              `branches_raw = run_git(['branch', '-a'])`,
+              `if branches_raw:`,
+              `    result['gitBranches'] = [b.strip() for b in branches_raw.splitlines() if b.strip()][:30]`,
+              `log_raw = run_git(['log', '-n', '35', '--date=short', '--pretty=format:%h%x1f%ad%x1f%an%x1f%s'])`,
+              `if log_raw:`,
+              `    for line in log_raw.splitlines():`,
+              `        parts = line.split('\\x1f')`,
+              `        if len(parts) >= 4:`,
+              `            result['recentCommits'].append({'hash': parts[0], 'date': parts[1], 'author': parts[2], 'subject': parts[3]})`,
+              `for dirpath, dirnames, filenames in os.walk(root):`,
+              `    dirnames[:] = [d for d in dirnames if d not in SKIP]`,
+              `    for fname in filenames:`,
+              `        if fname in ('odoo.conf', 'openerp-server.conf', 'requirements.txt', 'docker-compose.yml', 'docker-compose.yaml') or fname.endswith('.conf'):`,
+              `            fp = os.path.join(dirpath, fname)`,
+              `            if len(result['configFiles']) < 10:`,
+              `                try:`,
+              `                    if os.path.getsize(fp) < 100000:`,
+              `                        with open(fp, 'r', encoding='utf-8', errors='ignore') as cf:`,
+              `                            txt = cf.read(2000)`,
+              `                            if any(k in txt for k in ('addons_path', 'db_name', 'services:', 'odoo', 'psycopg')) or fname == 'requirements.txt':`,
+              `                                result['configFiles'].append({'path': fp, 'snippet': txt[:1400]})`,
+              `                except Exception: pass`,
+              `    if '__manifest__.py' in filenames or '__openerp__.py' in filenames:`,
+              `        mfile = '__manifest__.py' if '__manifest__.py' in filenames else '__openerp__.py'`,
+              `        mpath = os.path.join(dirpath, mfile)`,
+              `        mod_name = os.path.basename(dirpath)`,
+              `        try:`,
+              `            with open(mpath, 'r', encoding='utf-8', errors='ignore') as mf:`,
+              `                manifest = ast.literal_eval(mf.read())`,
+              `        except Exception:`,
+              `            manifest = {}`,
+              `        if not isinstance(manifest, dict): manifest = {}`,
+              `        py_cnt = 0; xml_cnt = 0; js_cnt = 0`,
+              `        for mdp, mdns, mfns in os.walk(dirpath):`,
+              `            mdns[:] = [d for d in mdns if d not in SKIP]`,
+              `            for fn in mfns:`,
+              `                full_fn = os.path.join(mdp, fn)`,
+              `                if fn.endswith('.py'):`,
+              `                    py_cnt += 1`,
+              `                    if len(result['models']) < 160 and os.path.getsize(full_fn) < 250000:`,
+              `                        try:`,
+              `                            with open(full_fn, 'r', encoding='utf-8', errors='ignore') as pf:`,
+              `                                src = pf.read()`,
+              `                            if 'models.Model' in src or 'models.TransientModel' in src or 'models.AbstractModel' in src:`,
+              `                                tree = ast.parse(src)`,
+              `                                for node in tree.body:`,
+              `                                    if isinstance(node, ast.ClassDef):`,
+              `                                        m_name = ''; m_desc = ''; inherits = []; flds = []; meths = []`,
+              `                                        for stmt in node.body:`,
+              `                                            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):`,
+              `                                                tname = stmt.targets[0].id`,
+              `                                                if tname == '_name' and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):`,
+              `                                                    m_name = stmt.value.value`,
+              `                                                elif tname == '_description' and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):`,
+              `                                                    m_desc = stmt.value.value`,
+              `                                                elif tname == '_inherit':`,
+              `                                                    if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):`,
+              `                                                        inherits = [stmt.value.value]`,
+              `                                                    elif isinstance(stmt.value, (ast.List, ast.Tuple)):`,
+              `                                                        inherits = [el.value for el in stmt.value.elts if isinstance(el, ast.Constant) and isinstance(el.value, str)]`,
+              `                                                elif isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute):`,
+              `                                                    if isinstance(stmt.value.func.value, ast.Name) and stmt.value.func.value.id == 'fields':`,
+              `                                                        ftype = stmt.value.func.attr`,
+              `                                                        comodel = ''`,
+              `                                                        slabel = ''`,
+              `                                                        if stmt.value.args and isinstance(stmt.value.args[0], ast.Constant) and isinstance(stmt.value.args[0].value, str):`,
+              `                                                            if ftype in ('Many2one', 'One2many', 'Many2many'): comodel = stmt.value.args[0].value`,
+              `                                                            else: slabel = stmt.value.args[0].value`,
+              `                                                        for kw in stmt.value.keywords:`,
+              `                                                            if kw.arg == 'comodel_name' and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str): comodel = kw.value.value`,
+              `                                                            if kw.arg == 'string' and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str): slabel = kw.value.value`,
+              `                                                        if len(flds) < 40:`,
+              `                                                            flds.append({'name': tname, 'fieldType': ftype, 'comodel': comodel, 'stringLabel': slabel})`,
+              `                                            elif isinstance(stmt, ast.FunctionDef) and len(meths) < 20:`,
+              `                                                if not stmt.name.startswith('__'): meths.append(stmt.name)`,
+              `                                        if m_name or inherits or flds:`,
+              `                                            result['models'].append({'module': mod_name, 'filePath': full_fn, 'className': node.name, 'modelName': m_name or (inherits[0] if inherits else node.name), 'inheritModels': inherits, 'description': m_desc, 'fields': flds, 'methods': meths})`,
+              `                        except Exception: pass`,
+              `                elif fn.endswith('.xml'):`,
+              `                    xml_cnt += 1`,
+              `                    if len(result['views']) < 220 and os.path.getsize(full_fn) < 250000:`,
+              `                        try:`,
+              `                            tree_xml = ET.parse(full_fn)`,
+              `                            xroot = tree_xml.getroot()`,
+              `                            for rec in xroot.findall('.//record'):`,
+              `                                rid = rec.attrib.get('id', '')`,
+              `                                rmodel = rec.attrib.get('model', '')`,
+              `                                if rmodel == 'ir.ui.view':`,
+              `                                    v_model = ''; v_inh = ''`,
+              `                                    for fld in rec.findall('field'):`,
+              `                                        fname_attr = fld.attrib.get('name', '')`,
+              `                                        if fname_attr == 'model': v_model = (fld.text or '').strip()`,
+              `                                        elif fname_attr == 'inherit_id': v_inh = fld.attrib.get('ref', '')`,
+              `                                    result['views'].append({'module': mod_name, 'filePath': full_fn, 'xmlId': rid, 'model': v_model, 'inheritId': v_inh})`,
+              `                                elif rmodel == 'ir.rule' and len(result['recordRules']) < 80:`,
+              `                                    dom = ''; rmod = ''`,
+              `                                    for fld in rec.findall('field'):`,
+              `                                        fn_a = fld.attrib.get('name', '')`,
+              `                                        if fn_a == 'domain_force': dom = (fld.text or '').strip()[:160]`,
+              `                                        elif fn_a == 'model_id': rmod = fld.attrib.get('ref', '')`,
+              `                                    result['recordRules'].append({'module': mod_name, 'filePath': full_fn, 'xmlId': rid, 'model': rmod, 'domainForce': dom})`,
+              `                        except Exception: pass`,
+              `                elif fn.endswith('.js'):`,
+              `                    js_cnt += 1`,
+              `                elif fn == 'ir.model.access.csv' and len(result['accessRules']) < 180:`,
+              `                    try:`,
+              `                        with open(full_fn, 'r', encoding='utf-8', errors='ignore') as cf:`,
+              `                            reader = csv.DictReader(cf)`,
+              `                            for row in reader:`,
+              `                                if len(result['accessRules']) >= 180: break`,
+              `                                p_str = ''.join([k for k, v in [('r', row.get('perm_read')), ('w', row.get('perm_write')), ('c', row.get('perm_create')), ('u', row.get('perm_unlink'))] if str(v).strip() == '1'])`,
+              `                                result['accessRules'].append({'module': mod_name, 'filePath': full_fn, 'id': row.get('id', ''), 'name': row.get('name', ''), 'modelId': row.get('model_id:id', ''), 'groupId': row.get('group_id:id', ''), 'perms': p_str})`,
+              `                    except Exception: pass`,
+              `        if len(result['modules']) < 80:`,
+              `            deps = manifest.get('depends', []) if isinstance(manifest.get('depends'), list) else []`,
+              `            dfiles = manifest.get('data', []) if isinstance(manifest.get('data'), list) else []`,
+              `            result['modules'].append({'name': mod_name, 'path': dirpath, 'displayName': str(manifest.get('name', mod_name)), 'version': str(manifest.get('version', '')), 'depends': [str(d) for d in deps[:30]], 'dataFiles': [str(df) for df in dfiles[:40]], 'summary': str(manifest.get('summary', '') or manifest.get('description', ''))[:240], 'pyFilesCount': py_cnt, 'xmlFilesCount': xml_cnt, 'jsFilesCount': js_cnt})`,
+              `print(json.dumps(result))`,
+            ].join('\n');
+
+            const scanRes = await execOnSsh(`python3 -c ${quoteShellArg(pyScanScript)}`, 45000);
+            if (scanRes.code !== 0 || !scanRes.stdout.trim().startsWith('{')) {
+              throw new Error(
+                scanRes.stderr.trim() ||
+                  'Python3 ERP scanner failed on remote server. Check workspace path and permissions.'
+              );
+            }
+            const parsed = JSON.parse(scanRes.stdout.trim()) as Record<string, unknown>;
+            emitJson({
+              type: 'scanErpResult',
+              requestId,
+              scan: {
+                ...parsed,
+                scannedAt: Date.now(),
+              },
+            });
+          } catch (err) {
+            emitJson({
+              type: 'scanErpError',
+              requestId,
+              error: err instanceof Error ? err.message : 'Failed to scan remote ERP workspace.',
             });
           }
         })();

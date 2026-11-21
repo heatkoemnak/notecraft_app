@@ -37,6 +37,11 @@ import {
   listCodeAgentModels,
   runCodeAgent,
 } from './server/codeAgent.ts';
+import {
+  type KnowledgeEntry,
+  retrieveRelevantKnowledge,
+  sanitizeKnowledgeEntry,
+} from './server/erpKnowledge.ts';
 import { registerOAuthRoutes } from './server/oauth.ts';
 import { attachSshWebSocketServer } from './server/sshGateway.ts';
 import {
@@ -1352,6 +1357,7 @@ async function startServer() {
         rootPath,
         projectTree,
         relatedFiles,
+        knowledgeEntries,
         history,
       } = (req.body || {}) as {
         prompt?: unknown;
@@ -1368,6 +1374,7 @@ async function startServer() {
         rootPath?: unknown;
         projectTree?: unknown;
         relatedFiles?: unknown;
+        knowledgeEntries?: unknown;
         history?: unknown;
       };
 
@@ -1393,7 +1400,7 @@ async function startServer() {
 
       const sanitizedRelatedFiles: CodeAgentRelatedFile[] = Array.isArray(relatedFiles)
         ? relatedFiles
-            .slice(0, 8)
+            .slice(0, 14)
             .filter(
               (item): item is { path?: unknown; content?: unknown } =>
                 Boolean(item && typeof item === 'object')
@@ -1419,6 +1426,86 @@ async function startServer() {
             .filter((item) => item.content.trim().length > 0)
         : [];
 
+      // Combine client-supplied knowledge (localStorage mode) with PostgreSQL knowledge entries (if authenticated)
+      const knowledgeMap = new Map<string, KnowledgeEntry>();
+      if (Array.isArray(knowledgeEntries)) {
+        for (const rawEntry of knowledgeEntries.slice(0, 120)) {
+          const clean = sanitizeKnowledgeEntry(rawEntry);
+          if (clean) knowledgeMap.set(clean.id, clean);
+        }
+      }
+      try {
+        const pool = getPool();
+        if (pool) {
+          await ensureSchema(pool);
+          const sessionUser = await resolveSessionUser(pool, req);
+          if (sessionUser) {
+            const kbRes = await pool.query<{
+              id: string;
+              system_name: string;
+              category: string;
+              title: string;
+              summary: string;
+              content: string;
+              tags_json: string;
+              module_name: string | null;
+              models_json: string;
+              file_paths_json: string;
+              source_type: string;
+              workspace_root: string | null;
+              enabled: boolean;
+              created_at: string | number;
+              updated_at: string | number;
+            }>(
+              `SELECT id, system_name, category, title, summary, content, tags_json, module_name,
+                      models_json, file_paths_json, source_type, workspace_root, enabled, created_at, updated_at
+               FROM knowledge_entries
+               WHERE user_id = $1`,
+              [sessionUser.id]
+            );
+            for (const r of kbRes.rows) {
+              const parseJsonArr = (raw: string): string[] => {
+                try {
+                  const arr = JSON.parse(raw);
+                  return Array.isArray(arr) ? arr : [];
+                } catch {
+                  return [];
+                }
+              };
+              const dbEntry = sanitizeKnowledgeEntry({
+                id: r.id,
+                systemName: r.system_name,
+                category: r.category,
+                title: r.title,
+                summary: r.summary,
+                content: r.content,
+                tags: parseJsonArr(r.tags_json),
+                moduleName: r.module_name || undefined,
+                models: parseJsonArr(r.models_json),
+                filePaths: parseJsonArr(r.file_paths_json),
+                sourceType: r.source_type,
+                workspaceRoot: r.workspace_root || undefined,
+                enabled: Boolean(r.enabled),
+                createdAt: Number(r.created_at),
+                updatedAt: Number(r.updated_at),
+              });
+              if (dbEntry) knowledgeMap.set(dbEntry.id, dbEntry);
+            }
+          }
+        }
+      } catch {
+        // Continue with client-supplied knowledge if DB unavailable
+      }
+
+      const { retrieved: knowledgeContext, catalogSummary: knowledgeCatalog } =
+        retrieveRelevantKnowledge(Array.from(knowledgeMap.values()), {
+          query: prompt,
+          activeFilePath: typeof filePath === 'string' ? filePath : undefined,
+          activeFileContent: typeof fileContent === 'string' ? fileContent : undefined,
+          relatedFilePaths: sanitizedRelatedFiles.map((rf) => rf.path),
+          workspaceRoot: typeof rootPath === 'string' ? rootPath : undefined,
+        });
+
       const result = await runCodeAgent({
         prompt,
         model: typeof model === 'string' ? model : undefined,
@@ -1436,6 +1523,8 @@ async function startServer() {
         rootPath: typeof rootPath === 'string' ? rootPath.slice(0, 500) : undefined,
         projectTree: typeof projectTree === 'string' ? projectTree.slice(0, 10000) : undefined,
         relatedFiles: sanitizedRelatedFiles,
+        knowledgeContext,
+        knowledgeCatalog: knowledgeCatalog || undefined,
         history: sanitizedHistory,
       });
 
@@ -1446,6 +1535,199 @@ async function startServer() {
       }
       console.error('AI Code Agent failed:', err);
       return res.status(500).json({ error: 'Failed to run AI Code Agent' });
+    }
+  });
+
+  // ERP / System Knowledge Base CRUD & retrieval testing
+  app.get('/api/knowledge', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const result = await pool.query<{
+        id: string;
+        system_name: string;
+        category: string;
+        title: string;
+        summary: string;
+        content: string;
+        tags_json: string;
+        module_name: string | null;
+        models_json: string;
+        file_paths_json: string;
+        source_type: string;
+        workspace_root: string | null;
+        enabled: boolean;
+        created_at: string | number;
+        updated_at: string | number;
+      }>(
+        `SELECT id, system_name, category, title, summary, content, tags_json, module_name,
+                models_json, file_paths_json, source_type, workspace_root, enabled, created_at, updated_at
+         FROM knowledge_entries
+         WHERE user_id = $1
+         ORDER BY updated_at DESC`,
+        [user.id]
+      );
+
+      const parseArr = (raw: string): string[] => {
+        try {
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      };
+
+      const entries = result.rows
+        .map((r) =>
+          sanitizeKnowledgeEntry({
+            id: r.id,
+            systemName: r.system_name,
+            category: r.category,
+            title: r.title,
+            summary: r.summary,
+            content: r.content,
+            tags: parseArr(r.tags_json),
+            moduleName: r.module_name || undefined,
+            models: parseArr(r.models_json),
+            filePaths: parseArr(r.file_paths_json),
+            sourceType: r.source_type,
+            workspaceRoot: r.workspace_root || undefined,
+            enabled: Boolean(r.enabled),
+            createdAt: Number(r.created_at),
+            updatedAt: Number(r.updated_at),
+          })
+        )
+        .filter((e): e is KnowledgeEntry => Boolean(e));
+
+      return res.json({ entries });
+    } catch (err) {
+      console.error('Failed to load knowledge entries:', err);
+      return res.status(500).json({ error: 'Failed to load AI knowledge base' });
+    }
+  });
+
+  app.post('/api/knowledge', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      const rawList = Array.isArray(req.body?.entries) ? req.body.entries : [req.body];
+      const savedEntries: KnowledgeEntry[] = [];
+
+      for (const rawItem of rawList.slice(0, 100)) {
+        const candidate = sanitizeKnowledgeEntry({
+          ...(rawItem && typeof rawItem === 'object' ? rawItem : {}),
+          id:
+            typeof rawItem?.id === 'string' && rawItem.id.trim()
+              ? rawItem.id.trim()
+              : `kb-${randomUUID()}`,
+        });
+        if (!candidate) continue;
+
+        await pool.query(
+          `INSERT INTO knowledge_entries (
+             id, user_id, system_name, category, title, summary, content, tags_json,
+             module_name, models_json, file_paths_json, source_type, workspace_root,
+             enabled, created_at, updated_at
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+           ON CONFLICT (id) DO UPDATE SET
+             system_name = EXCLUDED.system_name,
+             category = EXCLUDED.category,
+             title = EXCLUDED.title,
+             summary = EXCLUDED.summary,
+             content = EXCLUDED.content,
+             tags_json = EXCLUDED.tags_json,
+             module_name = EXCLUDED.module_name,
+             models_json = EXCLUDED.models_json,
+             file_paths_json = EXCLUDED.file_paths_json,
+             source_type = EXCLUDED.source_type,
+             workspace_root = EXCLUDED.workspace_root,
+             enabled = EXCLUDED.enabled,
+             updated_at = EXCLUDED.updated_at
+           WHERE knowledge_entries.user_id = EXCLUDED.user_id`,
+          [
+            candidate.id,
+            user.id,
+            candidate.systemName,
+            candidate.category,
+            candidate.title,
+            candidate.summary,
+            candidate.content,
+            JSON.stringify(candidate.tags),
+            candidate.moduleName || null,
+            JSON.stringify(candidate.models || []),
+            JSON.stringify(candidate.filePaths || []),
+            candidate.sourceType,
+            candidate.workspaceRoot || null,
+            candidate.enabled,
+            candidate.createdAt,
+            candidate.updatedAt,
+          ]
+        );
+        savedEntries.push(candidate);
+      }
+
+      if (savedEntries.length === 0) {
+        return res.status(400).json({ error: 'Title and content are required for knowledge entries.' });
+      }
+
+      return res.status(201).json({
+        entry: savedEntries[0],
+        entries: savedEntries,
+      });
+    } catch (err) {
+      console.error('Failed to save knowledge entries:', err);
+      return res.status(500).json({ error: 'Failed to save AI knowledge entries' });
+    }
+  });
+
+  app.delete('/api/knowledge/:id', async (req, res) => {
+    try {
+      const auth = await requireAuth(req, res);
+      if (!auth) return;
+      const { pool, user } = auth;
+
+      await pool.query('DELETE FROM knowledge_entries WHERE id = $1 AND user_id = $2', [
+        req.params.id,
+        user.id,
+      ]);
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('Failed to delete knowledge entry:', err);
+      return res.status(500).json({ error: 'Failed to delete AI knowledge entry' });
+    }
+  });
+
+  app.post('/api/knowledge/retrieve', async (req, res) => {
+    try {
+      const { query, workspaceRoot, knowledgeEntries } = (req.body || {}) as {
+        query?: unknown;
+        workspaceRoot?: unknown;
+        knowledgeEntries?: unknown;
+      };
+      const cleanQuery = typeof query === 'string' ? query.trim() : '';
+      if (!cleanQuery) {
+        return res.status(400).json({ error: 'Enter a test prompt to preview retrieval.' });
+      }
+
+      const entries: KnowledgeEntry[] = Array.isArray(knowledgeEntries)
+        ? knowledgeEntries
+            .map((e) => sanitizeKnowledgeEntry(e))
+            .filter((e): e is KnowledgeEntry => Boolean(e))
+        : [];
+
+      const result = retrieveRelevantKnowledge(entries, {
+        query: cleanQuery,
+        workspaceRoot: typeof workspaceRoot === 'string' ? workspaceRoot : undefined,
+      });
+      return res.json(result);
+    } catch (err) {
+      console.error('Knowledge retrieval test failed:', err);
+      return res.status(500).json({ error: 'Failed to test knowledge retrieval.' });
     }
   });
 

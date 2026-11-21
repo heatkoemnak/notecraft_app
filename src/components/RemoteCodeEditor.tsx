@@ -33,6 +33,8 @@ import {
   Wand2,
   X,
 } from 'lucide-react';
+import type { ErpWorkspaceScanResult, WorkspaceSearchMatch } from '../types/knowledge';
+import type { StorageBackendMode } from '../utils/authClient';
 import {
   CodeAgentFileOperation,
   resolvePosixWorkspacePath,
@@ -142,6 +144,10 @@ interface RemoteCodeEditorProps {
   onRefreshGit?: () => Promise<void> | void;
   onRunGit?: GitCommandRunner;
   requestedSidebarTab?: { tab: 'explorer' | 'git'; seq: number } | null;
+  storageMode?: StorageBackendMode;
+  userId?: string;
+  onSearchWorkspace?: (queries: string[], rootPath?: string) => Promise<WorkspaceSearchMatch[]>;
+  onScanErpWorkspace?: (rootPath?: string) => Promise<ErpWorkspaceScanResult>;
   onCopyText: (text: string) => Promise<boolean>;
   onSaveToNote: (file: RemoteFilePreview, draftContent: string) => void;
 }
@@ -233,6 +239,10 @@ export function RemoteCodeEditor({
   onRefreshGit,
   onRunGit,
   requestedSidebarTab = null,
+  storageMode,
+  userId,
+  onSearchWorkspace,
+  onScanErpWorkspace,
   onCopyText,
   onSaveToNote,
 }: RemoteCodeEditorProps) {
@@ -3994,6 +4004,10 @@ export function RemoteCodeEditor({
               trackedChanges={trackedChanges}
               applyingTrackedChanges={applyingTrackedChanges}
               onReadRemoteFile={onReadRemoteFile}
+              onSearchWorkspace={onSearchWorkspace}
+              onScanErpWorkspace={onScanErpWorkspace}
+              storageMode={storageMode}
+              userId={userId}
               onStageFileOperations={handleStageFileOperations}
               onReviewTrackedChange={handleReviewTrackedChange}
               onAcceptTrackedChange={handleAcceptTrackedChange}

@@ -36,6 +36,7 @@ import {
   Wand2,
   X,
 } from 'lucide-react';
+import { ErpWorkspaceScanResult, WorkspaceSearchMatch } from '../types/knowledge';
 import { AuthUser, Folder, Snippet, SshAuthType, SshProfile } from '../types/notes';
 import { StorageBackendMode } from '../utils/authClient';
 import { formatRelativeDate } from '../utils/markdown';
@@ -372,6 +373,26 @@ export function SshTerminalView({
       string,
       {
         resolve: (val: Record<string, unknown>) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
+  const pendingAsyncSearchReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: WorkspaceSearchMatch[]) => void;
+        reject: (err: Error) => void;
+        timer: number;
+      }
+    >
+  >(new Map());
+  const pendingAsyncScanErpReqsRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (val: ErpWorkspaceScanResult) => void;
         reject: (err: Error) => void;
         timer: number;
       }
@@ -914,6 +935,18 @@ export function SshTerminalView({
       pending.reject(err);
     });
     pendingAsyncGitReqsRef.current.clear();
+
+    pendingAsyncSearchReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncSearchReqsRef.current.clear();
+
+    pendingAsyncScanErpReqsRef.current.forEach((pending) => {
+      window.clearTimeout(pending.timer);
+      pending.reject(err);
+    });
+    pendingAsyncScanErpReqsRef.current.clear();
   }, []);
 
   const clearConnectionFields = useCallback(() => {
@@ -1139,6 +1172,63 @@ export function SshTerminalView({
             cwd: targetCwd,
             action,
             payload: payload || {},
+          })
+        );
+      });
+    },
+    []
+  );
+
+  const searchWorkspaceAsync = useCallback(
+    (queries: string[], rootPathOverride?: string): Promise<WorkspaceSearchMatch[]> => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('SSH is not connected.'));
+      }
+      const cleanQueries = queries.map((q) => q.trim()).filter(Boolean).slice(0, 6);
+      if (cleanQueries.length === 0) {
+        return Promise.resolve([]);
+      }
+      const reqId = `srch-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const targetRoot = rootPathOverride || currentRemotePathRef.current || '~';
+      return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          pendingAsyncSearchReqsRef.current.delete(reqId);
+          reject(new Error('Timed out searching remote workspace.'));
+        }, 30000);
+        pendingAsyncSearchReqsRef.current.set(reqId, { resolve, reject, timer });
+        ws.send(
+          JSON.stringify({
+            type: 'searchWorkspace',
+            requestId: reqId,
+            rootPath: targetRoot,
+            queries: cleanQueries,
+          })
+        );
+      });
+    },
+    []
+  );
+
+  const scanErpWorkspaceAsync = useCallback(
+    (rootPathOverride?: string): Promise<ErpWorkspaceScanResult> => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('SSH is not connected.'));
+      }
+      const reqId = `scan-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const targetRoot = rootPathOverride || currentRemotePathRef.current || '~';
+      return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          pendingAsyncScanErpReqsRef.current.delete(reqId);
+          reject(new Error('Timed out scanning remote ERP workspace.'));
+        }, 55000);
+        pendingAsyncScanErpReqsRef.current.set(reqId, { resolve, reject, timer });
+        ws.send(
+          JSON.stringify({
+            type: 'scanErpWorkspace',
+            requestId: reqId,
+            rootPath: targetRoot,
           })
         );
       });
@@ -1376,6 +1466,8 @@ export function SshTerminalView({
           isBinary?: boolean;
           savedAt?: number;
           action?: string;
+          matches?: WorkspaceSearchMatch[];
+          scan?: ErpWorkspaceScanResult;
         };
         try {
           msg = JSON.parse(String(event.data));
@@ -1669,6 +1761,54 @@ export function SshTerminalView({
             window.clearTimeout(asyncPending.timer);
             pendingAsyncGitReqsRef.current.delete(msg.requestId);
             asyncPending.reject(new Error(msg.error || 'Git command failed.'));
+          }
+          return;
+        }
+
+        if (msg.type === 'searchWorkspaceResult') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncSearchReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncSearchReqsRef.current.delete(msg.requestId);
+            asyncPending.resolve(Array.isArray(msg.matches) ? msg.matches : []);
+          }
+          return;
+        }
+
+        if (msg.type === 'searchWorkspaceError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncSearchReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncSearchReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'Workspace search failed.'));
+          }
+          return;
+        }
+
+        if (msg.type === 'scanErpResult') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncScanErpReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId && msg.scan) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncScanErpReqsRef.current.delete(msg.requestId);
+            asyncPending.resolve(msg.scan);
+          }
+          return;
+        }
+
+        if (msg.type === 'scanErpError') {
+          const asyncPending = msg.requestId
+            ? pendingAsyncScanErpReqsRef.current.get(msg.requestId)
+            : undefined;
+          if (asyncPending && msg.requestId) {
+            window.clearTimeout(asyncPending.timer);
+            pendingAsyncScanErpReqsRef.current.delete(msg.requestId);
+            asyncPending.reject(new Error(msg.error || 'ERP workspace scan failed.'));
           }
           return;
         }
@@ -3170,6 +3310,10 @@ export function SshTerminalView({
                     onRefreshGit={() => refreshGitStatus()}
                     onRunGit={runGitCommandAsync}
                     requestedSidebarTab={requestedIdeTab}
+                    storageMode={storageMode}
+                    userId={currentUser.id}
+                    onSearchWorkspace={searchWorkspaceAsync}
+                    onScanErpWorkspace={scanErpWorkspaceAsync}
                     onCopyText={copyTextToClipboard}
                     onSaveToNote={handleSaveRemoteFileToNote}
                   />
